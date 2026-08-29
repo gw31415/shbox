@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain DESIGN.md"
+  short_description: "Maintain the current architecture source of truth"
+  default_prompt: "Use $maintain-design to record this durable architecture decision and its invariants in DESIGN.md."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain AGENTS.md"
+  short_description: "Keep durable repository guidance concise"
+  default_prompt: "Use $maintain-agents to update durable repository guidance without adding transient project history."

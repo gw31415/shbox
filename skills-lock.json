@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "archive-commit": {
+      "source": "gw31415/project-continuity",
+      "sourceType": "github",
+      "skillPath": "skills/archive-commit/SKILL.md",
+      "computedHash": "6cd6ddd2c47defdb02a4bd69af3fc3645e37061d90a3c37ee4bd13d7f2e9b038"
+    },
+    "maintain-agents": {
+      "source": "gw31415/project-continuity",
+      "sourceType": "github",
+      "skillPath": "skills/maintain-agents/SKILL.md",
+      "computedHash": "c7dd5aba17d65c7d433d918ebeeee56be849a20c6723d503031e60e625d1d92c"
+    },
+    "maintain-design": {
+      "source": "gw31415/project-continuity",
+      "sourceType": "github",
+      "skillPath": "skills/maintain-design/SKILL.md",
+      "computedHash": "4dfa08d9fdd006603d1d74eb6ea464121598cb32124e699af6a048a51a8e64e1"
+    },
+    "project-start": {
+      "source": "gw31415/project-continuity",
+      "sourceType": "github",
+      "skillPath": "skills/project-start/SKILL.md",
+      "computedHash": "d7b00336059049e661e1435c2b4bd097e7e861a1c75a74518b5d0056e4b4fd3e"
+    },
+    "rolling-plan": {
+      "source": "gw31415/project-continuity",
+      "sourceType": "github",
+      "skillPath": "skills/rolling-plan/SKILL.md",
+      "computedHash": "7979b4f8636857e8e8ed7beaedfb7ed434e44d5091a9574c3a3bebc61c85815b"
+    }
+  }
+}

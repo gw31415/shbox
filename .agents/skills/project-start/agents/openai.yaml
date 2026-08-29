@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Start"
+  short_description: "Bootstrap durable project workflow documents"
+  default_prompt: "Use $project-start to initialize this repository with focused AGENTS.md, DESIGN.md, and PLANS.md files."

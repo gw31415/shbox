@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rolling Execution Plan"
+  short_description: "Run resumable plans without completed-history bloat"
+  default_prompt: "Use $rolling-plan to create or refresh a self-contained PLANS.md containing only unfinished work."
