@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    WARNING: Arapuca's macOS backend depends on Apple's deprecated
+    /usr/bin/sandbox-exec (Seatbelt). This job is a blocking release artifact
+    only for the exact macOS 15/26 arm64 gates that pass; it is not a claim
+    that future macOS versions are supported.
+
+    Provision the account and every directory/file owner and mode before
+    loading this plist. This file intentionally contains no installer or
+    start/stop operation.
+  -->
+  <key>Label</key>
+  <string>com.example.shbox</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/shbox</string>
+  </array>
+  <key>UserName</key>
+  <string>shbox</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/shbox</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/shbox</string>
+    <key>XDG_CONFIG_HOME</key>
+    <string>/Users/shbox/.config</string>
+    <key>XDG_DATA_HOME</key>
+    <string>/Users/shbox/.local/share</string>
+    <key>XDG_STATE_HOME</key>
+    <string>/Users/shbox/.local/state</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/shbox/Library/Logs/shbox.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/shbox/Library/Logs/shbox.stderr.log</string>
+</dict>
+</plist>

@@ -1,12 +1,15 @@
 //! OpenSSH integration harness for the public-key server and the admin host
 //! route and the SandboxManager management operations (PLANS.md Milestones
-//! 2-7).
+//! 2-8).
 //!
 //! Every test starts a real daemon binary with a temporary XDG tree and its
 //! own listener, then drives it with the real `ssh` client. Tests share
 //! nothing and are run serially (`--test-threads=1`).
 
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -96,6 +99,10 @@ fn daemon_binary() -> PathBuf {
 
 impl TestDaemon {
     fn start(admin_keys: &[&str]) -> TestDaemon {
+        Self::start_with_config(admin_keys, "")
+    }
+
+    fn start_with_config(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
         let root = TempDir::new().expect("temp root");
         let config_dir = root.path().join("config/shbox");
         let data_dir = root.path().join("data/shbox");
@@ -138,6 +145,12 @@ impl TestDaemon {
             authorized_keys.display().to_string()
         ));
         config.push_str(&format!("admin_keys = {admin_list:?}\n"));
+        if !extra_config.is_empty() {
+            config.push_str(extra_config);
+            if !extra_config.ends_with('\n') {
+                config.push('\n');
+            }
+        }
         let config_path = config_dir.join("config.toml");
         std::fs::write(&config_path, config).expect("write config");
 
@@ -168,6 +181,14 @@ impl TestDaemon {
         };
         daemon.wait_ready();
         daemon
+    }
+
+    fn sandbox_workspace(&self, id: &str) -> PathBuf {
+        self._root
+            .path()
+            .join("data/shbox/sandboxes")
+            .join(id)
+            .join("workspace")
     }
 
     /// Replace only the admin-key line in the fixture's config file.
@@ -256,6 +277,113 @@ impl TestDaemon {
         }
     }
 
+    /// Run OpenSSH with one explicit client-only environment variable. The
+    /// server still receives that value only through an SSH env request, so a
+    /// test can prove that the request is rejected before the sandbox launch.
+    fn ssh_with_client_env(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        command: &str,
+        extra: &[&str],
+        name: &str,
+        value: &str,
+    ) -> SshResult {
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&self.ssh_config)
+            .arg("-i")
+            .arg(&key.private)
+            .arg("-p")
+            .arg(self.port.to_string())
+            .args(extra)
+            .arg(format!("{username}@127.0.0.1"))
+            .arg(command)
+            .env(name, value)
+            .output()
+            .expect("ssh runs");
+        SshResult {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
+    }
+
+    /// Spawn OpenSSH with pipes so the test can explicitly close client
+    /// stdin after sending a bounded input sequence.
+    fn spawn_ssh(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        command: &str,
+        extra: &[&str],
+    ) -> std::process::Child {
+        Command::new("ssh")
+            .arg("-F")
+            .arg(&self.ssh_config)
+            .arg("-i")
+            .arg(&key.private)
+            .arg("-p")
+            .arg(self.port.to_string())
+            .args(extra)
+            .arg(format!("{username}@127.0.0.1"))
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ssh starts")
+    }
+
+    /// Spawn OpenSSH on a local PTY. OpenSSH then sends the local PTY's
+    /// dimensions and terminal modes in its real `pty-req`, and a SIGWINCH
+    /// can be used to drive a real SSH `window-change` request.
+    fn spawn_ssh_pty(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        command: &str,
+        rows: u16,
+        cols: u16,
+    ) -> OpenSshPty {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pair = nix::pty::openpty(Some(&size), None).expect("open local pty");
+        let master: File = pair.master.into();
+        let slave: File = pair.slave.into();
+        configure_local_pty(slave.as_raw_fd());
+        let stdout = slave.try_clone().expect("clone local pty stdout");
+        let stderr = slave.try_clone().expect("clone local pty stderr");
+
+        let child = Command::new("ssh")
+            .arg("-F")
+            .arg(&self.ssh_config)
+            .arg("-i")
+            .arg(&key.private)
+            .arg("-p")
+            .arg(self.port.to_string())
+            .arg("-tt")
+            .args(["-o", "EscapeChar=none"])
+            .arg(format!("{username}@127.0.0.1"))
+            .arg(command)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("ssh starts on local pty");
+
+        OpenSshPty {
+            child,
+            master,
+            pending: Vec::new(),
+        }
+    }
+
     /// Run a command over an explicit OpenSSH ControlMaster connection.
     fn ssh_with_control(
         &self,
@@ -321,6 +449,166 @@ impl SshResult {
     fn ok(&self) -> bool {
         self.status == 0
     }
+}
+
+/// A real OpenSSH client attached to a local PTY. The master is kept in the
+/// harness so tests can send bytes, resize the client terminal, and observe
+/// the resulting remote PTY behavior without relying on an operator terminal.
+struct OpenSshPty {
+    child: std::process::Child,
+    master: File,
+    pending: Vec<u8>,
+}
+
+impl OpenSshPty {
+    fn send(&mut self, data: &[u8]) {
+        self.master.write_all(data).expect("write local pty");
+        self.master.flush().expect("flush local pty");
+    }
+
+    fn read_until(&mut self, marker: &[u8], timeout: Duration) -> Vec<u8> {
+        assert!(!marker.is_empty(), "PTY marker must not be empty");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(start) = find_subslice(&self.pending, marker) {
+                let end = start + marker.len();
+                return self.pending.drain(..end).collect();
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                panic!(
+                    "PTY output did not contain {:?} within {timeout:?}; output={:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&self.pending)
+                );
+            };
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            let mut descriptor = libc::pollfd {
+                fd: self.master.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            // SAFETY: descriptor points to one initialized pollfd and the
+            // master fd remains owned by this session for the call.
+            let polled = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if polled == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("poll local pty: {error}");
+            }
+            if polled == 0 {
+                panic!(
+                    "PTY output did not contain {:?} within {timeout:?}; output={:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&self.pending)
+                );
+            }
+
+            let mut buffer = [0u8; 4096];
+            match self.master.read(&mut buffer) {
+                Ok(0) => panic!(
+                    "local PTY closed before {:?}; output={:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&self.pending)
+                ),
+                Ok(count) => self.pending.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => panic!(
+                    "local PTY returned EIO before {:?}; output={:?}",
+                    String::from_utf8_lossy(marker),
+                    String::from_utf8_lossy(&self.pending)
+                ),
+                Err(error) => panic!("read local pty: {error}"),
+            }
+        }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the master is an open PTY and size points to an initialized
+        // winsize owned by this stack frame.
+        let result = unsafe {
+            libc::ioctl(
+                self.master.as_raw_fd(),
+                libc::TIOCSWINSZ,
+                &size as *const libc::winsize,
+            )
+        };
+        assert_eq!(result, 0, "resize local pty");
+
+        let pid = i32::try_from(self.child.id()).expect("ssh pid fits pid_t");
+        // SAFETY: the pid belongs to the OpenSSH child created by this
+        // session; SIGWINCH asks it to send a protocol window-change.
+        let result = unsafe { libc::kill(pid, libc::SIGWINCH) };
+        assert_eq!(result, 0, "send SIGWINCH to OpenSSH client");
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll ssh child") {
+                return status;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                panic!("OpenSSH child did not exit within {timeout:?}");
+            };
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+}
+
+impl Drop for OpenSshPty {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn configure_local_pty(fd: std::os::fd::RawFd) {
+    let mut state = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: fd is the slave side of the local PTY held by the caller.
+    assert_eq!(
+        unsafe { libc::tcgetattr(fd, &mut state) },
+        0,
+        "read local pty modes"
+    );
+    // Keep ISIG enabled so OpenSSH includes a real VINTR/ISIG request while
+    // disabling canonical buffering and local echo for byte-level probes.
+    state.c_lflag &= !(libc::ICANON | libc::ECHO);
+    state.c_lflag |= libc::ISIG;
+    state.c_cc[libc::VMIN] = 1;
+    state.c_cc[libc::VTIME] = 0;
+    // SAFETY: state was read from this PTY and remains fully initialized.
+    assert_eq!(
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &state) },
+        0,
+        "set local pty modes"
+    );
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn between_markers<'a>(output: &'a [u8], start: &[u8], end: &[u8]) -> &'a [u8] {
+    let start_index = find_subslice(output, start).expect("start marker");
+    let content = &output[start_index + start.len()..];
+    let end = find_subslice(content, end).expect("end marker");
+    &content[..end]
 }
 
 const RELOAD_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -570,6 +858,359 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
     let empty = daemon.ssh(&daemon.admin_key, "_", "list", &["-T", "-s"]);
     assert!(empty.ok(), "post-delete list failed: {empty:?}");
     assert!(empty.stdout.is_empty());
+}
+
+/// The real Arapuca path keeps non-PTY stdout/stderr separate and forwards a
+/// non-zero shell exit status through the OpenSSH client.
+#[test]
+fn arapuca_sandbox_non_pty_exec_reports_streams_and_status() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let result = daemon.ssh(
+        &daemon.normal_key,
+        "m8-streams",
+        "printf out; printf err >&2; exit 17",
+        &["-T"],
+    );
+    assert_eq!(result.status, 17, "sandbox exit status: {result:?}");
+    assert_eq!(result.stdout, "out");
+    assert_eq!(result.stderr, "err");
+}
+
+/// The real PTY path exposes the requested terminal modes and size, supports
+/// raw byte input, and applies a later OpenSSH window-change request.
+#[test]
+fn arapuca_sandbox_pty_applies_modes_and_resize() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let command = concat!(
+        "printf '__M8_TERM_%s__' \"$TERM\"; ",
+        "printf '__M8_PTY_READY__'; ",
+        "dd bs=1 count=1 >/dev/null 2>/dev/null; ",
+        "printf '__M8_MODES_BEGIN__'; stty -a; printf '__M8_MODES_END__'; ",
+        "stty raw -echo; ",
+        "printf '__M8_RAW_BEGIN__'; stty -a; printf '__M8_RAW_END__'; ",
+        "printf '__M8_INITIAL_BEGIN__'; stty size; printf '__M8_INITIAL_END__'; ",
+        "printf '__M8_RESIZE_READY__'; ",
+        "dd bs=1 count=1 >/dev/null 2>/dev/null; ",
+        "printf '__M8_RESIZED_BEGIN__'; stty size; printf '__M8_RESIZED_END__'"
+    );
+    let mut session = daemon.spawn_ssh_pty(&daemon.normal_key, "m8-pty", command, 24, 80);
+
+    let ready = session.read_until(b"__M8_PTY_READY__", Duration::from_secs(5));
+    assert!(
+        String::from_utf8_lossy(&ready).contains("__M8_TERM_xterm-256color__"),
+        "TERM was not negotiated through pty-req: {ready:?}"
+    );
+    // A single byte must pass the requested non-canonical mode before the
+    // remote command can emit the mode and size probes.
+    session.send(b"A");
+    let first = session.read_until(b"__M8_RESIZE_READY__", Duration::from_secs(5));
+    let first_text = String::from_utf8_lossy(&first);
+    let modes = between_markers(&first, b"__M8_MODES_BEGIN__", b"__M8_MODES_END__");
+    let modes_text = String::from_utf8_lossy(modes);
+    assert!(
+        modes_text.contains("-icanon"),
+        "canonical mode remained enabled: {modes_text}"
+    );
+    assert!(
+        modes_text.contains("-echo"),
+        "echo mode remained enabled: {modes_text}"
+    );
+    assert!(
+        modes_text.contains("isig") && !modes_text.contains("-isig"),
+        "signal mode was not enabled: {modes_text}"
+    );
+    let mode_start = first_text
+        .find("__M8_MODES_BEGIN__")
+        .expect("mode marker in PTY output");
+    assert!(
+        !first_text[..mode_start].contains('A'),
+        "input was echoed despite the requested echo mode: {first_text}"
+    );
+
+    let raw = between_markers(&first, b"__M8_RAW_BEGIN__", b"__M8_RAW_END__");
+    let raw_text = String::from_utf8_lossy(raw);
+    assert!(
+        raw_text.contains("-icanon"),
+        "stty raw did not disable canonical mode"
+    );
+    assert!(
+        raw_text.contains("-echo"),
+        "stty raw -echo did not disable echo"
+    );
+
+    let initial = between_markers(&first, b"__M8_INITIAL_BEGIN__", b"__M8_INITIAL_END__");
+    assert!(
+        String::from_utf8_lossy(initial).contains("24 80"),
+        "initial PTY size was not applied: {initial:?}"
+    );
+
+    session.resize(41, 117);
+    std::thread::sleep(Duration::from_millis(250));
+    session.send(b"R");
+    let resized = session.read_until(b"__M8_RESIZED_END__", Duration::from_secs(5));
+    let resized_size = between_markers(&resized, b"__M8_RESIZED_BEGIN__", b"__M8_RESIZED_END__");
+    assert!(
+        String::from_utf8_lossy(resized_size).contains("41 117"),
+        "window-change was not applied: {resized:?}"
+    );
+    assert!(
+        session.wait_for_exit(Duration::from_secs(5)).success(),
+        "PTY probe did not exit successfully"
+    );
+}
+
+/// The real launch maps HOME/PWD to the durable workspace, injects only the
+/// configured sandbox environment, and keeps a client env request out.
+#[test]
+fn arapuca_sandbox_maps_environment_and_workspace() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start_with_config(
+        &["admin"],
+        "[sandbox_env]\nM8_SANDBOX_TOKEN = \"configured-token\"\n",
+    );
+    let id = "m8-environment";
+    let marker = daemon.sandbox_workspace(id).join("m8-workspace-marker");
+    let result = daemon.ssh_with_client_env(
+        &daemon.normal_key,
+        id,
+        r#"test "$M8_SANDBOX_TOKEN" = "configured-token" && test -z "${M8_CLIENT_INJECTION+x}" && test "$HOME" = "$PWD" && test "$(pwd)" = "$PWD" && printf workspace-ok > "$HOME/m8-workspace-marker" && printf '%s\n%s\n%s\n' "$HOME" "$PWD" "$(pwd)""#,
+        &["-T", "-o", "SendEnv=M8_CLIENT_INJECTION"],
+        "M8_CLIENT_INJECTION",
+        "must-not-reach-sandbox",
+    );
+    assert!(result.ok(), "sandbox environment probe failed: {result:?}");
+    let expected =
+        std::fs::canonicalize(daemon.sandbox_workspace(id)).expect("canonical sandbox workspace");
+    let lines = result.stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "sandbox HOME/PWD output: {result:?}");
+    assert_eq!(lines[0], lines[1], "HOME and PWD differ: {result:?}");
+    for path in lines {
+        assert_eq!(
+            std::fs::canonicalize(path).expect("canonical sandbox environment path"),
+            expected,
+            "sandbox path escaped its workspace: {result:?}"
+        );
+    }
+    assert!(
+        result.stderr.is_empty(),
+        "sandbox environment stderr: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("sandbox workspace marker"),
+        "workspace-ok"
+    );
+}
+
+/// Client EOF closes a non-PTY stdin and still permits output/status delivery;
+/// PTY EOF does not inject a VEOF byte into the sandbox child.
+#[test]
+fn arapuca_sandbox_eof_behavior_is_transport_correct() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let mut non_pty = daemon.spawn_ssh(
+        &daemon.normal_key,
+        "m8-non-pty-eof",
+        "cat; printf __M8_NON_PTY_EOF__; exit 19",
+        &["-T"],
+    );
+    let mut input = non_pty.stdin.take().expect("non-PTY ssh stdin");
+    input.write_all(b"eof-input").expect("write non-PTY input");
+    drop(input);
+    let output = non_pty.wait_with_output().expect("wait for non-PTY EOF");
+    assert_eq!(
+        output.status.code(),
+        Some(19),
+        "non-PTY EOF status: {output:?}"
+    );
+    assert_eq!(
+        output.stdout, b"eof-input__M8_NON_PTY_EOF__",
+        "non-PTY output after EOF: {output:?}"
+    );
+    assert!(output.stderr.is_empty(), "non-PTY EOF stderr: {output:?}");
+
+    let mut pty = daemon.spawn_ssh(
+        &daemon.normal_key,
+        "m8-pty-eof",
+        "printf '__M8_PTY_EOF_READY__\\n'; read -r line; printf __M8_SYNTHETIC_VEOF__",
+        &["-tt"],
+    );
+    let stdout = pty.stdout.take().expect("PTY ssh stdout");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line);
+        let _ = ready_tx.send(result.map(|_| line));
+        let mut tail = Vec::new();
+        let tail_result = reader.read_to_end(&mut tail);
+        (tail_result, tail)
+    });
+    let ready = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => {
+            let _ = pty.kill();
+            let _ = pty.wait_with_output();
+            let _ = reader.join();
+            panic!("read PTY EOF ready marker: {error}");
+        }
+        Err(error) => {
+            let _ = pty.kill();
+            let _ = pty.wait_with_output();
+            let _ = reader.join();
+            panic!("PTY EOF ready marker did not arrive: {error}");
+        }
+    };
+    if !ready.contains("__M8_PTY_EOF_READY__") {
+        let _ = pty.kill();
+        let _ = pty.wait_with_output();
+        let _ = reader.join();
+        panic!("PTY EOF ready output: {ready:?}");
+    }
+    let input = pty.stdin.take().expect("PTY ssh stdin");
+    drop(input);
+    let deadline = Instant::now() + Duration::from_millis(750);
+    let exited = loop {
+        if let Some(status) = pty.try_wait().expect("poll PTY ssh child") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let pty_output = if exited.is_none() {
+        let _ = pty.kill();
+        pty.wait_with_output().expect("wait for PTY EOF cleanup")
+    } else {
+        pty.wait_with_output().expect("collect PTY EOF output")
+    };
+    let (tail_result, tail) = reader.join().expect("PTY EOF stdout reader");
+    tail_result.expect("read PTY EOF output");
+    assert!(
+        exited.is_none(),
+        "PTY child exited after client EOF, likely from synthetic VEOF: {pty_output:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&tail).contains("__M8_SYNTHETIC_VEOF__"),
+        "PTY child observed synthetic VEOF: {tail:?}"
+    );
+}
+
+/// A terminal VINTR byte reaches the sandbox process group and is surfaced by
+/// the real PTY exec as the command's handled interrupt exit.
+#[test]
+fn arapuca_sandbox_pty_forwards_terminal_signal() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let mut session = daemon.spawn_ssh_pty(
+        &daemon.normal_key,
+        "m8-signal",
+        "printf __M8_SIGNAL_READY__; trap 'printf __M8_SIGNAL_HANDLED__; exit 23' INT; while :; do read -r line; done",
+        24,
+        80,
+    );
+    session.read_until(b"__M8_SIGNAL_READY__", Duration::from_secs(5));
+    session.send(&[0x03]);
+    session.read_until(b"__M8_SIGNAL_HANDLED__", Duration::from_secs(5));
+    let status = session.wait_for_exit(Duration::from_secs(5));
+    assert_eq!(
+        status.code(),
+        Some(23),
+        "handled terminal signal status: {status}"
+    );
+}
+
+/// A real sandbox shutdown removes both the direct process and an ignored-TERM
+/// descendant from the sandbox runtime before the daemon exits.
+#[test]
+fn arapuca_sandbox_shutdown_cleans_up_descendants() {
+    if !arapuca_integration_enabled() {
+        return;
+    }
+
+    let mut daemon = TestDaemon::start(&["admin"]);
+    let id = "m8-cleanup";
+    let workspace = daemon.sandbox_workspace(id);
+    let parent_path = workspace.join("m8-parent.pid");
+    let descendant_path = workspace.join("m8-descendant.pid");
+    let config = daemon.ssh_config.clone();
+    let key = daemon.normal_key.private.clone();
+    let port = daemon.port;
+    let client = std::thread::spawn(move || {
+        run_ssh_command(
+            config,
+            key,
+            port,
+            id,
+            r#"printf '%s' "$$" > "$HOME/m8-parent.pid"; trap '' TERM; sleep 30 & child=$!; printf '%s' "$child" > "$HOME/m8-descendant.pid"; wait"#,
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (parent_pid, descendant_pid) = loop {
+        if let (Ok(parent), Ok(descendant)) = (
+            std::fs::read_to_string(&parent_path),
+            std::fs::read_to_string(&descendant_path),
+        ) {
+            break (
+                parent.trim().parse::<i32>().expect("sandbox parent pid"),
+                descendant
+                    .trim()
+                    .parse::<i32>()
+                    .expect("sandbox descendant pid"),
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sandbox descendant fixture did not start"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    daemon.send_signal(libc::SIGTERM);
+    let daemon_status = daemon.child.wait().expect("daemon wait");
+    assert!(
+        daemon_status.success(),
+        "graceful sandbox shutdown expected: {daemon_status}"
+    );
+    let _ = client.join().expect("sandbox ssh client join");
+
+    for (label, pid) in [
+        ("sandbox parent", parent_pid),
+        ("sandbox descendant", descendant_pid),
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // SAFETY: each PID was written by the sandbox process created by
+            // this fixture; kill(pid, 0) only probes its existence.
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{label} {pid} survived sandbox shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// Client `env` requests are rejected but never kill the connection; an

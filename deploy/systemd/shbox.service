@@ -1,0 +1,38 @@
+[Unit]
+Description=shbox SSH sandbox daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# This must be a dedicated, unprivileged account. Do not run unrelated
+# processes in this service's delegated cgroup.
+User=shbox
+Group=shbox
+WorkingDirectory=/var/lib/shbox
+ExecStart=/usr/local/bin/shbox
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+TimeoutStopSec=10s
+UMask=0077
+
+# shbox creates a private child below this delegated service scope. All four
+# controllers are required by the Linux Arapuca adapter.
+Delegate=cpu cpuset memory pids
+
+# Permit a non-root daemon to bind port 22. Remove this if an unprivileged
+# listener plus an operator-managed port forward is used instead.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# xdg's application prefix adds /shbox to each of these roots. Keep data and
+# state roots separate: shbox holds independent locks in both locations.
+Environment=XDG_CONFIG_HOME=/etc
+Environment=XDG_DATA_HOME=/var/lib
+Environment=XDG_STATE_HOME=/var/lib/shbox-state
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

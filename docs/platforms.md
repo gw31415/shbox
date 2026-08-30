@@ -2,6 +2,8 @@
 
 この文書は、shbox が依存する OS 機能、Arapuca の利用範囲、配備条件を定める。ここでいう「対応」は、単にコンパイルできることではなく、後述する実 Arapuca・実 OpenSSH の統合試験を通過した OS/architecture の組合せを指す。
 
+M8 の固定 runner、fail-closed platform gate、current verification status は [release runbook](release.md) に記録する。そこに同一 commit の passing evidence がない tuple は、この文書でも正式対応として扱わない。
+
 ## 1. 責務の境界
 
 shbox の Sandbox は、次の二つを合わせた論理リソースである。

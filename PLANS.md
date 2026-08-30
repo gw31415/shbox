@@ -34,7 +34,8 @@ selector、installer、永続 terminal session はありません。
 
 - Milestone 1 から Milestone 7 までは完了し、各検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
-  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 15 test を通過する。
+  `cargo test --locked --all-targets` が通り、OpenSSH harness は 21 test を通過する。M8 の
+  real Arapuca 6 test は明示的な integration gate で実行する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
@@ -133,65 +134,33 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 
 ## Milestone 8 — real-platform release gates と operational examples
 
-### 目標
+M8 の workflow、fail-closed platform scripts、real OpenSSH cases、運用 artifact、release
+runbook の実装は完了した。formal support の宣言は、下記の未完了 tuple の hosted blocking
+evidence が揃うまで行わない。
 
-full behavior が実証された OS/version/architecture combination だけを ship し、external
-prerequisite を安全に満たすために必要な deployment guidance を operator に提供します。
+### 実装済み
 
-### 編集内容
+- `.github/workflows/m8-release-gate.yml` が Rust 1.91/stable quality、supported target build、
+  delegated Linux、固定 macOS 15/26 runner を実行する。
+- `scripts/verify-linux-platform` と `scripts/verify-macos-platform` が exact OS/architecture、
+  prerequisite、lock pin、pinned Arapuca wrapper build、real suite を fail-closed で検査する。
+- `deploy/systemd/shbox.service`、`deploy/launchd/com.example.shbox.plist`、`docs/release.md`
+  が dedicated account、cgroup/Seatbelt 制約、未検証状態を記録する。
 
-1. Rust 1.91 と stable の CI を追加します。format、warnings denied の clippy、
-   unit/property/state/fake-launcher test、supported target の build check を実行します。
-2. blocking な real-platform job、または同等の記録可能な release pipeline を追加します。
-   - Linux x86_64、dedicated delegated cgroup v2 scope
-   - Linux aarch64、dedicated delegated cgroup v2 scope
-   - macOS 15 arm64
-   - macOS 26 arm64
-3. Milestone 5--7 の real OpenSSH/Arapuca suite を、列挙した各 tuple で実行します。full passing
-   run のない tuple は unverified であり、formal に supported ではありません。macOS x86_64
-   cross-build は informational only です。
-4. dedicated non-root service account、port-22 capability、required な
-   Delegate=cpu cpuset memory pids、private state/data、delegated scope 内に無関係な process
-   を置かないことを含む Linux systemd unit example を追加します。
-5. dedicated service account と deprecated Seatbelt dependency および tested OS version への
-   明示的な warning を含む macOS launchd example を追加します。installer/start/stop command
-   は追加しません。
-6. tracked lockfile と exact git revision から source distribution/build が reproducible である
-   ことを検証します。
-7. すべての behavior を docs/ と照合し、tested support table を実際の runner image/version
-   で更新します。満たされていない condition は contract を黙って弱めず、blocking として
-   記録します。
+### 未完了の受入れ
 
-### 成果
+- [ ] 同一 commit の hosted workflow で Rust 1.91 と stable quality job が成功する。
+- [ ] Linux x86_64 delegated cgroup v2 上で real suite が成功する。
+- [ ] Linux aarch64 delegated cgroup v2 上で real suite が成功する。
+- [ ] macOS 15 arm64 fixed runner 上で real suite が成功する。
+- [ ] macOS 26 arm64 fixed runner 上で real suite が成功する（local preflight は pass 済みだが formal evidence ではない）。
 
-- release documentation が exact tested OS version/architecture と Arapuca revision を明記
-  します。
-- operator は Arapuca の cgroup scope を共有せず、fallback として sandbox process を host
-  上で直接実行することもなく、daemon を deploy できます。
-- current OpenSSH が compatibility guarantee です。他の RFC 4254 client は best effort の
-  ままです。
+### 現在の証跡
 
-### 検証
-
-release pipeline は少なくとも次を実行しなければなりません。
-
-```console
-cargo fmt --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-```
-
-さらに、この milestone で生成した platform script を、例えば次のように実行します。
-
-```console
-./scripts/verify-linux-platform
-./scripts/verify-macos-platform
-```
-
-期待結果: すべての formal tuple が exact OS image、architecture、Rust version、Arapuca
-revision、OpenSSH version、passing full suite を報告すること。required tuple が skip、
-cross-compile only、または mutable で記録のない image 上で実行された場合は formal-support
-claim を公開しません。
+- 通常の serial OpenSSH harness は `21 passed`。macOS 26.6.2 arm64 の local gate も pinned
+  Arapuca、Seatbelt、real suite `21 passed`、gate `PASS` まで確認済み。
+- Linux と macOS 15 の専用 runner、および同一 commit の hosted workflow log は未取得である。
+- 上記が完了するまで M8 と release status は `[ ]` / `BLOCKED — UNVERIFIED` のままにする。
 
 ## milestone 横断の受け入れ条件
 

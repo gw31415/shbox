@@ -163,7 +163,9 @@ path、root 外 symlink、二つの advisory lock、再起動後の metadata/wor
 test harness は shbox を一時 config で起動し、実 `ssh` client から接続する。以下は代表的な command 例であり、`$PORT`、`$OWNER_KEY`、`$ADMIN_KEY` は harness が作る。
 
 リポジトリに含まれる現在の OpenSSH harness は、次のコマンドで実行する。stable と MSRV
-1.91 の各 full test run で unit/state 113 件、harness 15 件が通過する。loopback bind を
+1.91 の各 full test run で unit/state 113 件、harness 21 件が通過する。うち M8 の real
+Arapuca cases 6 件は `SHBOX_RUN_ARAPUCA_INTEGRATION` を設定した platform gate でだけ実行し、
+通常 run では fail-closed 側を安全に確認して終了する。loopback bind を
 制限する環境では、`server::tests::bind_all_is_all_or_nothing` だけが権限エラーになるため、
 release artifact を作る際は loopback bind を許可した runner で再実行する。
 
@@ -304,7 +306,7 @@ forwarding、X11、agent、SFTP、direct-tcpip、streamlocal request は明示 r
 ```console
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
+cargo test --locked --all-targets -- --test-threads=1
 cargo test --locked --test ssh_auth -- --test-threads=1
 ```
 
