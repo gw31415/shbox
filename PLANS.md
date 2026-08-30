@@ -32,9 +32,9 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 と Milestone 2 は完了し、検証証跡ごと git history に archive 済みである。
+- Milestone 1 から Milestone 3 までは完了し、検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
-  `cargo test --locked --all-targets` が通り、M2 の実 OpenSSH harness は 9 test を通過する。
+  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 9 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
@@ -44,10 +44,13 @@ selector、installer、永続 terminal session はありません。
   ownership-safe file validation、connection-scoped Principal を持つ。`server.rs` は
   concurrent connection handling、handshake/auth timeout、connection/auth caps、
   all-or-nothing bind を持つ。`ssh/` は session channel、admin-only `_` host shell/exec/PTY、
-  generic unavailable な sandbox/list/delete placeholder と request rejection を実装済み。
+  generic unavailable な未接続 request と request rejection を実装済み。`sandbox/` は
+  v1 metadata、fd-relative no-follow storage、owner/count admission、Active/Deleting
+  lifecycle、filtered list/delete、startup reconciliation、runtime launcher seam を持ち、
+  `main.rs` は bind 前に registry を scan/reconcile する。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M2 の後続依存: sandbox request は SandboxManager 実装まで unavailable のまま、terminal
+- M3 の後続依存: sandbox request は M4 の SSH wiring まで unavailable のまま、terminal
   modes は M6、SIGHUP reload と `max_host_processes` enforcement は M7 の作業である。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
@@ -104,7 +107,6 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 
 ## 進捗
 
-- [ ] Milestone 3 — durable SandboxManager storage と ownership
 - [ ] Milestone 4 — deterministic launcher による SSH request semantics
 - [ ] Milestone 5 — production Arapuca non-PTY process Adapter
 - [ ] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
@@ -115,51 +117,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 3 — durable SandboxManager storage と ownership
-
-### 目標
-
-Arapuca なしで、persistent metadata/workspace の atomic な first-owner-wins creation、filtered
-list、idempotent delete、corruption blocking、crash-resumable な Deleting state を実装します。
-
-### 編集内容
-
-1. src/sandbox/ の下に validated domain type と v1 metadata parser/serializer を追加します。
-2. safe no-follow/open-at-style storage operation、明示的 mode、atomic file
-   fsync/rename/parent-fsync、sandbox root の外へ cross できない deletion を実装します。
-3. keyed lock、atomic owner/count reservation、Active/Deleting admission、filtered sorted list、
-   runtime registry placeholder を備えた SandboxManager を実装します。
-4. startup scan を実装します。valid Active record を load し、Deleting record を resume し、
-   missing/corrupt/unknown-version management entry は block しますが決して mutate しません。
-   owner/admin の再 delete は保存済み owner fingerprint で認可し、state を再書込みせず
-   Deleting cleanup を再開します。startup reconciliation は caller 無しで durable intent を
-   再開します。
-5. private な ProcessLauncher Seam と deterministic fake Adapter を実装します。
-6. 二つの key による一つの ID の claim、create-vs-delete、delete-vs-launch、異なる二つの ID、
-   count reservation、transition 中の list の barrier-driven race を追加します。
-7. すべての durable write/rename/fsync/delete step の周囲に fault point を追加し、各 injected
-   failure の後に manager を restart します。
-
-### 成果
-
-- 一つの fingerprint だけが ID を所有します。losing key は foreign sandbox の存在と
-  absent/inaccessible target を区別できません。
-- claim 後の launch failure では、owner/workspace が retry 用に残ります。
-- Deleting entry は隠され、deletion 完了まで launch を block します。
-- corrupt entry は ID を block し、admin/out-of-band inspection 用に残ります。
-
-### 検証
-
-```console
-cargo test --locked sandbox::
-cargo test --locked --test lifecycle_races -- --test-threads=1
-cargo test --locked --test crash_recovery -- --test-threads=1
-```
-
-期待結果: deterministic race test が繰り返し通ること。各 simulated crash の後、registry が
-指定された recoverable state のいずれかになること。hostile symlink と special file が、
-temporary XDG root の外で read/delete を発生させないこと。
 
 ## Milestone 4 — deterministic launcher による SSH request semantics
 

@@ -7,10 +7,9 @@
 //! SHA256:<43 characters of unpadded standard base64>
 //! ```
 //!
-//! Fingerprints printed by `ssh-keygen -lf` parse here unchanged. Milestone 2
-//! extends this module with authorized-keys line parsing and principals;
-//! Milestone 1 validates fingerprints referenced by configuration and the
-//! file-level safety of the authorized-keys file itself.
+//! Fingerprints printed by `ssh-keygen -lf` parse here unchanged. The module
+//! also owns the bounded authorized-keys parser, connection principals, and
+//! the file-level safety checks used by the SSH server.
 
 use std::fmt;
 use std::fs;

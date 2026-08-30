@@ -1,10 +1,10 @@
 //! shbox: a foreground SSH daemon that maps authenticated keys onto
 //! persistent sandbox workspaces.
 //!
-//! Milestone 2 bootstrap: resolve and validate every local input, then run
-//! the public-key SSH server with the admin-only `_` host route. Sandbox
-//! shell/exec/list/delete still answer the intentional unavailable response
-//! until the SandboxManager arrives.
+//! Milestone 3 bootstrap: resolve and validate every local input, reconcile
+//! durable sandbox metadata, then run the public-key SSH server with the
+//! admin-only `_` host route. Sandbox process requests remain unavailable
+//! until the process launcher milestones connect to the manager.
 
 mod account;
 mod auth;
@@ -131,6 +131,8 @@ async fn run() -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
+    let _sandbox_manager = sandbox::SandboxManager::open(&paths, *app_config.caps())
+        .map_err(|err| fail("reconciling sandbox registry", err))?;
 
     debug!(
         limits = ?app_config.limits(),
