@@ -32,14 +32,30 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- リポジトリは単一の Rust package、shbox version 0.1.0、edition 2024 です。
-- src/main.rs はまだ生成された Hello, world! プログラムです。
-- Cargo.toml に依存関係はありません。
-- docs/ 以下の仕様が実装契約です。
-- Cargo.lock はローカルにすでに存在する場合があります。Milestone 1 で意図的に再生成して
-  検証するまでは、ユーザーの作業として扱ってください。最終 application repository では
-  lockfile を追跡対象にします。
-- 実装、test harness、CI workflow、deployment example、release artifact はまだありません。
+- Milestone 1 は完了し、検証証跡ごと git history に archive 済みである。local では stable
+  1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) / `cargo test --locked` (56 test)
+  が通ることを確認済み。
+- Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
+  `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
+  backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
+  rand 0.10 (`rand::rng()`) に依存する。
+- src/ の現状: `main.rs` (Tokio bootstrap、SIGINT/SIGTERM で終了、SIGHUP は未実装を
+  log するだけ)、`config.rs` (typed TOML snapshot、欠落時は built-in default)、
+  `paths.rs`、`lockfile.rs` (registry.lock → state lock の順で non-blocking flock、
+  失敗時 rollback)、`hostkey.rs` (link(2) による atomic create、既存鍵は決して置換
+  しない)、`auth.rs` (KeyFingerprint 型と authorized_keys の file-level 検証のみ)、
+  `account.rs`、`logging.rs` (reload 可能な level filter、まだ SIGHUP 非接続)、
+  `server.rs` (`probe_listen` の all-or-nothing bind 検証)、`sandbox/id.rs`、
+  `platform/mod.rs` (Arapuca 公開 API の compile probe のみ)。
+- Milestone 2 は `server.rs` の `probe_listen` を実際の russh listener に置き換え、
+  `auth.rs` に authorized_keys の行 parse と connection-scoped Principal を追加する。
+- 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
+  `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
+  shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
+  entry であり、`--help`/`--version` はその中で処理される。CLI の説明文は `Args` の
+  doc comment から生成される。
+- Arapuca の公開 API は `Profile`、`sanitize_task_id`、`platform::Sandbox` trait が
+  compile 済み。`Config` / `Process` を実際に組み立てるのは Milestone 5 である。
 
 以下のすべてのコマンドは、repository root で実行します。
 
@@ -88,7 +104,6 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 
 ## 進捗
 
-- [ ] Milestone 1 — package foundation、typed configuration、process bootstrap
 - [ ] Milestone 2 — public-key SSH server と admin host route
 - [ ] Milestone 3 — durable SandboxManager storage と ownership
 - [ ] Milestone 4 — deterministic launcher による SSH request semantics
@@ -101,59 +116,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 1 — package foundation、typed configuration、process bootstrap
-
-### 目標
-
-shbox、shbox --help、shbox --version が動作し、SSH connection をまだ受け付けずに、
-startup がすべての local input を解決・検証します。無効な state は sandbox process を一つも
-開始する前に失敗しなければなりません。
-
-### 編集内容
-
-1. src/main.rs を Tokio foreground bootstrap と小さな signal loop に置き換えます。
-2. [docs/configuration.md](docs/configuration.md) の exact schema に従う src/config.rs を追加
-   します。built-in defaults、optional TOML、deny_unknown_fields、absolute-path validation、
-   duplicate detection、field-size limits、immutable runtime snapshots を実装します。
-3. XDG path resolution と安全な directory creation を追加します。config/data/state path は
-   validated な Paths value に保持し、標準 XDG variable 以外の CLI/env override は追加
-   しません。
-4. UTC RFC 3339 timestamp と動的 log-level reload を備えた structured tracing initialization
-   を追加します。
-5. Ed25519 host-key の load/atomic-create と permission check を追加します。さらに
-   `$XDG_DATA_HOME/shbox/registry.lock` と `$XDG_STATE_HOME/shbox/lock` をこの順で
-   non-blocking に取得し、同じ data root または state root の二重 daemon を拒否します。
-6. 重要な dependency を厳密宣言します。Arapuca を full rev で pin し、文書化した
-   russh crypto backend を一つ有効にし、その後 Cargo.lock を意図的に再生成して追跡します。
-7. configuration、SandboxId grammar、path validation、limits、environment name/value、fingerprint
-   syntax、missing config、unsafe permissions の unit/property test を追加します。
-
-### 成果
-
-- 引数なしで initialization が開始します。subcommand や server-setting flag はありません。
-- missing config では built-in defaults を使います。malformed config、missing/empty authorized
-  keys、unsafe file permissions、corrupt host key、duplicate data/state daemon lock、bind できない
-  configured path は明示的なエラーになります。同じ data root と別 state/listener、および
-  同じ state root と別 data/listener の第二 daemon も拒否します。
-- missing host key は mode 0600 で atomic に作成します。既存の invalid key は決して置換
-  しません。
-
-### 検証
-
-実行:
-
-```console
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --locked config
-cargo run --locked -- --help
-cargo run --locked -- --version
-```
-
-期待結果: すべての check が Rust 1.91 と stable で通ること。help には -h/--help と
--V/--version だけが表示されること。property test が、非 ASCII、slash、dot、underscore、
-leading hyphen、empty、overlong なすべての SandboxId を拒否すること。
 
 ## Milestone 2 — public-key SSH server と admin host route
 
@@ -557,7 +519,9 @@ v0.1 の完了を宣言する前に、コード inspection だけでなく観測
 ## proof で解消すべき既知の実装リスク
 
 - pin した Arapuca revision は unreleased commit で、package version はまだ 0.2.7 です。
-  abstraction を作る前に、その exact public API を compile します。
+  `Profile` / `sanitize_task_id` / `platform::Sandbox` の compile は Milestone 1 で確認
+  済みですが、`Config` と `Process` を組み立てる adapter 実装 (Milestone 5) まで
+  abstraction を作りません。
 - Arapuca の effective HOME override order は、comments と衝突する implementation behavior
   です。使用可能と扱う前に、Linux と macOS の environment integration test が必須です。
 - macOS Seatbelt は deprecated であり、upstream の public CI は各 named OS version の raw PTY
