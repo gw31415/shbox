@@ -2,19 +2,23 @@
 
 ## Release decision
 
-**BLOCKED — UNVERIFIED (2026-08-30).**
+**BLOCKED — UNVERIFIED (2026-08-31).**
 
-この working tree には、同一 commit で blocking suite を通過した実 platform の記録がまだありません。したがって、Linux x86_64、Linux aarch64、macOS 15 arm64、macOS 26 arm64 のいずれも formal support 済み、または ship 可能とは扱いません。build 成功、runner label、Arapuca upstream の一般的な対応表だけではこの状態を解除できません。
+同一 commit で blocking suite を通過した実 platform の記録がまだありません。直近の hosted run
+`33323095132`（commit `14a590e`）は stable と Rust 1.91 の quality job が clippy で失敗し、
+Linux/macOS の platform job は skipped でした。したがって、Linux x86_64、Linux aarch64、
+macOS 15 arm64、macOS 26 arm64 のいずれも formal support 済み、または ship 可能とは扱いません。
+build 成功、runner label、Arapuca upstream の一般的な対応表だけではこの状態を解除できません。
 
 次の全てを同一 commit の blocking run で確認し、workflow log を保存できた場合だけ tuple ごとに `VERIFIED` へ更新します。一つでも未実行、前提不足、失敗、または証跡欠落なら、その tuple と release は `BLOCKED / UNVERIFIED` のままです。
 
 | tuple / gate | 現在の状態 | blocking 条件 |
 | --- | --- | --- |
-| Rust 1.91.0: fmt / clippy / test / build | artifact 未検証 | `rust-toolchains` job の全 step が成功すること |
-| Rust stable: fmt / clippy / test / build | artifact 未検証 | `rust-toolchains` job の全 step が成功すること |
-| Linux x86_64 | **BLOCKED / UNVERIFIED** | 専用 delegated cgroup v2 runner、native build、real Arapuca、real OpenSSH suite |
-| Linux aarch64 | **BLOCKED / UNVERIFIED** | 専用 delegated cgroup v2 runner、native build、real Arapuca、real OpenSSH suite |
-| macOS 15 arm64 | **BLOCKED / UNVERIFIED** | 固定 `macos-15` runner、native arm64、Seatbelt、real Arapuca、real OpenSSH suite |
+| Rust 1.91.0: fmt / clippy / test / build | **FAILED**（run `33323095132` の clippy） | `rust-toolchains` job の全 step が成功すること。修正後の hosted rerun が必要 |
+| Rust stable: fmt / clippy / test / build | **FAILED**（run `33323095132` の clippy） | `rust-toolchains` job の全 step が成功すること。修正後の hosted rerun が必要 |
+| Linux x86_64 | **BLOCKED / UNVERIFIED**（初回 run は skipped） | 専用 delegated cgroup v2 runner、native build、real Arapuca、real OpenSSH suite |
+| Linux aarch64 | **BLOCKED / UNVERIFIED**（初回 run は skipped） | 専用 delegated cgroup v2 runner、native build、real Arapuca、real OpenSSH suite |
+| macOS 15 arm64 | **BLOCKED / UNVERIFIED**（初回 run は skipped） | 固定 `macos-15` runner、native arm64、Seatbelt、real Arapuca、real OpenSSH suite |
 | macOS 26 arm64 | **BLOCKED / UNVERIFIED** (local preflight passed) | 固定 `macos-26` runner、native arm64、Seatbelt、real Arapuca、real OpenSSH suite |
 
 ### Local preflight evidence (not formal support evidence)
@@ -105,4 +109,4 @@ macOS backend は Apple の deprecated `/usr/bin/sandbox-exec` (Seatbelt) に依
 
 ## Verification status update rule
 
-この文書の matrix を `VERIFIED` に変更するのは、workflow run URL、commit、固定 OS/architecture、全 blocking job の成功ログが揃った後だけにしてください。現時点ではその証跡がないため、M8 は未完了であり release は blocking です。
+この文書の matrix を `VERIFIED` に変更するのは、workflow run URL、commit、固定 OS/architecture、全 blocking job の成功ログが揃った後だけにしてください。現時点では成功証跡がなく、初回 run は失敗しているため、M8 は未完了であり release は blocking です。

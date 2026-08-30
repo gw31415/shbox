@@ -193,7 +193,10 @@ pub(crate) struct ArapucaLauncher {
     policy: RwLock<ArapucaLaunchPolicy>,
     active_tasks: Arc<Mutex<HashSet<String>>>,
     #[cfg(target_os = "linux")]
-    linux_scope: LinuxScope,
+    // The leading underscore documents that this is an owned lifetime guard:
+    // its Drop implementation restores the daemon cgroup and removes the
+    // private child after all task leases have drained.
+    _linux_scope: LinuxScope,
 }
 
 impl fmt::Debug for ArapucaLauncher {
@@ -255,7 +258,7 @@ impl ArapucaLauncher {
             policy: RwLock::new(policy),
             active_tasks,
             #[cfg(target_os = "linux")]
-            linux_scope,
+            _linux_scope: linux_scope,
         })
     }
 

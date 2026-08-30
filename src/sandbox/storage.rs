@@ -764,7 +764,7 @@ fn is_regular(mode: libc::mode_t) -> bool {
 }
 
 fn mode_bits(mode: libc::mode_t) -> u32 {
-    mode as u32 & 0o777
+    u32::from(mode) & 0o777
 }
 
 /// Registry storage errors. Corrupt entries are data failures, not permission

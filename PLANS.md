@@ -159,7 +159,12 @@ evidence が揃うまで行わない。
 
 - 通常の serial OpenSSH harness は `21 passed`。macOS 26.6.2 arm64 の local gate も pinned
   Arapuca、Seatbelt、real suite `21 passed`、gate `PASS` まで確認済み。
-- Linux と macOS 15 の専用 runner、および同一 commit の hosted workflow log は未取得である。
+- 同一 commit `14a590e` の hosted run
+  `33323095132` は stable と Rust 1.91 の quality job が clippy で失敗し、Linux/macOS の
+  real-platform jobs は skipped になった。失敗原因は Linux cfg でのみ生きる RAII field の
+  dead-code 警告と、Linux の `mode_t` に対する不要な同型 cast であり、working tree で修正済み
+  である。修正を follow-up commit に archive してから hosted run を再実行する。
+- Linux と macOS 15 の専用 runner、および修正後の同一 commit の hosted workflow log は未取得である。
 - 上記が完了するまで M8 と release status は `[ ]` / `BLOCKED — UNVERIFIED` のままにする。
 
 ## milestone 横断の受け入れ条件
