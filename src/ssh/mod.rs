@@ -158,7 +158,9 @@ impl ConnHandler {
         let lease = managed.lease.clone();
         let process = managed.process;
         if session.channel_success(channel).is_err() {
+            let control = Arc::clone(&process.control);
             process.control.terminate();
+            channel::wait_for_process_cleanup(control).await;
             self.shared.sandbox.clear_runtime(&lease);
             self.conn.registry.remove(channel);
             return Ok(());

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use russh::ChannelId;
 use russh::server::Handle;
@@ -255,9 +256,26 @@ pub(crate) async fn spawn_host_process(
     request: HostRequest,
 ) -> Result<(host::HostProcess, host::HostWaiter), host::SpawnError> {
     // Spawn on the blocking pool: PTY allocation and fork/exec block.
-    tokio::task::spawn_blocking(move || host::HostProcess::spawn(&request))
-        .await
-        .expect("spawn_blocking join")
+    tokio::task::spawn_blocking(move || {
+        // Keep host fork/exec serialized with the sandbox adapter's
+        // non-atomic macOS pipe-CLOEXEC setup. Otherwise a host child could
+        // inherit an endpoint between pipe() and fcntl(FD_CLOEXEC).
+        let _spawn_guard = crate::platform::process_spawn_lock()
+            .lock()
+            .expect("process spawn lock");
+        host::HostProcess::spawn(&request)
+    })
+    .await
+    .expect("spawn_blocking join")
+}
+
+/// Wait for an adapter's reap/cleanup owner after an abnormal channel
+/// teardown. Persistent workspace deletion must not race this boundary.
+pub(crate) async fn wait_for_process_cleanup(control: Arc<dyn platform::RunningProcess>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = control.wait_for_cleanup(TEARDOWN_GRACE);
+    })
+    .await;
 }
 
 /// Bridge an already-started host process to one SSH channel.
@@ -474,10 +492,12 @@ pub(crate) async fn run_sandbox_process(
     };
 
     if result != ChannelResult::Completed {
+        let control = Arc::clone(&process.control);
         process.control.terminate();
         for pump in pumps {
             pump.abort();
         }
+        wait_for_process_cleanup(control).await;
         let _ = sink.close(id).await;
         return result;
     }

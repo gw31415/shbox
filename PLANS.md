@@ -32,15 +32,15 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 から Milestone 4 までは完了し、各検証証跡ごと git history に archive 済みである。
+- Milestone 1 から Milestone 5 までは完了し、各検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
   `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 10 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
   rand 0.10 (`rand::rng()`) に依存する。
-- src/ の現状: `main.rs` は validated snapshot を組み立て、実際の russh listener を
-  SIGINT/SIGTERM まで serve する。`auth.rs` は bounded な Ed25519 authorized_keys parser、
+- src/ の現状: `main.rs` は validated snapshot と process-lifetime Arapuca adapter を
+  組み立て、実際の russh listener を SIGINT/SIGTERM まで serve する。`auth.rs` は bounded な Ed25519 authorized_keys parser、
   ownership-safe file validation、connection-scoped Principal を持つ。`server.rs` は
   concurrent connection handling、handshake/auth timeout、connection/auth caps、
   all-or-nothing bind を持つ。`ssh/` は session channel、admin-only `_` host shell/exec/PTY、
@@ -49,18 +49,25 @@ selector、installer、永続 terminal session はありません。
   lifecycle、filtered list/delete、startup reconciliation、manager-owned runtime launcher seam、
   per-launch lease を持つ。`ssh/` は manager-backed list/delete と bounded sandbox stream
   bridge を持ち、`main.rs` は bind 前に registry を scan/reconcile する。
+  `platform/arapuca.rs` は pinned runtime の profile/env mapping、unique task lease、owned
+  non-PTY pipes、daemon-owned spawn lock、private Linux cgroup child、process-group kill、
+  blocking wait と cleanup を実装する。manager は workspace delete 前の runtime reap/cleanup
+  barrier を持つ。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M4 の残存依存: production Arapuca non-PTY adapter は M5、terminal modes と実 PTY は M6、
-  SIGHUP reload と `max_host_processes` enforcement は M7 の作業である。現在の production
-  launcher は adapter 未接続時に fail closed し、host process へ fallback しない。
+- M5 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated cgroup
+  child 作成権限が必要なため、現 macOS 開発環境では fail-closed が観測された状態である。
+  wrapper を含む実行環境での full exec/environment/network/descendant evidence は M8 の
+  release gate に残る。terminal modes と実 PTY は M6、SIGHUP reload と
+  `max_host_processes` enforcement は M7 の作業である。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
   shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
   entry であり、`--help`/`--version` はその中で処理される。CLI の説明文は `Args` の
   doc comment から生成される。
-- Arapuca の公開 API は `Profile`、`sanitize_task_id`、`platform::Sandbox` trait が
-  compile 済み。`Config` / `Process` を実際に組み立てるのは Milestone 5 である。
+- Arapuca の公開 API は `Profile`、`Config`、`Process`、`sanitize_task_id`、`platform::Sandbox`
+  trait まで adapter で compile/検証済みである。実 runtime の platform acceptance は M8
+  の dedicated environment gate に残る。
 
 以下のすべてのコマンドは、repository root で実行します。
 
@@ -110,7 +117,7 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 ## 進捗
 
 - [x] Milestone 4 — deterministic launcher による SSH request semantics
-- [ ] Milestone 5 — production Arapuca non-PTY process Adapter
+- [x] Milestone 5 — production Arapuca non-PTY process Adapter
 - [ ] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
 - [ ] Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
 - [ ] Milestone 8 — real-platform release gates と operational examples
@@ -119,58 +126,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 5 — production Arapuca non-PTY process Adapter
-
-### 目標
-
-Sandbox exec を、persistent workspace の HOME/cwd、clean environment、read policy、resource
-limit、disabled または unrestricted outbound networking、信頼できる wait、完全な process cleanup
-を備えた実 Arapuca Process として実行します。
-
-### 編集内容
-
-1. 一つの process-lifetime Arapuca platform instance を包む production Adapter を実装します。
-   connection ごと、または SIGHUP 時に再構築してはなりません。
-2. Linux では cgroup v2、required delegated controller、wrapper/runtime prerequisite、shbox
-   だけを含む dedicated scope を preflight します。scope が shared または invalid なら
-   sandbox backend を fail closed にします。
-3. validated な shbox policy だけを Arapuca profile へ変換します。workspace write access、
-   curated/configured canonical read path、allow-exec、common/platform limit、network mode を
-   含めます。raw Arapuca control は private に保ちます。
-4. launch ごとに unique な <sandbox-id>-<128-bit-random-hex> task ID を生成し、active lease
-   set を維持します。external ID は log/correlation 用に分離して保持します。
-5. workspace の HOME、cwd、shell、sanitized global sandbox environment を渡します。pin した
-   Arapuca revision が Linux と macOS の両方で最終 environment を実際に提供することを検証
-   します。
-6. owned pipe で non-PTY stdio を bridge し、blocking な Process::wait() を blocking task で
-   実行します。wait と cleanup が完了するまで Process を保持します。
-7. process-group termination と Arapuca cleanup を実装し、descendant をテストします。
-
-### 成果
-
-- ssh id@host command は configured sandbox shell を -c 付きで使い、persistent workspace
-  home/cwd、分離された stdout/stderr、remote exit status を提供します。
-- network = "disabled" は outbound connection を作れません。network = "outbound" は v0.1
-  から unrestricted outbound TCP/UDP/DNS をサポートし、isolation posture が低下することを
-  log します。
-- backend initialization または launch failure が unsandboxed host process へ fallback する
-  ことはありません。
-
-### 検証
-
-各 candidate formal platform の、required delegated/service environment 下で:
-
-```console
-cargo test --locked --test arapuca_exec -- --test-threads=1
-cargo test --locked --test arapuca_environment -- --test-threads=1
-cargo test --locked --test arapuca_network -- --test-threads=1
-cargo test --locked --test arapuca_cleanup -- --test-threads=1
-```
-
-期待結果: workspace file は reconnect/restart 後も残り、process-local state は残らないこと。
-disabled networking は fail し、outbound mode は controlled test endpoint に到達すること。
-disconnect/delete/shutdown の後に child と descendant の PID が消えること。
 
 ## Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
 
@@ -378,9 +333,8 @@ v0.1 の完了を宣言する前に、コード inspection だけでなく観測
 ## proof で解消すべき既知の実装リスク
 
 - pin した Arapuca revision は unreleased commit で、package version はまだ 0.2.7 です。
-  `Profile` / `sanitize_task_id` / `platform::Sandbox` の compile は Milestone 1 で確認
-  済みですが、`Config` と `Process` を組み立てる adapter 実装 (Milestone 5) まで
-  abstraction を作りません。
+  `platform/arapuca.rs` が `Config` と `Process` を組み立てますが、wrapper と formal
+  platform environment がない開発環境では実 process behavior を成功扱いにしません。
 - Arapuca の effective HOME override order は、comments と衝突する implementation behavior
   です。使用可能と扱う前に、Linux と macOS の environment integration test が必須です。
 - macOS Seatbelt は deprecated であり、upstream の public CI は各 named OS version の raw PTY

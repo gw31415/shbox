@@ -49,7 +49,7 @@ c94802c4d8b6b880334c0d643b16b7326ec7f039
 
 ### 3.2 Linux
 
-Linux の実 Arapuca suite は cgroups v2、`cpu`/`cpuset`/`memory`/`pids` controller の delegation、必要な kernel/wrapper capability が揃った専用 service scope で実行する。scope 内には shbox とその子 process 以外を置かない。次のような事前情報を artifact に保存する。
+Linux の実 Arapuca suite は cgroups v2、`cpu`/`cpuset`/`memory`/`pids` controller の delegation、必要な kernel/wrapper capability が揃った service scope で実行する。shbox は起動時にその scope の下へ private child cgroup を作り、daemon PID だけを移動して Arapuca の stale cleanup 範囲を閉じる。child 作成・移動・controller 検証ができない場合は backend unavailable として扱う。次のような事前情報を artifact に保存する。
 
 ```console
 uname -a
@@ -59,7 +59,7 @@ cat /sys/fs/cgroup/cgroup.controllers
 cat /sys/fs/cgroup/cgroup.subtree_control
 ```
 
-専用 scope を証明できない runner では、cgroup を使う real integration を成功扱いにしない。Arapuca manager の startup cleanup が同一 scope の `arapuca-*` group を kill/remove し得るためである。必要な delegated scope の配備例は [platforms.md](platforms.md) を参照する。
+private child を作成できない runner では、cgroup を使う real integration を成功扱いにしない。Arapuca manager の startup cleanup が現在の child 以下の `arapuca-*` group を kill/remove し得るためである。必要な delegated scope の配備例は [platforms.md](platforms.md) を参照する。
 
 ### 3.3 macOS
 
@@ -161,6 +161,8 @@ path、root 外 symlink、二つの advisory lock、再起動後の metadata/wor
 ## 6. OpenSSH integration suite
 
 test harness は shbox を一時 config で起動し、実 `ssh` client から接続する。以下は代表的な command 例であり、`$PORT`、`$OWNER_KEY`、`$ADMIN_KEY` は harness が作る。
+
+リポジトリの通常 OpenSSH test は、wrapper と delegated cgroup がない開発環境でも安全性を検証できるよう、sandbox request が status 111 の generic failure になることを既定の合格条件にする。実 Arapuca の成功経路を試験する場合だけ `SHBOX_RUN_ARAPUCA_INTEGRATION=1` を test process と daemon に継承させ、sandbox exec が status 0 と期待 output を返すことを要求する。両方の結果を一つの `or` 条件で合格扱いにしてはならない。
 
 ### 6.1 exec、ownership、list、delete
 

@@ -1,6 +1,6 @@
 //! Private process-launch seam.
 //!
-//! The production adapter (Milestone 5) wraps the pinned Arapuca revision
+//! The production adapter wraps the pinned Arapuca revision
 //! `c94802c4d8b6b880334c0d643b16b7326ec7f039` (package version 0.2.7). Tests
 //! get a deterministic fake launcher with barriers and failure injection;
 //! nothing here is a configurable backend, and no Arapuca type leaks into the
@@ -9,9 +9,30 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::sandbox::SandboxId;
+
+#[cfg(unix)]
+mod arapuca;
+
+#[cfg(unix)]
+pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
+
+/// Serialize every daemon-owned process spawn with adapter pipe creation.
+///
+/// macOS has no `pipe2(O_CLOEXEC)` equivalent exposed by the supported libc
+/// surface. Holding this process-wide lock across pipe creation and the
+/// subsequent fork/exec prevents host and sandbox launches from creating a
+/// child while an endpoint is still being marked close-on-exec. Linux also
+/// uses the lock for one uniform spawn boundary, even though it has an
+/// atomic pipe primitive.
+static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn process_spawn_lock() -> &'static Mutex<()> {
+    &PROCESS_SPAWN_LOCK
+}
 
 /// The operation a sandbox process must perform.  This is deliberately a
 /// protocol-neutral value: the SSH layer never passes an Arapuca type across
@@ -45,6 +66,11 @@ pub(crate) struct LaunchRequest {
 /// process lifetime while the channel bridge owns the I/O endpoints.
 pub(crate) trait RunningProcess: fmt::Debug + Send + Sync {
     fn terminate(&self);
+
+    /// Wait until the adapter has reaped the process and released all
+    /// platform-owned resources. Delete uses this before removing a
+    /// workspace, so termination is not merely an asynchronous signal.
+    fn wait_for_cleanup(&self, timeout: Duration) -> bool;
 
     /// Forward a validated SSH signal.  The production implementation maps
     /// this to its process group; the default keeps older adapters harmless.
@@ -119,9 +145,9 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
-/// Until Milestone 5 constructs the process-lifetime Arapuca adapter, sandbox
-/// requests fail closed after the durable claim.  This adapter is deliberately
-/// not selectable through config or SSH.
+/// Fallback used when the process-lifetime Arapuca adapter could not be
+/// initialized. Sandbox requests fail closed after the durable claim. This
+/// adapter is deliberately not selectable through config or SSH.
 #[derive(Debug, Default)]
 pub(crate) struct UnavailableLauncher;
 
@@ -224,6 +250,7 @@ impl ProcessLauncher for FakeLauncher {
 #[cfg(test)]
 pub(crate) struct FakeProcess {
     terminated: std::sync::atomic::AtomicBool,
+    cleanup_complete: std::sync::atomic::AtomicBool,
     signals: std::sync::Mutex<Vec<i32>>,
     resizes: std::sync::Mutex<Vec<(u32, u32)>>,
     stdin: tokio::sync::Mutex<tokio::io::DuplexStream>,
@@ -308,6 +335,7 @@ impl FakeProcess {
     ) -> FakeProcess {
         FakeProcess {
             terminated: std::sync::atomic::AtomicBool::new(false),
+            cleanup_complete: std::sync::atomic::AtomicBool::new(false),
             signals: std::sync::Mutex::new(Vec::new()),
             resizes: std::sync::Mutex::new(Vec::new()),
             stdin: tokio::sync::Mutex::new(stdin),
@@ -322,6 +350,11 @@ impl FakeProcess {
 
     pub(crate) fn terminated(&self) -> bool {
         self.terminated.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_clean_for_test(&self) {
+        self.cleanup_complete
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn signals(&self) -> Vec<i32> {
@@ -378,6 +411,8 @@ impl FakeProcess {
         if let Some(wait) = wait {
             let _ = wait.send(Ok(exit));
         }
+        self.cleanup_complete
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn terminate_now(&self) {
@@ -393,6 +428,8 @@ impl FakeProcess {
         if let Some(wait) = wait {
             let _ = wait.send(Ok(ProcessExit::Code(143)));
         }
+        self.cleanup_complete
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -408,6 +445,11 @@ enum FakeOutput {
 impl RunningProcess for FakeProcess {
     fn terminate(&self) {
         self.terminate_now();
+    }
+
+    fn wait_for_cleanup(&self, _timeout: Duration) -> bool {
+        self.cleanup_complete
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn signal(&self, number: i32) {
@@ -519,21 +561,21 @@ mod tests {
     /// plan calls out; this keeps the surface compiling from Milestone 1 on.
     #[test]
     fn pinned_arapuca_public_api_compiles() {
-        let profile = arapuca::Profile::default();
+        let profile = ::arapuca::Profile::default();
         assert_eq!(profile.max_open_files, 0);
-        assert_eq!(profile.seccomp_profile, arapuca::SeccompProfile::Strict);
+        assert_eq!(profile.seccomp_profile, ::arapuca::SeccompProfile::Strict);
 
         let task_id = "dev-0123456789abcdef0123456789abcdef";
         assert_eq!(
-            arapuca::sanitize_task_id(task_id).expect("valid task id"),
+            ::arapuca::sanitize_task_id(task_id).expect("valid task id"),
             task_id
         );
-        assert!(arapuca::sanitize_task_id("bad_task").is_err());
+        assert!(::arapuca::sanitize_task_id("bad_task").is_err());
 
-        fn implements_sandbox_trait<T: arapuca::platform::Sandbox>() {}
+        fn implements_sandbox_trait<T: ::arapuca::platform::Sandbox>() {}
         #[cfg(target_os = "linux")]
-        implements_sandbox_trait::<arapuca::platform::Linux>();
+        implements_sandbox_trait::<::arapuca::platform::Linux>();
         #[cfg(target_os = "macos")]
-        implements_sandbox_trait::<arapuca::platform::Darwin>();
+        implements_sandbox_trait::<::arapuca::platform::Darwin>();
     }
 }

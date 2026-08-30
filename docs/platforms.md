@@ -146,9 +146,9 @@ directory と config を先に準備し、`ssh _@host` が利用できること�
 1. Linux kernel 5.13 以上と cgroups v2。
 2. `cpu`、`cpuset`、`memory`、`pids` controller が shbox service に delegated されていること。
 3. Arapuca の必要な wrapper/loader と launch capability が利用可能であること。
-4. shbox daemon が、他の daemon や無関係な process を含まない専用 cgroup scope で起動していること。
+4. shbox daemon が、delegated scope の下に private child cgroup を作成し、そこへ自身を移動できること。
 
-Arapuca は `/proc/self/cgroup` から自身の scope を自動検出し、backend manager の生成時に `arapuca-*` の stale group を cleanup する。専用 API で base cgroup path を指定できないため、同じ scope を別 daemon と共有してはならない。共有すると、他利用者の group を stale と誤認して kill/remove したり、controller enable のために scope 内 PID を移動したりする危険がある。limits が無い場合も manager 初期化時の cleanup は起こり得る。
+Arapuca は `/proc/self/cgroup` から自身の scope を自動検出し、backend manager の生成時に `arapuca-*` の stale group を cleanup する。shbox は backend 初期化前に delegated scope の下へ自身専用の random-named child cgroup を作り、daemon PID だけを移動する。これにより Arapuca の cleanup と controller 操作はその private child 以下に限定される。child の作成・PID 移動・required controller の検証に失敗した場合は sandbox backend を fail closed にする。親 scope は他用途と共有されていてもよいが、同じ service account が private child へ無関係な process を追加してはならず、親で `cpu`、`cpuset`、`memory`、`pids` が child に pre-delegate されていなければならない。limits が無い場合も manager 初期化時の cleanup は起こり得る。
 
 systemd の delegated user/service scope の最小例は次のとおりである。実際のユーザー名、binary path、port 権限は配備環境に合わせる。
 

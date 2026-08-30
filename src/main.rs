@@ -1,10 +1,11 @@
 //! shbox: a foreground SSH daemon that maps authenticated keys onto
 //! persistent sandbox workspaces.
 //!
-//! Milestone 4 bootstrap: resolve and validate every local input, reconcile
-//! durable sandbox metadata, then run the public-key SSH server with the
-//! admin-only `_` host route. The production sandbox adapter remains
-//! fail-closed until the Arapuca milestone connects it.
+//! Bootstrap: resolve and validate every local input, reconcile durable
+//! sandbox metadata, initialize the process-lifetime Arapuca adapter, then
+//! run the public-key SSH server with the admin-only `_` host route. Adapter
+//! initialization remains fail-closed for sandbox launches so host recovery
+//! and metadata management do not depend on a working sandbox runtime.
 
 mod account;
 mod auth;
@@ -131,8 +132,21 @@ async fn run() -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
+    let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
+    let launcher: Arc<dyn platform::ProcessLauncher> = match platform::ArapucaLauncher::new(
+        launch_policy,
+    ) {
+        Ok(launcher) => {
+            info!("sandbox process adapter initialized");
+            Arc::new(launcher)
+        }
+        Err(error) => {
+            warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
+            Arc::new(platform::UnavailableLauncher)
+        }
+    };
     let sandbox_manager = Arc::new(
-        sandbox::SandboxManager::open(&paths, *app_config.caps())
+        sandbox::SandboxManager::open_with_launcher(&paths, *app_config.caps(), launcher)
             .map_err(|err| fail("reconciling sandbox registry", err))?,
     );
 

@@ -236,6 +236,14 @@ fn run_ssh_command(
         .expect("ssh runs")
 }
 
+/// Real Arapuca execution is an explicit environment-gated acceptance test.
+/// Ordinary CI and developer runs must prove the fail-closed path when the
+/// wrapper/delegated cgroup is not provisioned; a successful branch is never
+/// accepted merely because the adapter happened to be unavailable.
+fn arapuca_integration_enabled() -> bool {
+    std::env::var_os("SHBOX_RUN_ARAPUCA_INTEGRATION").is_some()
+}
+
 /// The `_` host route runs the daemon account's login shell and command.
 #[test]
 fn admin_host_exec_works() {
@@ -380,15 +388,21 @@ fn unregistered_key_and_non_publickey_methods_are_refused() {
     assert!(stderr.contains("Permission denied"), "{stderr}");
 }
 
-/// Sandbox process launch is still unavailable until the production adapter,
-/// but claiming an ID is durable so management requests can observe it.
+/// Sandbox launches fail closed by default. A real-platform harness opts in
+/// explicitly with SHBOX_RUN_ARAPUCA_INTEGRATION and must then observe a real
+/// successful launch.
 #[test]
-fn sandbox_requests_are_currently_unavailable() {
+fn sandbox_requests_execute_or_fail_closed() {
     let daemon = TestDaemon::start(&["admin"]);
     let result = daemon.ssh(&daemon.normal_key, "dev", "printf nope", &["-T"]);
-    assert!(!result.ok(), "sandbox route is not implemented yet");
-    assert_eq!(result.status, 111, "generic unavailable status");
-    assert!(!result.stdout.contains("nope"));
+    if arapuca_integration_enabled() {
+        assert_eq!(result.status, 0, "real Arapuca launch failed: {result:?}");
+        assert_eq!(result.stdout, "nope");
+    } else {
+        assert_eq!(result.status, 111, "sandbox must fail closed: {result:?}");
+        assert!(result.stderr.contains("request cannot be completed"));
+        assert!(!result.stdout.contains("nope"));
+    }
 }
 
 /// The real OpenSSH subsystem reaches the manager for owner-filtered and
@@ -397,10 +411,16 @@ fn sandbox_requests_are_currently_unavailable() {
 fn sandbox_list_and_delete_are_wired_to_the_manager() {
     let daemon = TestDaemon::start(&["admin"]);
 
-    // The terminal adapter is intentionally not ready in this milestone, but
-    // the request still exercises lazy first-owner claim.
+    // The request exercises lazy first-owner claim. The real-platform suite
+    // opts in explicitly; the default path proves unavailable is fail-closed.
     let claim = daemon.ssh(&daemon.normal_key, "dev", "printf ignored", &["-T"]);
-    assert_eq!(claim.status, 111, "launch failure is generic");
+    if arapuca_integration_enabled() {
+        assert!(claim.ok(), "real Arapuca launch failed: {claim:?}");
+        assert_eq!(claim.stdout, "ignored");
+    } else {
+        assert_eq!(claim.status, 111, "sandbox must fail closed: {claim:?}");
+        assert!(claim.stderr.contains("request cannot be completed"));
+    }
 
     // The list username is only connection context; owner filtering uses the
     // authenticated fingerprint, so it need not itself be a SandboxId.
