@@ -32,9 +32,9 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 から Milestone 6 までは完了し、各検証証跡ごと git history に archive 済みである。
+- Milestone 1 から Milestone 7 までは完了し、各検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
-  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 14 test を通過する。
+  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 15 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
@@ -48,17 +48,22 @@ selector、installer、永続 terminal session はありません。
   v1 metadata、fd-relative no-follow storage、owner/count admission、Active/Deleting
   lifecycle、filtered list/delete、startup reconciliation、manager-owned runtime launcher seam、
   per-launch lease を持つ。`ssh/` は manager-backed list/delete と bounded sandbox stream
-  bridge を持ち、`main.rs` は bind 前に registry を scan/reconcile する。
+  bridge を持ち、`main.rs` は sandbox-only mode では bind 前に registry を scan/reconcile し、
+  managed mode では認可済み recovery route を先に公開した上で background reconciliation を
+  fail-closed readiness として完了させる。`main.rs` と `server.rs` は validated SIGHUP reload、
+  graceful/forced shutdown、dynamic caps、host task registry を実装し、既存の process/connection
+  を新しい低い cap だけで evict しない。
   `platform/arapuca.rs` は pinned runtime の profile/env mapping、unique task lease、owned
   non-PTY pipes、daemon-owned spawn lock、private Linux cgroup child、process-group kill、
   blocking wait と cleanup を実装する。manager は workspace delete 前の runtime reap/cleanup
   barrier を持つ。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M5/M6 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated cgroup
-  child 作成権限が必要なため、現 macOS 開発環境では fail-closed が観測された状態である。
-  wrapper を含む実行環境での full exec/environment/network/descendant evidence は M8 の
-  release gate に残る。SIGHUP reload、shutdown、recovery、dynamic limits は M7 の作業である。
+- M5--M7 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated
+  cgroup child 作成権限が必要なため、現 macOS 開発環境では fail-closed が観測された状態で
+  ある。wrapper を含む実行環境での full exec/environment/network/descendant evidence は
+  M8 の release gate に残る。M7 の reload、shutdown、recovery、dynamic limits、hostile
+  concurrency 実装と local suite は完了している。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
   shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
@@ -118,62 +123,13 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 - [x] Milestone 4 — deterministic launcher による SSH request semantics
 - [x] Milestone 5 — production Arapuca non-PTY process Adapter
 - [x] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
-- [ ] Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
+- [x] Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
 - [ ] Milestone 8 — real-platform release gates と operational examples
 
 milestone は、proof を実行し、ユーザーから観測可能な結果が仕様と一致した後にだけ完了に
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
-
-### 目標
-
-config/key reload、abrupt disconnect、daemon termination、malformed remote request、partial
-filesystem failure、maximum concurrency の下でも、完全な daemon が bounded かつ recoverable
-であり続けます。
-
-### 編集内容
-
-1. atomic SIGHUP reload を実装します。新しい auth/role snapshot は新規 connection に、新しい
-   execution setting は新規 process に適用します。failure が一つでもあれば古い snapshot を
-   保持します。listen address は restart-only とします。
-2. SIGINT/SIGTERM の graceful shutdown を実装します。admission を停止し、runtime process を
-   parallel に terminate し、5 秒待ち、group を force し、log を flush して listener/lock
-   を解放します。二回目の signal では直ちに終了します。
-3. startup reconciliation と managed-mode の早期 _ access を実装します。sandbox-only mode
-   では listener を公開する前に reconciliation を完了しなければなりません。
-4. validated snapshot からすべての connection/channel/process/sandbox cap と auth/handshake
-   timeout を enforce します。limit が減少しただけで既存 work を evict してはなりません。
-5. hostile/malformed SSH test、oversized field test、slow-reader/writer test、disconnect storm、
-   repeated reload、backend-unavailable behavior、daemon crash、process descendant escape attempt
-   を追加します。
-6. operational error が panic しないようにします。明示的な invariant test を追加し、invariant
-   panic は location と backtrace を log してから daemon を abort します。未知の state のまま
-   継続してはなりません。
-
-### 成果
-
-- reload が partially updated policy を作ることはありません。最後の admin を削除すると
-  sandbox-only mode に入り、既存の admin connection は切断まで元の role を保持します。
-- resource use は configured cap と bounded queue によって bounded です。
-- 対応する crash/disconnect/delete/shutdown case で、指定された cleanup window と platform
-  watchdog behavior を超えて workload が実行中のまま残りません。
-
-### 検証
-
-```console
-cargo test --locked --all-targets
-cargo test --locked --test reload -- --test-threads=1
-cargo test --locked --test limits -- --test-threads=1
-cargo test --locked --test hostile_ssh -- --test-threads=1
-cargo test --locked --test daemon_crash -- --test-threads=1
-```
-
-期待結果: suite が繰り返し実行しても flaky にならずに通ること。backpressure case の memory
-が bounded であること。daemon を panic/abort で終了させるのは deliberate invariant fixture
-だけであること。
 
 ## Milestone 8 — real-platform release gates と operational examples
 

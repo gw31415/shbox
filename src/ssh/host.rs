@@ -9,6 +9,7 @@
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use russh::Pty;
 use tokio::io::AsyncWriteExt;
@@ -63,6 +64,7 @@ pub struct HostRequest {
 /// blocks on the exit status.
 pub struct HostProcess {
     pid: libc::pid_t,
+    control: Arc<HostProcessControl>,
     stdin: Option<tokio::process::ChildStdin>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
@@ -76,6 +78,24 @@ pub struct HostProcess {
     /// handed to the output pump, so window-change can still issue ioctl on
     /// the write duplicate.
     pty_size: Option<libc::winsize>,
+}
+
+/// Process-group control retained independently of the channel I/O handles.
+/// The server uses it to force-kill host groups when a second shutdown signal
+/// arrives before the bridge task can finish its graceful cleanup path.
+#[derive(Debug, Clone)]
+pub struct HostProcessControl {
+    pid: libc::pid_t,
+}
+
+impl HostProcessControl {
+    pub fn terminate(&self) -> bool {
+        signal_process_group(self.pid, libc::SIGTERM)
+    }
+
+    pub fn force_terminate(&self) -> bool {
+        signal_process_group(self.pid, libc::SIGKILL)
+    }
 }
 
 /// Owns the child and reports its exit exactly once.
@@ -141,12 +161,6 @@ impl HostProcess {
         }
         // Host mode intentionally inherits the whole daemon service
         // environment, `HOME` included; shbox does not filter it here.
-        if request.pty.is_none() {
-            // Without a PTY the cleanup path targets a dedicated process
-            // group. The PTY path must not call setpgid first: setsid in the
-            // child would then fail with EPERM for a process-group leader.
-            command.process_group(0);
-        }
         // Keep the child kill-on-drop until it is owned by the waiter. This
         // also covers the narrow error window after fork but before the PTY
         // AsyncFd wrappers have been fully constructed.
@@ -164,7 +178,7 @@ impl HostProcess {
                 // is a no-op; its normal process-group cleanup remains the
                 // explicit teardown path.
                 unsafe {
-                    command.pre_exec(set_parent_death_signal);
+                    command.pre_exec(set_session_and_parent_death_signal);
                 }
                 command.spawn().map_err(SpawnError::Exec)?
             }
@@ -231,6 +245,7 @@ impl HostProcess {
         let stderr = child.stderr.take();
         let process = HostProcess {
             pid,
+            control: Arc::new(HostProcessControl { pid }),
             stdin,
             stdout,
             stderr,
@@ -325,10 +340,11 @@ impl HostProcess {
 
     /// Send a signal to the whole process group.
     pub fn signal_group(&self, signal: i32) -> bool {
-        if self.pid <= 1 {
-            return false;
-        }
         signal_process_group(self.pid, signal)
+    }
+
+    pub fn control(&self) -> Arc<HostProcessControl> {
+        Arc::clone(&self.control)
     }
 }
 
@@ -373,6 +389,17 @@ fn signal_process_group(pid: libc::pid_t, signal: i32) -> bool {
     }
     // SAFETY: the process group was created by this spawn operation.
     unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+/// Give every host child a dedicated process group before installing the
+/// parent-death guard. On Linux, the session setup must precede the prctl
+/// call because session creation can clear the inherited death signal.
+fn set_session_and_parent_death_signal() -> io::Result<()> {
+    // SAFETY: called by Command::pre_exec in the forked child before exec.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    set_parent_death_signal()
 }
 
 #[cfg(target_os = "linux")]
@@ -432,7 +459,7 @@ impl Drop for HostProcess {
     fn drop(&mut self) {
         // If the owner drops the process without an orderly teardown, make
         // sure the process group does not outlive shbox silently.
-        self.signal_group(libc::SIGTERM);
+        self.control.terminate();
     }
 }
 

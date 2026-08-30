@@ -5,8 +5,9 @@
 //! accepted TCP connection gets a handshake deadline that ends as soon as
 //! authentication succeeds; authenticated connections have no idle timeout.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use russh::server::{self, Config};
@@ -25,8 +26,7 @@ pub type HandlerError = russh::Error;
 /// Connection admission counters for the configured caps.
 #[derive(Debug)]
 pub struct Limiter {
-    max_unauthenticated: usize,
-    max_connections: usize,
+    caps: RwLock<Caps>,
     unauthenticated: AtomicUsize,
     total: AtomicUsize,
 }
@@ -34,20 +34,29 @@ pub struct Limiter {
 impl Limiter {
     pub fn new(caps: &Caps) -> Limiter {
         Limiter {
-            max_unauthenticated: caps.max_unauthenticated_connections as usize,
-            max_connections: caps.max_connections as usize,
+            caps: RwLock::new(*caps),
             unauthenticated: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
         }
     }
 
+    /// Replace admission limits for future connections. Existing slots remain
+    /// valid, so lowering a cap never evicts an active connection.
+    pub fn reload_caps(&self, caps: &Caps) {
+        *self.caps.write().expect("connection limiter caps") = *caps;
+    }
+
     /// Reserve a connection slot, enforcing both caps atomically enough for
     /// the admission decision: a slot is only granted under both limits.
     pub fn admit(self: &Arc<Self>) -> Option<Arc<LimiterSlot>> {
-        if !try_acquire(&self.total, self.max_connections) {
+        let caps = *self.caps.read().expect("connection limiter caps");
+        if !try_acquire(&self.total, caps.max_connections as usize) {
             return None;
         }
-        if !try_acquire(&self.unauthenticated, self.max_unauthenticated) {
+        if !try_acquire(
+            &self.unauthenticated,
+            caps.max_unauthenticated_connections as usize,
+        ) {
             self.release_connection();
             return None;
         }
@@ -103,6 +112,140 @@ pub struct LimiterSlot {
     unauthenticated: AtomicBool,
 }
 
+/// Dynamic cap for host processes. The slot is held by exactly one host
+/// bridge, so a connection can open several independent channels without
+/// allowing the aggregate host-process count to exceed the current snapshot.
+#[derive(Debug)]
+pub(crate) struct HostProcessLimiter {
+    cap: RwLock<usize>,
+    in_flight: AtomicUsize,
+}
+
+impl HostProcessLimiter {
+    pub(crate) fn new(caps: &Caps) -> HostProcessLimiter {
+        HostProcessLimiter {
+            cap: RwLock::new(caps.max_host_processes as usize),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn reload_caps(&self, caps: &Caps) {
+        *self.cap.write().expect("host process cap") = caps.max_host_processes as usize;
+    }
+
+    pub(crate) fn admit(self: &Arc<Self>) -> Option<HostProcessSlot> {
+        let cap = *self.cap.read().expect("host process cap");
+        if !try_acquire(&self.in_flight, cap) {
+            return None;
+        }
+        Some(HostProcessSlot {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+/// RAII admission slot for one running host process.
+#[derive(Debug)]
+pub(crate) struct HostProcessSlot {
+    limiter: Arc<HostProcessLimiter>,
+}
+
+impl Drop for HostProcessSlot {
+    fn drop(&mut self) {
+        self.limiter.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Owns the join handles for host bridges that are spawned from russh handler
+/// callbacks. Keeping the handles outside the connection task prevents a
+/// daemon shutdown from dropping the Tokio runtime while a host process is
+/// still in its TERM/KILL/reap sequence.
+#[derive(Debug, Default)]
+pub(crate) struct HostTaskRegistry {
+    tasks: std::sync::Mutex<HashMap<u64, HostTaskEntry>>,
+    next_id: AtomicU64,
+    closed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct HostTaskEntry {
+    task: tokio::task::JoinHandle<()>,
+    control: Arc<crate::ssh::host::HostProcessControl>,
+}
+
+impl HostTaskRegistry {
+    pub(crate) fn track(
+        self: &Arc<Self>,
+        task: tokio::task::JoinHandle<()>,
+        control: Arc<crate::ssh::host::HostProcessControl>,
+    ) -> Result<
+        (),
+        (
+            tokio::task::JoinHandle<()>,
+            Arc<crate::ssh::host::HostProcessControl>,
+        ),
+    > {
+        let mut tasks = self.tasks.lock().expect("host task registry");
+        if self.closed.load(Ordering::Acquire) {
+            return Err((task, control));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let registry = Arc::clone(self);
+        let wrapper = tokio::spawn(async move {
+            let _ = task.await;
+            registry.complete(id);
+        });
+        tasks.insert(
+            id,
+            HostTaskEntry {
+                task: wrapper,
+                control,
+            },
+        );
+        Ok(())
+    }
+
+    fn complete(&self, id: u64) {
+        self.tasks.lock().expect("host task registry").remove(&id);
+    }
+
+    pub(crate) fn close(&self) {
+        let _tasks = self.tasks.lock().expect("host task registry");
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn force_stop(&self) {
+        let tasks = self.tasks.lock().expect("host task registry");
+        for task in tasks.values() {
+            task.control.force_terminate();
+        }
+    }
+
+    pub(crate) async fn join_all(&self) {
+        self.close();
+        loop {
+            let tasks = {
+                let mut tasks = self.tasks.lock().expect("host task registry");
+                tasks
+                    .drain()
+                    .map(|(_, entry)| entry.task)
+                    .collect::<Vec<_>>()
+            };
+            if tasks.is_empty() {
+                return;
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+}
+
 impl LimiterSlot {
     /// The connection authenticated: it leaves the unauthenticated bucket but
     /// keeps occupying the total connection cap.
@@ -124,10 +267,11 @@ impl Drop for LimiterSlot {
 
 /// The running SSH server.
 pub struct SshServer {
-    shared: crate::ssh::Shared,
-    russh_config: Arc<Config>,
+    shared: RwLock<crate::ssh::Shared>,
+    host_key: russh::keys::PrivateKey,
     limiter: Arc<Limiter>,
-    handshake_timeout: Duration,
+    host_process_limiter: Arc<HostProcessLimiter>,
+    host_tasks: Arc<HostTaskRegistry>,
 }
 
 impl SshServer {
@@ -138,14 +282,46 @@ impl SshServer {
         host_key: russh::keys::PrivateKey,
         app_config: &AppConfig,
     ) -> SshServer {
+        let caps = app_config.caps();
+        SshServer {
+            shared: RwLock::new(shared),
+            host_key,
+            limiter: Arc::new(Limiter::new(caps)),
+            host_process_limiter: Arc::new(HostProcessLimiter::new(caps)),
+            host_tasks: Arc::new(HostTaskRegistry::default()),
+        }
+    }
+
+    /// Publish an all-or-nothing runtime snapshot for future connections.
+    /// Existing handlers already own a clone of the previous `Shared` value.
+    pub(crate) fn reload(&self, shared: crate::ssh::Shared) {
+        let mut current = self.shared.write().expect("server shared state");
+        // Keep the shared read lock across the admission decision. The
+        // limiter changes only after this writer lock is acquired, so a new
+        // connection cannot combine an old Shared snapshot with new caps (or
+        // vice versa) while SIGHUP is publishing the replacement.
+        shared.sandbox.reload_caps(*shared.config.caps());
+        self.limiter.reload_caps(shared.config.caps());
+        self.host_process_limiter.reload_caps(shared.config.caps());
+        *current = shared;
+    }
+
+    /// Force-kill host process groups when a second shutdown signal bypasses
+    /// the normal server task. The bridge/waiter tasks may still be detached,
+    /// but no host process is allowed to continue running after this call.
+    pub(crate) fn force_stop_host_tasks(&self) {
+        self.host_tasks.close();
+        self.host_tasks.force_stop();
+    }
+
+    fn transport_config(&self, caps: &Caps) -> Arc<Config> {
         let mut methods = MethodSet::empty();
         // Public-key only: none/password/keyboard-interactive and everything
         // else are refused before they can even be attempted.
         methods.push(MethodKind::PublicKey);
-        let caps = app_config.caps();
-        let russh_config = Config {
+        Arc::new(Config {
             methods,
-            keys: vec![host_key],
+            keys: vec![self.host_key.clone()],
             max_auth_attempts: caps.max_auth_attempts as usize,
             // No idle timeout: authenticated connections may sit idle.
             inactivity_timeout: None,
@@ -154,13 +330,7 @@ impl SshServer {
             auth_rejection_time: Duration::from_millis(250),
             auth_rejection_time_initial: Some(Duration::from_millis(0)),
             ..Default::default()
-        };
-        SshServer {
-            shared,
-            russh_config: Arc::new(russh_config),
-            limiter: Arc::new(Limiter::new(caps)),
-            handshake_timeout: Duration::from_secs(caps.handshake_timeout_secs as u64),
-        }
+        })
     }
 
     /// Serve until the shutdown signal fires. `sockets` are already bound,
@@ -203,7 +373,32 @@ impl SshServer {
                 while connection_tasks.join_next().await.is_some() {}
             });
         }
-        while listener_tasks.join_next().await.is_some() {}
+        let mut shutdown_rx = shutdown.clone();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    self.host_tasks.close();
+                    // Stop sandbox processes before waiting for connection
+                    // tasks. Their channel bridges may otherwise be waiting
+                    // on a child that no longer has a client transport.
+                    let manager = self
+                        .shared
+                        .read()
+                        .expect("server shared state")
+                        .sandbox
+                        .clone();
+                    let _ = tokio::task::spawn_blocking(move || manager.shutdown_runtime()).await;
+                    while listener_tasks.join_next().await.is_some() {}
+                    break;
+                }
+                joined = listener_tasks.join_next() => {
+                    if joined.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.host_tasks.join_all().await;
     }
 
     /// Admit, supervise, and run one connection.
@@ -216,22 +411,34 @@ impl SshServer {
         if *shutdown.borrow() {
             return;
         }
-        let Some(slot) = self.limiter.admit() else {
-            tracing::debug!(?peer, "connection cap reached; refusing connection");
-            return; // Dropping the stream is the resource-exhaustion refusal.
+        let (shared, caps, slot) = {
+            let shared_guard = self.shared.read().expect("server shared state");
+            let caps = *shared_guard.config.caps();
+            let Some(slot) = self.limiter.admit() else {
+                tracing::debug!(?peer, "connection cap reached; refusing connection");
+                return; // Dropping the stream is the resource-exhaustion refusal.
+            };
+            // The guard is dropped before any await, but it covers the
+            // snapshot and admission decision as one reload boundary.
+            (shared_guard.clone(), caps, slot)
         };
         let conn = Arc::new(crate::ssh::ConnState {
             principal: std::sync::Mutex::new(None),
             authenticated: Arc::new(Notify::new()),
             registry: crate::ssh::channel::ChannelRegistry::new(),
+            host_process_limiter: Arc::clone(&self.host_process_limiter),
+            host_tasks: Arc::clone(&self.host_tasks),
+            shutdown: shutdown.clone(),
             unauth_slot: slot,
         });
-        let handler = ConnHandler::new(self.shared.clone(), conn.clone());
-        let deadline = tokio::time::Instant::now() + self.handshake_timeout;
+        let handler = ConnHandler::new(shared, conn.clone());
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(caps.handshake_timeout_secs as u64);
+        let transport_config = self.transport_config(&caps);
         let session = tokio::select! {
             result = tokio::time::timeout_at(
                 deadline,
-                server::run_stream(self.russh_config.clone(), stream, handler),
+                server::run_stream(transport_config, stream, handler),
             ) => match result {
                 Ok(Ok(session)) => session,
                 Ok(Err(err)) => {
@@ -391,6 +598,59 @@ mod tests {
         drop(slot);
         let (unauth, total) = limiter.in_flight();
         assert_eq!((unauth, total), (0, 0));
+    }
+
+    #[test]
+    fn reloaded_connection_caps_constrain_new_work_without_evicting_slots() {
+        let caps = Caps {
+            max_connections: 2,
+            max_unauthenticated_connections: 2,
+            ..Caps::default()
+        };
+        let limiter = limiter(&caps);
+        let first = limiter.admit().expect("first");
+        let second = limiter.admit().expect("second");
+        limiter.reload_caps(&Caps {
+            max_connections: 1,
+            max_unauthenticated_connections: 1,
+            ..Caps::default()
+        });
+
+        assert_eq!(limiter.in_flight(), (2, 2));
+        assert!(limiter.admit().is_none(), "reloaded cap affects new work");
+        drop(first);
+        assert_eq!(limiter.in_flight(), (1, 1));
+        assert!(limiter.admit().is_none(), "remaining slot fills the cap");
+        drop(second);
+        assert!(limiter.admit().is_some(), "released slots are reusable");
+    }
+
+    #[test]
+    fn host_process_cap_is_bounded_and_reload_does_not_evict_existing_slots() {
+        let caps = Caps {
+            max_host_processes: 2,
+            ..Caps::default()
+        };
+        let limiter = Arc::new(HostProcessLimiter::new(&caps));
+        let first = limiter.admit().expect("first host process");
+        let second = limiter.admit().expect("second host process");
+        assert!(limiter.admit().is_none(), "host cap must be enforced");
+        let reduced = Caps {
+            max_host_processes: 1,
+            ..Caps::default()
+        };
+        limiter.reload_caps(&reduced);
+        assert_eq!(limiter.in_flight(), 2);
+        assert!(limiter.admit().is_none(), "reloaded cap affects new work");
+        drop(first);
+        assert_eq!(limiter.in_flight(), 1);
+        assert!(
+            limiter.admit().is_none(),
+            "existing slot fills the reduced cap"
+        );
+        drop(second);
+        assert_eq!(limiter.in_flight(), 0);
+        assert!(limiter.admit().is_some(), "released slot is reusable");
     }
 
     #[test]

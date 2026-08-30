@@ -106,11 +106,12 @@ struct Ledger {
 #[derive(Debug)]
 pub(crate) struct SandboxManager {
     storage: Storage,
-    caps: Caps,
+    caps: Mutex<Caps>,
     launcher: Arc<dyn ProcessLauncher>,
     ledger: Mutex<Ledger>,
     runtime_changed: std::sync::Condvar,
     lifecycle_locks: Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
+    ready: std::sync::atomic::AtomicBool,
 }
 
 impl SandboxManager {
@@ -127,6 +128,18 @@ impl SandboxManager {
         launcher: Arc<dyn ProcessLauncher>,
     ) -> Result<SandboxManager, Error> {
         Self::open_with_faults_and_launcher(paths, caps, None, launcher)
+    }
+
+    /// Open the manager and load its durable index without waiting for the
+    /// startup deletion reconciliation. Managed mode uses this constructor so
+    /// the admin host route can be published while sandbox operations remain
+    /// fail-closed until [`SandboxManager::reconcile_startup`] completes.
+    pub(crate) fn open_unreconciled_with_launcher(
+        paths: &Paths,
+        caps: Caps,
+        launcher: Arc<dyn ProcessLauncher>,
+    ) -> Result<SandboxManager, Error> {
+        Self::open_loaded(paths, caps, launcher, None)
     }
 
     pub(crate) fn open_with_faults(
@@ -148,19 +161,43 @@ impl SandboxManager {
         faults: Option<Arc<storage::FaultInjector>>,
         launcher: Arc<dyn ProcessLauncher>,
     ) -> Result<SandboxManager, Error> {
+        let manager = Self::open_loaded(paths, caps, launcher, faults)?;
+        manager.reconcile_startup();
+        Ok(manager)
+    }
+
+    fn open_loaded(
+        paths: &Paths,
+        caps: Caps,
+        launcher: Arc<dyn ProcessLauncher>,
+        faults: Option<Arc<storage::FaultInjector>>,
+    ) -> Result<SandboxManager, Error> {
         let storage =
             Storage::with_faults(paths.sandboxes_root(), faults).map_err(Error::Storage)?;
         let manager = SandboxManager {
             storage,
-            caps,
+            caps: Mutex::new(caps),
             launcher,
             ledger: Mutex::new(Ledger::default()),
             runtime_changed: std::sync::Condvar::new(),
             lifecycle_locks: Mutex::new(HashMap::new()),
+            ready: std::sync::atomic::AtomicBool::new(false),
         };
         manager.load_registry()?;
-        manager.reconcile_deleting();
         Ok(manager)
+    }
+
+    /// Complete startup cleanup and make sandbox operations available.
+    pub(crate) fn reconcile_startup(&self) {
+        self.reconcile_deleting();
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Replace the caps used for future claims and launches. Existing
+    /// sandboxes and processes are intentionally not evicted when a reload
+    /// lowers a limit; the new snapshot only constrains new work.
+    pub(crate) fn reload_caps(&self, caps: Caps) {
+        *self.caps.lock().expect("sandbox caps") = caps;
     }
 
     /// Atomically claim an ID for the principal, creating its workspace only
@@ -171,6 +208,7 @@ impl SandboxManager {
         principal: &Principal,
         id: &SandboxId,
     ) -> Result<SandboxHandle, Error> {
+        self.ensure_ready()?;
         let lifecycle_lock = self.lifecycle_lock(id);
         let _guard = lifecycle_lock.lock().expect("sandbox lifecycle lock");
         match self.storage.inspect(id).map_err(Error::Storage)? {
@@ -225,6 +263,7 @@ impl SandboxManager {
     /// while another ID is publishing metadata must not become permanently
     /// blocked as corruption.
     pub(crate) fn list(&self, principal: &Principal) -> Result<Vec<SandboxId>, Error> {
+        self.ensure_ready()?;
         let scan = self.storage.scan().map_err(Error::Storage)?;
         let blocked = self.ledger.lock().expect("sandbox ledger").blocked.clone();
         let mut result: Vec<SandboxId> = scan
@@ -253,6 +292,7 @@ impl SandboxManager {
         principal: &Principal,
         id: &SandboxId,
     ) -> Result<DeleteResult, Error> {
+        self.ensure_ready()?;
         let lifecycle_lock = self.lifecycle_lock(id);
         let _guard = lifecycle_lock.lock().expect("sandbox lifecycle lock");
         let entry = self.storage.inspect(id).map_err(Error::Storage)?;
@@ -344,8 +384,7 @@ impl SandboxManager {
             }
         };
         if !self.finish_launch(&lease, Arc::clone(&process.control)) {
-            process.control.terminate();
-            let _ = process.control.wait_for_cleanup(RUNTIME_CLEANUP_TIMEOUT);
+            terminate_and_wait(&process.control);
             self.clear_runtime_if(&lease);
             return Err(Error::Unavailable);
         }
@@ -360,7 +399,12 @@ impl SandboxManager {
         if metadata.state() != State::Active || metadata.owner() != handle.owner() {
             return Err(Error::Unavailable);
         }
-        if ledger.runtime.len() >= self.caps.max_sandbox_processes as usize {
+        let max_sandbox_processes = self
+            .caps
+            .lock()
+            .expect("sandbox caps")
+            .max_sandbox_processes as usize;
+        if ledger.runtime.len() >= max_sandbox_processes {
             return Err(Error::Limit("max_sandbox_processes"));
         }
         let token = next_runtime_token(&mut ledger);
@@ -401,7 +445,7 @@ impl SandboxManager {
             (Ok(Entry::Active(metadata)), Some(record)) => metadata.owner() == record.owner(),
             _ => false,
         };
-        match ledger.runtime.get_mut(&lease.token) {
+        let accepted = match ledger.runtime.get_mut(&lease.token) {
             Some(entry)
                 if entry.marker == RuntimeMarker::Launching
                     && entry.sandbox_id == lease.sandbox_id
@@ -414,7 +458,9 @@ impl SandboxManager {
                 true
             }
             _ => false,
-        }
+        };
+        self.runtime_changed.notify_all();
+        accepted
     }
 
     pub(crate) fn clear_runtime(&self, lease: &RuntimeLease) {
@@ -469,7 +515,167 @@ impl SandboxManager {
         for process in processes {
             process.terminate();
         }
+        if self.wait_for_runtime_cleanup(id, Instant::now() + RUNTIME_CLEANUP_TIMEOUT) {
+            return true;
+        }
+
+        // A process that ignores TERM gets a second, explicit force pass. The
+        // first deadline is the graceful contract; the second wait is only to
+        // observe Arapuca's reap/cleanup barrier after SIGKILL.
+        let processes = {
+            let ledger = self.ledger.lock().expect("sandbox ledger");
+            ledger
+                .runtime
+                .values()
+                .filter(|entry| entry.sandbox_id == *id)
+                .filter_map(|entry| entry.process.clone())
+                .collect::<Vec<_>>()
+        };
+        for process in processes {
+            process.force_terminate();
+        }
         self.wait_for_runtime_cleanup(id, Instant::now() + RUNTIME_CLEANUP_TIMEOUT)
+    }
+
+    /// Gracefully stop every registered sandbox process during daemon
+    /// shutdown. The first pass gives all processes the same five-second
+    /// deadline; only survivors receive the force-stop pass. Launch markers
+    /// remain in the ledger until their owner returns, so a late adapter
+    /// result cannot outlive this cancellation barrier.
+    pub(crate) fn shutdown_runtime(&self) {
+        let (tokens, processes) = {
+            let mut ledger = self.ledger.lock().expect("sandbox ledger");
+            let mut tokens = BTreeSet::new();
+            let mut processes = Vec::new();
+            for (token, entry) in &mut ledger.runtime {
+                tokens.insert(*token);
+                entry
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Some(process) = &entry.process {
+                    processes.push(Arc::clone(process));
+                }
+            }
+            (tokens, processes)
+        };
+        for process in &processes {
+            process.terminate();
+        }
+        if self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT) {
+            return;
+        }
+
+        let processes = {
+            let ledger = self.ledger.lock().expect("sandbox ledger");
+            tokens
+                .iter()
+                .filter_map(|token| ledger.runtime.get(token)?.process.clone())
+                .collect::<Vec<_>>()
+        };
+        for process in &processes {
+            process.force_terminate();
+        }
+        let _ = self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT);
+    }
+
+    /// Force-stop every process currently registered by the manager. This is
+    /// the second-signal path: it publishes cancellation and sends the
+    /// adapter's hard-stop signal without waiting for graceful cleanup.
+    pub(crate) fn force_shutdown_runtime(&self) {
+        let processes = {
+            let mut ledger = self.ledger.lock().expect("sandbox ledger");
+            let mut processes = Vec::new();
+            for entry in ledger.runtime.values_mut() {
+                entry
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Some(process) = &entry.process {
+                    processes.push(Arc::clone(process));
+                }
+            }
+            processes
+        };
+        for process in processes {
+            process.force_terminate();
+        }
+    }
+
+    /// Wait for all selected runtime entries in parallel. A launch marker
+    /// without a process waits on the ledger condition variable; a running
+    /// process waits on its adapter cleanup barrier. The helper removes only
+    /// the exact runtime tokens it observed, preserving newer leases.
+    fn wait_for_runtime_tokens(&self, tokens: &BTreeSet<u64>, deadline: Instant) -> bool {
+        loop {
+            let (pending, launching, done) = {
+                let ledger = self.ledger.lock().expect("sandbox ledger");
+                let mut pending = Vec::new();
+                let mut launching = false;
+                let mut done = true;
+                for token in tokens {
+                    let Some(entry) = ledger.runtime.get(token) else {
+                        continue;
+                    };
+                    done = false;
+                    if let Some(process) = &entry.process {
+                        pending.push((*token, Arc::clone(process)));
+                    } else {
+                        launching = true;
+                    }
+                }
+                (pending, launching, done)
+            };
+            if done {
+                return true;
+            }
+
+            if !pending.is_empty() {
+                let mut completed = Vec::with_capacity(pending.len());
+                std::thread::scope(|scope| {
+                    let mut waits = Vec::with_capacity(pending.len());
+                    for (token, process) in pending {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            completed.push((token, false));
+                            continue;
+                        };
+                        waits.push(
+                            scope.spawn(move || (token, process.wait_for_cleanup(remaining))),
+                        );
+                    }
+                    for wait in waits {
+                        completed.push(wait.join().unwrap_or((0, false)));
+                    }
+                });
+                let mut ledger = self.ledger.lock().expect("sandbox ledger");
+                for (token, complete) in &completed {
+                    if *complete
+                        && ledger
+                            .runtime
+                            .get(token)
+                            .is_some_and(|entry| entry.process.is_some())
+                    {
+                        ledger.runtime.remove(token);
+                    }
+                }
+                self.runtime_changed.notify_all();
+                if completed.iter().any(|(_, complete)| !complete) {
+                    return false;
+                }
+                continue;
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let ledger = self.ledger.lock().expect("sandbox ledger");
+            let Ok((_ledger, timeout)) = self.runtime_changed.wait_timeout(ledger, remaining)
+            else {
+                return false;
+            };
+            if timeout.timed_out() && launching {
+                return false;
+            }
+        }
     }
 
     fn wait_for_runtime_cleanup(&self, id: &SandboxId, deadline: Instant) -> bool {
@@ -639,16 +845,17 @@ impl SandboxManager {
 
     fn reserve_sandbox(&self, owner: &KeyFingerprint) -> Result<(), Error> {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
+        let caps = *self.caps.lock().expect("sandbox caps");
         if ledger
             .records
             .len()
             .saturating_add(ledger.reserved_sandboxes)
-            >= self.caps.max_sandboxes as usize
+            >= caps.max_sandboxes as usize
         {
             return Err(Error::Limit("max_sandboxes"));
         }
         if ledger.owner_counts.get(owner).copied().unwrap_or(0)
-            >= self.caps.max_sandboxes_per_owner as usize
+            >= caps.max_sandboxes_per_owner as usize
         {
             return Err(Error::Limit("max_sandboxes_per_owner"));
         }
@@ -696,6 +903,14 @@ impl SandboxManager {
             .entry(id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    fn ensure_ready(&self) -> Result<(), Error> {
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Error::Unavailable)
+        }
     }
 }
 
@@ -752,6 +967,14 @@ fn remove_record_from_ledger(ledger: &mut Ledger, id: &SandboxId) {
         if let Some(process) = entry.process {
             process.terminate();
         }
+    }
+}
+
+fn terminate_and_wait(process: &Arc<dyn platform::RunningProcess>) {
+    process.terminate();
+    if !process.wait_for_cleanup(RUNTIME_CLEANUP_TIMEOUT) {
+        process.force_terminate();
+        let _ = process.wait_for_cleanup(RUNTIME_CLEANUP_TIMEOUT);
     }
 }
 
@@ -830,6 +1053,29 @@ mod tests {
         let manager = SandboxManager::open_with_launcher(&paths, caps, Arc::new(launcher.clone()))
             .expect("manager");
         (root, manager)
+    }
+
+    #[test]
+    fn unreconciled_manager_fails_closed_until_startup_pass_finishes() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let launcher = FakeLauncher::default();
+        let manager = SandboxManager::open_unreconciled_with_launcher(
+            &paths,
+            Caps::default(),
+            Arc::new(launcher),
+        )
+        .expect("manager");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+
+        assert!(matches!(
+            manager.claim(&owner, &id),
+            Err(Error::Unavailable)
+        ));
+        manager.reconcile_startup();
+        assert!(manager.claim(&owner, &id).expect("claim").created());
     }
 
     fn paths_for(root: &TempDir) -> Paths {
@@ -1221,6 +1467,8 @@ mod tests {
                     term: "xterm-256color".into(),
                     rows: 40,
                     cols: 120,
+                    modes: Vec::new(),
+                    window_revision: 0,
                 }),
             )
             .expect("launch");
@@ -1234,6 +1482,8 @@ mod tests {
                     term: "xterm-256color".into(),
                     rows: 40,
                     cols: 120,
+                    modes: Vec::new(),
+                    window_revision: 0,
                 }),
             })
         );
@@ -1277,6 +1527,31 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_runtime_terminates_all_registered_leases() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let first = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        let first_process = launcher.last_process().expect("first process");
+        let second = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("second launch");
+        let second_process = launcher.last_process().expect("second process");
+
+        manager.shutdown_runtime();
+
+        assert!(first_process.terminated());
+        assert!(second_process.terminated());
+        assert_eq!(manager.runtime_count(), 0);
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
     fn sandbox_process_cap_is_atomic_across_parallel_launches() {
         let launcher = FakeLauncher::default();
         let caps = Caps {
@@ -1296,6 +1571,41 @@ mod tests {
         ));
         first.process.control.terminate();
         manager.clear_runtime(&first.lease);
+        assert_eq!(manager.runtime_count(), 0);
+    }
+
+    #[test]
+    fn reloaded_sandbox_process_cap_only_constrains_new_launches() {
+        let launcher = FakeLauncher::default();
+        let caps = Caps {
+            max_sandbox_processes: 2,
+            ..Caps::default()
+        };
+        let (_root, manager) = manager_with_fake(caps, &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let first = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        let second = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("second launch");
+
+        manager.reload_caps(Caps {
+            max_sandbox_processes: 1,
+            ..Caps::default()
+        });
+        assert_eq!(manager.runtime_count(), 2);
+        assert!(matches!(
+            manager.launch_handle(&handle, platform::LaunchOperation::Shell, None),
+            Err(Error::Limit("max_sandbox_processes"))
+        ));
+
+        first.process.control.terminate();
+        second.process.control.terminate();
+        manager.clear_runtime(&first.lease);
+        manager.clear_runtime(&second.lease);
         assert_eq!(manager.runtime_count(), 0);
     }
 

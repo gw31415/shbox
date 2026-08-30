@@ -368,14 +368,28 @@ pub(crate) fn synchronize_host_window(
 }
 
 /// Bridge an already-started host process to one SSH channel.
-pub(crate) async fn run_host_process(
-    id: ChannelId,
-    handle: Handle,
-    mut process: host::HostProcess,
-    waiter: host::HostWaiter,
-    mut events: mpsc::Receiver<ChannelEvent>,
-    initial_window_revision: u64,
-) -> ChannelResult {
+pub(crate) struct HostProcessRun {
+    pub(crate) id: ChannelId,
+    pub(crate) handle: Handle,
+    pub(crate) process: host::HostProcess,
+    pub(crate) waiter: host::HostWaiter,
+    pub(crate) events: mpsc::Receiver<ChannelEvent>,
+    pub(crate) initial_window_revision: u64,
+    pub(crate) host_slot: crate::server::HostProcessSlot,
+    pub(crate) shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
+    let HostProcessRun {
+        id,
+        handle,
+        mut process,
+        waiter,
+        mut events,
+        initial_window_revision,
+        host_slot: _host_slot,
+        mut shutdown,
+    } = run;
     // Bounded queue of output chunks; the pumps block when full, so the child
     // blocks on its pipe once the daemon-side buffer is exhausted.
     let (output_tx, mut output_rx) = mpsc::channel::<OutputChunk>(OUTPUT_QUEUE_CHUNKS);
@@ -417,6 +431,7 @@ pub(crate) async fn run_host_process(
     let mut output_done = pumps.is_empty();
     let result: ChannelResult = loop {
         tokio::select! {
+            _ = shutdown.changed() => break ChannelResult::Aborted,
             event = events.recv() => {
                 match event {
                     Some(ChannelEvent::Data(data)) => {

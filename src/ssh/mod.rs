@@ -40,6 +40,12 @@ pub(crate) struct ConnState {
     /// stops the handshake timer on this.
     pub authenticated: Arc<tokio::sync::Notify>,
     pub registry: ChannelRegistry,
+    /// Dynamic host-process admission shared by all connections.
+    pub host_process_limiter: Arc<crate::server::HostProcessLimiter>,
+    /// Host bridge tasks remain joinable until the server shutdown barrier.
+    pub host_tasks: Arc<crate::server::HostTaskRegistry>,
+    /// Shared shutdown watch observed directly by each host bridge.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
     /// Tracks the connection in the unauthenticated bucket until auth.
     pub unauth_slot: std::sync::Arc<crate::server::LimiterSlot>,
 }
@@ -320,6 +326,12 @@ impl ConnHandler {
             let _ = session.channel_failure(channel);
             return Ok(());
         };
+        let Some(host_slot) = self.conn.host_process_limiter.admit() else {
+            let handle = session.handle();
+            let _ = channel::finish_failed(channel, &handle).await;
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
         // Do not acknowledge the request until fork/exec and PTY setup have
         // completed. A client-visible success must never be followed by a
         // spawn failure that was already known to the daemon.
@@ -350,20 +362,29 @@ impl ConnHandler {
         }
         let handle = session.handle();
         let conn = Arc::clone(&self.conn);
-        tokio::spawn(async move {
+        let host_tasks = Arc::clone(&self.conn.host_tasks);
+        let shutdown = self.conn.shutdown.clone();
+        let host_control = process.control();
+        let task = tokio::spawn(async move {
             // The bridge task owns the channel end to end; the handler only
             // routes further client events into the mailbox.
-            channel::run_host_process(
-                channel,
+            channel::run_host_process(channel::HostProcessRun {
+                id: channel,
                 handle,
                 process,
                 waiter,
                 events,
-                window_revision,
-            )
+                initial_window_revision: window_revision,
+                host_slot,
+                shutdown,
+            })
             .await;
             conn.registry.remove(channel);
         });
+        if let Err((task, control)) = host_tasks.track(task, host_control) {
+            control.force_terminate();
+            let _ = task.await;
+        }
         Ok(())
     }
 }

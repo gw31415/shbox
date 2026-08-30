@@ -1,6 +1,6 @@
 # Testing と release gate
 
-この文書は、shbox の実装を v0.1 の契約として認めるための試験計画である。ここに記載した試験はまだ実行結果を意味しない。実装・テスト環境が揃った時点で、組合せごとのログと revision を保存し、通過したものだけを正式対応とする。
+この文書は、shbox の実装を v0.1 の契約として認めるための試験計画と検証記録である。unit/state test と実 OpenSSH harness の手元証跡は更新済みだが、実 Arapuca と delegated cgroup を必要とする platform tuple は別の release gate で検証する。組合せごとのログと revision を保存し、full passing run のあるものだけを正式対応とする。
 
 ## 1. 試験の基本方針
 
@@ -162,6 +162,16 @@ path、root 外 symlink、二つの advisory lock、再起動後の metadata/wor
 
 test harness は shbox を一時 config で起動し、実 `ssh` client から接続する。以下は代表的な command 例であり、`$PORT`、`$OWNER_KEY`、`$ADMIN_KEY` は harness が作る。
 
+リポジトリに含まれる現在の OpenSSH harness は、次のコマンドで実行する。stable と MSRV
+1.91 の各 full test run で unit/state 113 件、harness 15 件が通過する。loopback bind を
+制限する環境では、`server::tests::bind_all_is_all_or_nothing` だけが権限エラーになるため、
+release artifact を作る際は loopback bind を許可した runner で再実行する。
+
+```console
+RUSTC_WRAPPER= cargo test --locked --test ssh_auth -- --test-threads=1
+RUSTC_WRAPPER= cargo +1.91.0 test --locked --test ssh_auth -- --test-threads=1
+```
+
 リポジトリの通常 OpenSSH test は、wrapper と delegated cgroup がない開発環境でも安全性を検証できるよう、sandbox request が status 111 の generic failure になることを既定の合格条件にする。実 Arapuca の成功経路を試験する場合だけ `SHBOX_RUN_ARAPUCA_INTEGRATION=1` を test process と daemon に継承させ、sandbox exec が status 0 と期待 output を返すことを要求する。両方の結果を一つの `or` 条件で合格扱いにしてはならない。
 
 ### 6.1 exec、ownership、list、delete
@@ -292,10 +302,10 @@ forwarding、X11、agent、SFTP、direct-tcpip、streamlocal request は明示 r
 実装後の基本 gate は次のように実行する。
 
 ```console
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
-cargo test --locked --test ssh -- --nocapture
+cargo test --locked --test ssh_auth -- --test-threads=1
 ```
 
 Arapuca が取得できない、cgroup delegation がない、macOS runner version が想定外、OpenSSH client がない場合は integration job を成功扱いにしない。代わりに「環境 prerequisite 未達」として記録する。

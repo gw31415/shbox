@@ -133,21 +133,34 @@ async fn run() -> Result<(), BootstrapError> {
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
     let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
-    let launcher: Arc<dyn platform::ProcessLauncher> = match platform::ArapucaLauncher::new(
-        launch_policy,
-    ) {
+    let (launcher, arapuca_launcher): (
+        Arc<dyn platform::ProcessLauncher>,
+        Option<Arc<platform::ArapucaLauncher>>,
+    ) = match platform::ArapucaLauncher::new(launch_policy) {
         Ok(launcher) => {
             info!("sandbox process adapter initialized");
-            Arc::new(launcher)
+            let launcher = Arc::new(launcher);
+            (
+                Arc::clone(&launcher) as Arc<dyn platform::ProcessLauncher>,
+                Some(launcher),
+            )
         }
         Err(error) => {
             warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
-            Arc::new(platform::UnavailableLauncher)
+            (Arc::new(platform::UnavailableLauncher), None)
         }
     };
     let sandbox_manager = Arc::new(
-        sandbox::SandboxManager::open_with_launcher(&paths, *app_config.caps(), launcher)
-            .map_err(|err| fail("reconciling sandbox registry", err))?,
+        if app_config.managed_mode() {
+            sandbox::SandboxManager::open_unreconciled_with_launcher(
+                &paths,
+                *app_config.caps(),
+                launcher,
+            )
+        } else {
+            sandbox::SandboxManager::open_with_launcher(&paths, *app_config.caps(), launcher)
+        }
+        .map_err(|err| fail("reconciling sandbox registry", err))?,
     );
 
     debug!(
@@ -187,8 +200,8 @@ async fn run() -> Result<(), BootstrapError> {
     let shared = ssh::Shared {
         auth: Arc::new(auth_snapshot),
         config: Arc::new(app_config.clone()),
-        account: Arc::new(account),
-        sandbox: sandbox_manager,
+        account: Arc::new(account.clone()),
+        sandbox: Arc::clone(&sandbox_manager),
     };
     let server = Arc::new(server::SshServer::new(
         shared,
@@ -204,7 +217,18 @@ async fn run() -> Result<(), BootstrapError> {
         .collect();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let serve_task = tokio::spawn(server.serve(sockets, shutdown_rx));
+    let mut serve_task = tokio::spawn(server.clone().serve(sockets, shutdown_rx));
+    let mut reconciliation_task = if app_config.managed_mode() {
+        let manager = Arc::clone(&sandbox_manager);
+        Some(
+            std::thread::Builder::new()
+                .name("shbox-startup-reconciliation".to_string())
+                .spawn(move || manager.reconcile_startup())
+                .map_err(|err| fail("starting sandbox reconciliation", err))?,
+        )
+    } else {
+        None
+    };
     info!(
         user = %account_name,
         listen = ?bound,
@@ -212,34 +236,188 @@ async fn run() -> Result<(), BootstrapError> {
         "shbox ready"
     );
 
-    wait_for_signals().await;
-    let _ = shutdown_tx.send(true);
-    let _ = serve_task.await;
-    drop(locks);
-    info!("shutdown complete");
-    Ok(())
-}
-
-/// Small signal loop: SIGINT/SIGTERM shut the daemon down; SIGHUP reload is
-/// implemented in a later milestone and is currently reported and ignored.
-async fn wait_for_signals() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    let mut hangup = signal(SignalKind::hangup()).expect("SIGHUP handler");
+    let mut current_config = app_config;
+    let mut signals = SignalReceiver::new();
     loop {
         tokio::select! {
-            _ = interrupt.recv() => {
-                info!("SIGINT received: shutting down");
-                break;
+            result = &mut serve_task => {
+                result.map_err(|err| fail("serving SSH", err))?;
+                if let Some(task) = reconciliation_task.take() {
+                    join_reconciliation(task).await?;
+                }
+                drop(locks);
+                return Ok(());
             }
-            _ = terminate.recv() => {
-                info!("SIGTERM received: shutting down");
-                break;
+            signal = signals.recv() => match signal {
+                DaemonSignal::Reload => {
+                    match load_reload_snapshot(&paths, &current_config, &account).await {
+                        Ok(snapshot) => {
+                            if let Some(launcher) = arapuca_launcher.as_ref()
+                                && let Err(error) = launcher.reload_policy(snapshot.policy.clone())
+                            {
+                                warn!(error = %error, "SIGHUP reload rejected by sandbox adapter");
+                                continue;
+                            }
+                            let next_shared = ssh::Shared {
+                                auth: Arc::new(snapshot.auth),
+                                config: Arc::new(snapshot.config.clone()),
+                                account: Arc::new(account.clone()),
+                                sandbox: Arc::clone(&sandbox_manager),
+                            };
+                            server.reload(next_shared);
+                            logging.set_level(logging::level_filter(snapshot.config.log_level()));
+                            current_config = snapshot.config;
+                            info!("configuration and authentication snapshot reloaded");
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "SIGHUP reload rejected; keeping the previous snapshot");
+                        }
+                    }
+                }
+                DaemonSignal::Shutdown => {
+                    info!("shutdown signal received: draining runtime processes");
+                    let _ = shutdown_tx.send(true);
+                    tokio::select! {
+                        result = &mut serve_task => {
+                            result.map_err(|err| fail("serving SSH", err))?;
+                        }
+                        _ = signals.recv_shutdown() => {
+                            warn!("second shutdown signal received; stopping immediately");
+                            server.force_stop_host_tasks();
+                            sandbox_manager.force_shutdown_runtime();
+                            serve_task.abort();
+                            let _ = serve_task.await;
+                            // A blocking reconciliation thread cannot be
+                            // cancelled. Detach it so the second-signal path
+                            // does not wait for filesystem cleanup to finish;
+                            // the next startup will retry any remaining work.
+                            drop(reconciliation_task.take());
+                            drop(locks);
+                            info!("shutdown stopped after second signal");
+                            return Ok(());
+                        }
+                    }
+                    if let Some(task) = reconciliation_task.take() {
+                        join_reconciliation(task).await?;
+                    }
+                    drop(locks);
+                    info!("shutdown complete");
+                    return Ok(());
+                }
             }
-            _ = hangup.recv() => {
-                warn!("SIGHUP received: config reload is not implemented yet");
-            }
+        }
+    }
+}
+
+/// Join the managed-mode reconciliation thread only on the normal shutdown
+/// path. The second-signal path deliberately drops its std thread handle so a
+/// slow filesystem operation cannot hold the daemon open.
+async fn join_reconciliation(task: std::thread::JoinHandle<()>) -> Result<(), BootstrapError> {
+    tokio::task::spawn_blocking(move || task.join())
+        .await
+        .map_err(|err| fail("joining sandbox reconciliation", err))?
+        .map_err(|_| {
+            fail(
+                "reconciling sandbox registry",
+                std::io::Error::other("reconciliation thread panicked"),
+            )
+        })
+}
+
+struct ReloadSnapshot {
+    config: config::Config,
+    auth: auth::AuthSnapshot,
+    policy: platform::ArapucaLaunchPolicy,
+}
+
+#[derive(Debug)]
+struct ReloadError(String);
+
+impl fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReloadError {}
+
+/// Load and validate every reload input before publishing any part of it.
+async fn load_reload_snapshot(
+    paths: &paths::Paths,
+    previous: &config::Config,
+    account: &account::Account,
+) -> Result<ReloadSnapshot, ReloadError> {
+    let paths = paths.clone();
+    let previous = previous.clone();
+    let account = account.clone();
+    tokio::task::spawn_blocking(move || {
+        let config = config::Config::load_snapshot(&paths)
+            .map_err(|error| ReloadError(format!("loading configuration: {error}")))?;
+        if previous.loaded_from_file() && !config.loaded_from_file() {
+            return Err(ReloadError(
+                "configuration file disappeared after a file-backed snapshot".into(),
+            ));
+        }
+        if previous.listen() != config.listen() {
+            return Err(ReloadError(
+                "listen addresses are restart-only and cannot be reloaded".into(),
+            ));
+        }
+        let sandbox_shell = account
+            .sandbox_shell(&config)
+            .map_err(|error| ReloadError(format!("selecting the sandbox shell: {error}")))?;
+        account::validate_executable(&sandbox_shell)
+            .map_err(|error| ReloadError(format!("validating the sandbox shell: {error}")))?;
+        let authorized_keys = auth::resolve_authorized_keys_path(config.authorized_keys())
+            .map_err(|error| ReloadError(format!("resolving authorized_keys: {error}")))?;
+        auth::validate_authorized_keys_file(&authorized_keys)
+            .map_err(|error| ReloadError(format!("validating authorized_keys: {error}")))?;
+        let auth = auth::AuthSnapshot::load(&authorized_keys, config.admin_keys())
+            .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
+        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell);
+        Ok(ReloadSnapshot {
+            config,
+            auth,
+            policy,
+        })
+    })
+    .await
+    .map_err(|error| ReloadError(format!("reload task failed: {error}")))?
+}
+
+enum DaemonSignal {
+    Reload,
+    Shutdown,
+}
+
+struct SignalReceiver {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl SignalReceiver {
+    fn new() -> SignalReceiver {
+        use tokio::signal::unix::{SignalKind, signal};
+        SignalReceiver {
+            interrupt: signal(SignalKind::interrupt()).expect("SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("SIGTERM handler"),
+            hangup: signal(SignalKind::hangup()).expect("SIGHUP handler"),
+        }
+    }
+
+    async fn recv(&mut self) -> DaemonSignal {
+        tokio::select! {
+            _ = self.interrupt.recv() => DaemonSignal::Shutdown,
+            _ = self.terminate.recv() => DaemonSignal::Shutdown,
+            _ = self.hangup.recv() => DaemonSignal::Reload,
+        }
+    }
+
+    async fn recv_shutdown(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
         }
     }
 }

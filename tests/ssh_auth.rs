@@ -1,6 +1,6 @@
 //! OpenSSH integration harness for the public-key server and the admin host
-//! route and the first SandboxManager management operations (PLANS.md
-//! Milestones 2-4).
+//! route and the SandboxManager management operations (PLANS.md Milestones
+//! 2-7).
 //!
 //! Every test starts a real daemon binary with a temporary XDG tree and its
 //! own listener, then drives it with the real `ssh` client. Tests share
@@ -21,6 +21,7 @@ struct TestDaemon {
     admin_key: KeyPair,
     normal_key: KeyPair,
     ssh_config: PathBuf,
+    config_path: PathBuf,
 }
 
 struct KeyPair {
@@ -163,9 +164,62 @@ impl TestDaemon {
             admin_key,
             normal_key,
             ssh_config,
+            config_path,
         };
         daemon.wait_ready();
         daemon
+    }
+
+    /// Replace only the admin-key line in the fixture's config file.
+    fn set_admin_keys(&self, admin_keys: &[&str]) {
+        let current = std::fs::read_to_string(&self.config_path).expect("read config");
+        let replacement = format!("admin_keys = {admin_keys:?}\n");
+        let mut updated = String::with_capacity(current.len());
+        let mut replaced = false;
+        for line in current.lines() {
+            if line.starts_with("admin_keys = ") {
+                updated.push_str(&replacement);
+                replaced = true;
+            } else {
+                updated.push_str(line);
+                updated.push('\n');
+            }
+        }
+        assert!(replaced, "fixture config has no admin_keys line");
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Replace the listener address without changing the live socket.
+    fn set_listen(&self, port: u16) {
+        let current = std::fs::read_to_string(&self.config_path).expect("read config");
+        let replacement = format!("listen = [\"127.0.0.1:{port}\"]\n");
+        let mut updated = String::with_capacity(current.len());
+        let mut replaced = false;
+        for line in current.lines() {
+            if line.starts_with("listen = ") {
+                updated.push_str(&replacement);
+                replaced = true;
+            } else {
+                updated.push_str(line);
+                updated.push('\n');
+            }
+        }
+        assert!(replaced, "fixture config has no listen line");
+        std::fs::write(&self.config_path, updated).expect("write config");
+    }
+
+    /// Send a signal to the child owned by this harness.
+    fn send_signal(&self, signal: libc::c_int) {
+        let pid = i32::try_from(self.child.id()).expect("daemon pid fits pid_t");
+        // SAFETY: the pid comes from the child process owned by this test
+        // daemon, and the caller keeps that child alive for the operation.
+        let result = unsafe { libc::kill(pid, signal) };
+        assert_eq!(result, 0, "sending signal {signal} to daemon pid {pid}");
+    }
+
+    /// Ask this daemon to reload its configuration from the fixture path.
+    fn reload(&self) {
+        self.send_signal(libc::SIGHUP);
     }
 
     /// Wait until the listener accepts TCP connections.
@@ -201,6 +255,59 @@ impl TestDaemon {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }
     }
+
+    /// Run a command over an explicit OpenSSH ControlMaster connection.
+    fn ssh_with_control(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        command: &str,
+        control_path: &Path,
+        control_master: &str,
+    ) -> std::process::Output {
+        Command::new("ssh")
+            .arg("-F")
+            .arg(&self.ssh_config)
+            .arg("-i")
+            .arg(&key.private)
+            .arg("-p")
+            .arg(self.port.to_string())
+            .args(["-o", "ControlPersist=30"])
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-o")
+            .arg(format!("ControlMaster={control_master}"))
+            .arg(format!("{username}@127.0.0.1"))
+            .arg(command)
+            .output()
+            .expect("ssh runs")
+    }
+
+    /// Query or close an existing OpenSSH ControlMaster without opening a
+    /// fallback connection.
+    fn control_operation(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        control_path: &Path,
+        operation: &str,
+    ) -> std::process::Output {
+        Command::new("ssh")
+            .arg("-F")
+            .arg(&self.ssh_config)
+            .arg("-i")
+            .arg(&key.private)
+            .arg("-p")
+            .arg(self.port.to_string())
+            .args(["-o", "ControlPersist=30"])
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-O")
+            .arg(operation)
+            .arg(format!("{username}@127.0.0.1"))
+            .output()
+            .expect("ssh runs")
+    }
 }
 
 #[derive(Debug)]
@@ -213,6 +320,23 @@ struct SshResult {
 impl SshResult {
     fn ok(&self) -> bool {
         self.status == 0
+    }
+}
+
+const RELOAD_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Wait for an observable post-reload state without retrying indefinitely.
+fn retry_until<T>(description: &str, mut attempt: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + RELOAD_RETRY_TIMEOUT;
+    loop {
+        if let Some(value) = attempt() {
+            return value;
+        }
+        if Instant::now() >= deadline {
+            panic!("{description} did not settle within {RELOAD_RETRY_TIMEOUT:?}");
+        }
+        std::thread::sleep(RELOAD_RETRY_DELAY);
     }
 }
 
@@ -501,25 +625,302 @@ fn env_requests_are_rejected_and_connections_stay_usable() {
     let _ = std::fs::remove_file(control_path);
 }
 
+/// A malformed SIGHUP snapshot is rejected without changing the current
+/// authentication snapshot used by subsequent connections.
+#[test]
+fn invalid_sighup_reload_keeps_previous_auth_snapshot() {
+    let daemon = TestDaemon::start(&["admin"]);
+    std::fs::write(&daemon.config_path, "admin_keys = [\n").expect("write invalid config");
+    daemon.reload();
+
+    let result = retry_until("admin access after invalid SIGHUP", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-snapshot", &["-T"]);
+        (result.ok() && result.stdout == "old-snapshot").then_some(result)
+    });
+    assert_eq!(result.stdout, "old-snapshot");
+}
+
+/// SIGHUP changes roles only for new connections: removing the last admin,
+/// retaining an already authenticated admin connection, and restoring the
+/// key all use the real OpenSSH client path.
+#[test]
+fn sighup_admin_keys_update_new_connections_and_preserve_existing_role() {
+    let daemon = TestDaemon::start(&["admin"]);
+    let control_path = std::env::temp_dir().join(format!("shbox-hup-{}", std::process::id()));
+    let _ = std::fs::remove_file(&control_path);
+
+    let first = daemon.ssh_with_control(
+        &daemon.admin_key,
+        "_",
+        "printf existing-before",
+        &control_path,
+        "yes",
+    );
+    assert!(first.status.success(), "control master failed: {first:?}");
+    assert_eq!(first.stdout, b"existing-before");
+    let _ = retry_until("ControlMaster readiness", || {
+        let check = daemon.control_operation(&daemon.admin_key, "_", &control_path, "check");
+        check.status.success().then_some(check)
+    });
+
+    daemon.set_admin_keys(&[]);
+    daemon.reload();
+
+    let denied = retry_until("new admin connection after admin removal", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf should-not-run", &["-T"]);
+        (result.status == 255 && result.stderr.contains("Permission denied")).then_some(result)
+    });
+    assert!(
+        !denied.ok(),
+        "new connection must lose admin role: {denied:?}"
+    );
+
+    let existing = retry_until("existing admin connection after admin removal", || {
+        let check = daemon.control_operation(&daemon.admin_key, "_", &control_path, "check");
+        if !check.status.success() {
+            return None;
+        }
+        let result = daemon.ssh_with_control(
+            &daemon.admin_key,
+            "_",
+            "printf existing-after",
+            &control_path,
+            "no",
+        );
+        (result.status.success() && result.stdout == b"existing-after").then_some(result)
+    });
+    assert_eq!(existing.stdout, b"existing-after");
+
+    daemon.set_admin_keys(&[daemon.admin_key.fingerprint.as_str()]);
+    daemon.reload();
+
+    let restored = retry_until("new admin connection after admin restore", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf restored", &["-T"]);
+        (result.ok() && result.stdout == "restored").then_some(result)
+    });
+    assert_eq!(restored.stdout, "restored");
+
+    let _ = daemon.control_operation(&daemon.admin_key, "_", &control_path, "exit");
+    let _ = std::fs::remove_file(control_path);
+}
+
+/// A restart-only listener change rejects the whole reload, preserving the
+/// prior auth snapshot instead of applying only the other changed fields.
+#[test]
+fn sighup_listener_change_is_rejected_atomically() {
+    let daemon = TestDaemon::start(&["admin"]);
+    daemon.set_listen(free_port());
+    daemon.set_admin_keys(&[]);
+    daemon.reload();
+
+    let result = retry_until("admin access after restart-only reload", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-listener", &["-T"]);
+        (result.ok() && result.stdout == "old-listener").then_some(result)
+    });
+    assert_eq!(result.stdout, "old-listener");
+}
+
 /// The daemon exits cleanly on SIGTERM.
 #[test]
 fn daemon_shuts_down_on_sigterm() {
     let mut daemon = TestDaemon::start(&["admin"]);
     let result = daemon.ssh(&daemon.admin_key, "_", "printf alive", &["-T"]);
     assert!(result.ok(), "{result:?}");
-    let pid = daemon.child.id() as i32;
-    // SAFETY: kill(2) with SIGTERM on the daemon we spawned.
-    unsafe {
-        libc_kill(pid);
-    }
+    daemon.send_signal(libc::SIGTERM);
     let status = daemon.child.wait().expect("wait");
     assert!(status.success(), "graceful exit expected, got {status}");
 }
 
-// SAFETY wrapper so the test body does not repeat the unsafe block.
-unsafe fn libc_kill(pid: i32) {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
+/// Shutdown closes an active host channel and eventually kills a process that
+/// ignores the graceful TERM. The PID check makes the cleanup contract
+/// observable beyond the SSH transport disconnect.
+#[test]
+fn daemon_shutdown_cleans_up_an_active_host_process() {
+    let mut daemon = TestDaemon::start(&["admin"]);
+    let pid_path = std::env::temp_dir().join(format!("shbox-host-pid-{}", std::process::id()));
+    let descendant_path =
+        std::env::temp_dir().join(format!("shbox-host-descendant-pid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&descendant_path);
+    let config = daemon.ssh_config.clone();
+    let key = daemon.admin_key.private.clone();
+    let port = daemon.port;
+    let command_pid_path = pid_path.clone();
+    let command_descendant_path = descendant_path.clone();
+    let client = std::thread::spawn(move || {
+        run_ssh_command(
+            config,
+            key,
+            port,
+            "_",
+            &format!(
+                "printf '%s' \"$$\" > {}; trap '' TERM; sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait",
+                command_pid_path.display(),
+                command_descendant_path.display(),
+            ),
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (host_pid, descendant_pid) = loop {
+        if let (Ok(host), Ok(descendant)) = (
+            std::fs::read_to_string(&pid_path),
+            std::fs::read_to_string(&descendant_path),
+        ) {
+            break (
+                host.parse::<i32>().expect("host pid"),
+                descendant.parse::<i32>().expect("descendant pid"),
+            );
+        }
+        assert!(Instant::now() < deadline, "host process did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    daemon.send_signal(libc::SIGTERM);
+    let daemon_status = daemon.child.wait().expect("daemon wait");
+    assert!(
+        daemon_status.success(),
+        "graceful exit expected: {daemon_status}"
+    );
+    let client_status = client.join().expect("ssh client join");
+    assert!(
+        !client_status.status.success(),
+        "shutdown must close ssh client"
+    );
+
+    for (label, pid) in [("host process", host_pid), ("descendant", descendant_pid)] {
+        let deadline = Instant::now() + Duration::from_secs(7);
+        loop {
+            // SAFETY: the PID was written by the host process created by this
+            // fixture; kill(pid, 0) only probes its existence.
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{label} {pid} survived shutdown");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
-    assert_eq!(unsafe { kill(pid, 15) }, 0);
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(descendant_path);
+}
+
+/// A second shutdown signal takes the force path instead of waiting for the
+/// first graceful deadline or for the client connection to drain.
+#[test]
+fn second_shutdown_signal_force_stops_host_process() {
+    let mut daemon = TestDaemon::start(&["admin"]);
+    let pid_path =
+        std::env::temp_dir().join(format!("shbox-second-signal-pid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&pid_path);
+    let config = daemon.ssh_config.clone();
+    let key = daemon.admin_key.private.clone();
+    let port = daemon.port;
+    let command_pid_path = pid_path.clone();
+    let client = std::thread::spawn(move || {
+        run_ssh_command(
+            config,
+            key,
+            port,
+            "_",
+            &format!(
+                "printf '%s' \"$$\" > {}; trap '' TERM; sleep 30",
+                command_pid_path.display()
+            ),
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let host_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_path) {
+            break text.parse::<i32>().expect("host pid");
+        }
+        assert!(Instant::now() < deadline, "host process did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    daemon.send_signal(libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.send_signal(libc::SIGTERM);
+    let started = Instant::now();
+    let status = daemon.child.wait().expect("daemon wait");
+    assert!(status.success(), "graceful exit expected, got {status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "second signal did not force a prompt exit"
+    );
+    let _ = client.join();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // SAFETY: the PID was written by the host process created by this
+        // fixture; kill(pid, 0) only probes its existence.
+        let result = unsafe { libc::kill(host_pid, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host process {host_pid} survived second shutdown signal"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(pid_path);
+}
+
+/// Linux's parent-death guard prevents a daemon crash from orphaning a host
+/// child. This is intentionally target-gated because macOS has no equivalent
+/// prctl contract; its native process-group behavior remains a release-gate
+/// observation.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_crash_does_not_orphan_an_active_host_process() {
+    let mut daemon = TestDaemon::start(&["admin"]);
+    let pid_path = std::env::temp_dir().join(format!("shbox-crash-pid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&pid_path);
+    let config = daemon.ssh_config.clone();
+    let key = daemon.admin_key.private.clone();
+    let port = daemon.port;
+    let command_pid_path = pid_path.clone();
+    let client = std::thread::spawn(move || {
+        run_ssh_command(
+            config,
+            key,
+            port,
+            "_",
+            &format!(
+                "printf '%s' \"$$\" > {}; sleep 30",
+                command_pid_path.display()
+            ),
+        )
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let child_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_path) {
+            break text.parse::<i32>().expect("host pid");
+        }
+        assert!(Instant::now() < deadline, "host process did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    daemon.send_signal(libc::SIGKILL);
+    let _ = daemon.child.wait();
+    let _ = client.join();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        // SAFETY: the PID was written by the host process created by this
+        // fixture; kill(pid, 0) only probes its existence.
+        let result = unsafe { libc::kill(child_pid, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host process {child_pid} survived daemon crash"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(pid_path);
 }
