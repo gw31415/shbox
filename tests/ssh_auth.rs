@@ -97,13 +97,22 @@ fn daemon_binary() -> PathBuf {
     path
 }
 
+/// Keep daemon fixtures below the crate workspace instead of the usual
+/// world-writable `/tmp`: shbox validates every authorized_keys ancestor.
+fn ssh_tempdir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix(".shbox-ssh-test-")
+        .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("tempdir")
+}
+
 impl TestDaemon {
     fn start(admin_keys: &[&str]) -> TestDaemon {
         Self::start_with_config(admin_keys, "")
     }
 
     fn start_with_config(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
-        let root = TempDir::new().expect("temp root");
+        let root = ssh_tempdir();
         let config_dir = root.path().join("config/shbox");
         let data_dir = root.path().join("data/shbox");
         let state_dir = root.path().join("state/shbox");
@@ -766,7 +775,7 @@ fn unregistered_key_and_non_publickey_methods_are_refused() {
     let daemon = TestDaemon::start(&["admin"]);
 
     // A key that is not in authorized_keys at all.
-    let root = TempDir::new().expect("tempdir");
+    let root = ssh_tempdir();
     let foreign = generated_key(root.path(), "foreign");
     let result = daemon.ssh(&foreign, "_", "printf nope", &["-T"]);
     assert!(!result.ok());

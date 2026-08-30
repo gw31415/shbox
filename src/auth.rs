@@ -511,6 +511,17 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
+    /// The authorized_keys validator intentionally rejects a world-writable
+    /// ancestor such as the usual `/tmp`. Keep these fixtures below the crate
+    /// workspace so the tests exercise the file checks rather than the
+    /// permissions of the host's shared temp directory.
+    fn auth_tempdir() -> TempDir {
+        tempfile::Builder::new()
+            .prefix(".shbox-auth-test-")
+            .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .expect("tempdir")
+    }
+
     /// Generate a fresh Ed25519 keypair and return the authorized-keys line
     /// plus its fingerprint.
     fn generated_key() -> (String, KeyFingerprint) {
@@ -563,7 +574,7 @@ mod tests {
 
     #[test]
     fn snapshot_load_validates_admin_subset() {
-        let home = TempDir::new().expect("tempdir");
+        let home = auth_tempdir();
         let path = home.path().join("authorized_keys");
         let (line_a, fp_a) = generated_key();
         let (line_b, _fp_b) = generated_key();
@@ -587,7 +598,7 @@ mod tests {
 
     #[test]
     fn authenticate_rejects_unknown_keys() {
-        let home = TempDir::new().expect("tempdir");
+        let home = auth_tempdir();
         let path = home.path().join("authorized_keys");
         let (line_a, fp_a) = generated_key();
         std::fs::write(&path, &line_a).expect("write");
@@ -715,7 +726,7 @@ mod tests {
 
     #[test]
     fn validates_authorized_keys_file_safety() {
-        let home = TempDir::new().expect("tempdir");
+        let home = auth_tempdir();
         let path = home.path().join("authorized_keys");
         // Missing.
         assert!(matches!(
@@ -741,7 +752,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_authorized_keys_file() {
-        let home = TempDir::new().expect("tempdir");
+        let home = auth_tempdir();
         let path = home.path().join("authorized_keys");
         let line = b"ssh-ed25519 AAAA test\n".repeat(48 * 1024);
         fs::write(&path, &line).expect("write big");
