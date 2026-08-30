@@ -32,9 +32,9 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 から Milestone 5 までは完了し、各検証証跡ごと git history に archive 済みである。
+- Milestone 1 から Milestone 6 までは完了し、各検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
-  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 10 test を通過する。
+  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 14 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
@@ -55,11 +55,10 @@ selector、installer、永続 terminal session はありません。
   barrier を持つ。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M5 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated cgroup
+- M5/M6 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated cgroup
   child 作成権限が必要なため、現 macOS 開発環境では fail-closed が観測された状態である。
   wrapper を含む実行環境での full exec/environment/network/descendant evidence は M8 の
-  release gate に残る。terminal modes と実 PTY は M6、SIGHUP reload と
-  `max_host_processes` enforcement は M7 の作業である。
+  release gate に残る。SIGHUP reload、shutdown、recovery、dynamic limits は M7 の作業である。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
   shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
@@ -118,7 +117,7 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 
 - [x] Milestone 4 — deterministic launcher による SSH request semantics
 - [x] Milestone 5 — production Arapuca non-PTY process Adapter
-- [ ] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
+- [x] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
 - [ ] Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
 - [ ] Milestone 8 — real-platform release gates と operational examples
 
@@ -126,61 +125,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
-
-### 目標
-
-raw mode と process-group cleanup を含め、すべての正式対応 platform で interactive session と
-ssh -t session が通常の SSH terminal のように動作します。
-
-### 編集内容
-
-1. Arapuca Process を保持したまま、lifetime-bound な PTY master を read、write、lifecycle
-   用に duplicate/own して async I/O に使います。
-2. Arapuca が target を spawn して master FD を返した直後、I/O bridge の公開前に、
-   rows/columns と RFC 4254 POSIX terminal mode のうち対応するものを適用します。固定
-   revision には pre-exec hook がなく、v0.1 は trusted child launcher を導入しないため、
-   target の最初の命令より前の反映は保証しません。pixel dimension、RFC が要求する zero
-   dimension、unknown terminal mode は ignore します。size/mode 適用に失敗した process は
-   cleanup し、部分適用した PTY を client へ公開しません。
-3. window-change を desired-size revision と platform PTY-master の TIOCSWINSZ Adapter で
-   処理します。PTY 未要求なら無視し、pty-req 後・master 生成前なら state だけを更新し、
-   running なら state と ioctl の両方を更新します。launch race では最新 revision の適用後に
-   bridge-ready を publish します。Arapuca に resize method があるとは主張しません。
-4. 対応する SSH signal name を process group へ translate します。unknown name は reject し、
-   通常の Ctrl-C terminal behavior を保持します。
-5. interactive shell を login mode で、PTY exec を同じ shell -c contract で実行します。
-   PTY output は merged、non-PTY stderr は分離したままにします。
-6. macOS の raw-mode tcsetattr/tcgetattr、pin した Seatbelt /dev/ttys* file-ioctl rule、
-   /var traversal fix、resize、descendant cleanup を実行します。
-7. client EOF では既受信入力を drain して write duplicate だけを閉じ、read/lifecycle
-   duplicate を保持します。PTY child の EOF/hangup は保証せず、`VEOF` や `0x04` を合成
-   しません。明示 close/disconnect/delete/shutdown は通常の termination contract に従います。
-
-### 成果
-
-- ssh id@host、ssh -t id@host command、full-screen terminal application、resize、
-  Ctrl-C、explicit signal request、disconnect cleanup が各 formal target で動作します。
-- 一つの slow client が unbounded memory growth を作れません。send failure は process cleanup
-  を発生させます。
-- bridge 公開後には要求した PTY size/modes を観測できますが、target startup の最初の命令で
-  それらを観測できるとは約束しません。
-
-### 検証
-
-```console
-cargo test --locked --test pty -- --test-threads=1
-cargo test --locked --test pty_raw_mode -- --test-threads=1
-cargo test --locked --test pty_resize -- --test-threads=1
-cargo test --locked --test pty_signals -- --test-threads=1
-```
-
-期待結果: bridge 開始後の controlled program が要求された size/mode と subsequent resize を
-観測すること。target の最初の命令で request 値を観測する test は v0.1 の gate にしません。
-non-PTY の `cat` は client EOF で終了し、PTY は client EOF で synthetic byte/hangup を受けずに
-出力を続けること。macOS で raw mode が成功すること。signal termination が exit-signal を
-報告すること。cleanup 後にすべての process-group member が消えること。
 
 ## Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
 

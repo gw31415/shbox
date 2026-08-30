@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Limits, NetworkMode};
@@ -24,7 +24,8 @@ use crate::sandbox::SandboxId;
 
 use super::{
     LaunchError, LaunchOperation, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher,
-    ProcessReader, ProcessWriter, RunningProcess,
+    ProcessReader, ProcessWriter, PtyIo, RunningProcess, apply_terminal_modes, apply_window_size,
+    duplicate_fd,
 };
 
 const TASK_RANDOM_BYTES: usize = 16;
@@ -162,7 +163,7 @@ impl ArapucaLaunchPolicy {
         }
     }
 
-    fn environment_for(&self, workspace: &Path) -> Vec<(String, String)> {
+    fn environment_for(&self, workspace: &Path, term: Option<&str>) -> Vec<(String, String)> {
         let workspace = workspace.to_string_lossy().into_owned();
         let shell = self.shell.to_string_lossy().into_owned();
         let mut env = vec![
@@ -175,6 +176,13 @@ impl ArapucaLaunchPolicy {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        if let Some(term) = term {
+            // A pty-req is authoritative for TERM; do not let an operator
+            // sandbox_env entry shadow the terminal type negotiated on the
+            // SSH channel.
+            env.retain(|(name, _)| name != "TERM");
+            env.push(("TERM".to_string(), term.to_string()));
+        }
         env
     }
 }
@@ -182,7 +190,7 @@ impl ArapucaLaunchPolicy {
 /// A process-lifetime Arapuca adapter.
 pub(crate) struct ArapucaLauncher {
     backend: Box<dyn ::arapuca::platform::Sandbox>,
-    policy: ArapucaLaunchPolicy,
+    policy: RwLock<ArapucaLaunchPolicy>,
     active_tasks: Arc<Mutex<HashSet<String>>>,
     #[cfg(target_os = "linux")]
     linux_scope: LinuxScope,
@@ -244,11 +252,24 @@ impl ArapucaLauncher {
         linux_scope.retain_tasks(Arc::clone(&active_tasks));
         Ok(Self {
             backend,
-            policy,
+            policy: RwLock::new(policy),
             active_tasks,
             #[cfg(target_os = "linux")]
             linux_scope,
         })
+    }
+
+    /// Atomically replace the policy used by future launches. Existing
+    /// Arapuca processes retain the profile and environment with which they
+    /// were started; a launch clones one complete policy snapshot before it
+    /// creates any descriptors or asks the backend to fork.
+    pub(crate) fn reload_policy(&self, policy: ArapucaLaunchPolicy) -> Result<(), LaunchError> {
+        *self
+            .policy
+            .write()
+            .map_err(|_| LaunchError::new("sandbox process adapter policy is unavailable"))? =
+            policy;
+        Ok(())
     }
 
     fn acquire_task(&self, sandbox_id: &SandboxId) -> Result<TaskLease, LaunchError> {
@@ -275,28 +296,29 @@ impl ArapucaLauncher {
     }
 
     fn build_config(
-        &self,
+        policy: &ArapucaLaunchPolicy,
         task_id: &str,
         workspace: &Path,
-        stdin: RawFd,
-        stdout: RawFd,
-        stderr: RawFd,
+        stdio: (Option<RawFd>, Option<RawFd>, Option<RawFd>),
+        tty: bool,
+        term: Option<&str>,
     ) -> ::arapuca::Config {
+        let (stdin, stdout, stderr) = stdio;
         ::arapuca::Config {
-            profile: self.policy.profile_for(workspace),
+            profile: policy.profile_for(workspace),
             socket_dir: PathBuf::new(),
             task_id: task_id.to_string(),
             phase: "ssh".to_string(),
             work_dir: Some(workspace.to_path_buf()),
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            stderr: Some(stderr),
+            stdin,
+            stdout,
+            stderr,
             extra_fds: Vec::new(),
-            tty: false,
+            tty,
             network_proxy_socket: None,
             #[cfg(target_os = "linux")]
             allowed_hosts: Vec::new(),
-            env: self.policy.environment_for(workspace),
+            env: policy.environment_for(workspace, term),
             audit_sink: None,
             audit_verbosity: ::arapuca::audit::AuditVerbosity::Standard,
             audit_principal: None,
@@ -305,15 +327,71 @@ impl ArapucaLauncher {
     }
 }
 
+/// Owns an Arapuca process while post-spawn PTY setup is still fallible. If a
+/// descriptor duplicate or ioctl fails, the process must be terminated and
+/// reaped before the launch error is returned; dropping Arapuca alone does not
+/// remove macOS descendants from the process group.
+struct ProcessSetupGuard {
+    process: Option<::arapuca::Process>,
+    pid: u32,
+}
+
+impl ProcessSetupGuard {
+    fn new(process: ::arapuca::Process) -> ProcessSetupGuard {
+        let pid = process.pid();
+        ProcessSetupGuard {
+            process: Some(process),
+            pid,
+        }
+    }
+
+    fn process(&self) -> &::arapuca::Process {
+        self.process.as_ref().expect("process setup guard")
+    }
+
+    fn into_process(mut self) -> ::arapuca::Process {
+        self.process.take().expect("process setup guard")
+    }
+}
+
+impl Drop for ProcessSetupGuard {
+    fn drop(&mut self) {
+        let Some(process) = self.process.take() else {
+            return;
+        };
+        let pid = self.pid;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::Builder::new()
+            .name("shbox-sandbox-setup-cleanup".to_string())
+            .spawn(move || {
+                let mut process = process;
+                let _ = process.wait();
+                process.cleanup();
+                let _ = done_tx.send(());
+            });
+        let Ok(worker) = worker else {
+            signal_process_group(pid, libc::SIGKILL);
+            return;
+        };
+        signal_process_group(pid, libc::SIGTERM);
+        if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            signal_process_group(pid, libc::SIGKILL);
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        }
+        let _ = worker.join();
+    }
+}
+
 impl ProcessLauncher for ArapucaLauncher {
     fn launch(&self, request: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
-        if request.pty.is_some() {
-            return Err(LaunchError::new("sandbox PTY adapter is not available yet"));
-        }
-
         let _launch_guard = crate::platform::process_spawn_lock()
             .lock()
             .map_err(|_| LaunchError::new("sandbox process adapter is unavailable"))?;
+        let policy = self
+            .policy
+            .read()
+            .map_err(|_| LaunchError::new("sandbox process adapter policy is unavailable"))?
+            .clone();
         let task = self.acquire_task(&request.sandbox_id)?;
         let workspace = fs::canonicalize(&request.workspace)
             .map_err(|_| LaunchError::new("sandbox workspace is unavailable"))?;
@@ -321,12 +399,27 @@ impl ProcessLauncher for ArapucaLauncher {
             return Err(LaunchError::new("sandbox workspace is unavailable"));
         }
 
-        let (stdin_child, stdin_parent) = make_pipe()?;
-        let (stdout_parent, stdout_child) = make_pipe()?;
-        let (stderr_parent, stderr_child) = make_pipe()?;
+        let is_pty = request.pty.is_some();
+        let (stdin_child, stdin_parent): (Option<OwnedFd>, Option<OwnedFd>) = if is_pty {
+            (None, None)
+        } else {
+            let (child, parent) = make_pipe()?;
+            (Some(child), Some(parent))
+        };
+        let (stdout_parent, stdout_child): (Option<OwnedFd>, Option<OwnedFd>) = if is_pty {
+            (None, None)
+        } else {
+            let (parent, child) = make_pipe()?;
+            (Some(parent), Some(child))
+        };
+        let (stderr_parent, stderr_child): (Option<OwnedFd>, Option<OwnedFd>) = if is_pty {
+            (None, None)
+        } else {
+            let (parent, child) = make_pipe()?;
+            (Some(parent), Some(child))
+        };
 
-        let command = self
-            .policy
+        let command = policy
             .shell
             .to_str()
             .ok_or_else(|| LaunchError::new("sandbox shell path is not valid UTF-8"))?;
@@ -354,17 +447,23 @@ impl ProcessLauncher for ArapucaLauncher {
         };
         let args: Vec<&str> = args_storage.iter().map(String::as_str).collect();
 
-        let config = self.build_config(
+        let config = Self::build_config(
+            &policy,
             &task.task_id,
             &workspace,
-            stdin_child.as_raw_fd(),
-            stdout_child.as_raw_fd(),
-            stderr_child.as_raw_fd(),
+            (
+                stdin_child.as_ref().map(|fd| fd.as_raw_fd()),
+                stdout_child.as_ref().map(|fd| fd.as_raw_fd()),
+                stderr_child.as_ref().map(|fd| fd.as_raw_fd()),
+            ),
+            is_pty,
+            request.pty.as_ref().map(|pty| pty.term.as_str()),
         );
         let process = self
             .backend
             .launch(&config, command, &args)
             .map_err(|_| LaunchError::new("sandbox process launch failed"))?;
+        let process = ProcessSetupGuard::new(process);
 
         // Arapuca has synchronously forked and duplicated the configured
         // descriptors. No child-side FD is needed after launch returns.
@@ -372,14 +471,46 @@ impl ProcessLauncher for ArapucaLauncher {
         drop(stdout_child);
         drop(stderr_child);
 
-        let pid = process.pid();
-        let control = Arc::new(ArapucaProcessControl::new(pid));
+        let (pty_stdin, pty_stdout, lifecycle_fd) = if let Some(pty) = request.pty.as_ref() {
+            let master = process
+                .process()
+                .pty_master()
+                .ok_or_else(|| LaunchError::new("sandbox PTY master was not returned"))?;
+            let master_fd = master.as_raw_fd();
+            let read_fd = duplicate_fd(master_fd)
+                .map_err(|_| LaunchError::new("sandbox PTY read duplicate failed"))?;
+            let write_fd = duplicate_fd(master_fd)
+                .map_err(|_| LaunchError::new("sandbox PTY write duplicate failed"))?;
+            let lifecycle_fd = duplicate_fd(master_fd)
+                .map_err(|_| LaunchError::new("sandbox PTY lifecycle duplicate failed"))?;
+
+            apply_window_size(lifecycle_fd.as_raw_fd(), pty.rows, pty.cols)
+                .map_err(|_| LaunchError::new("sandbox PTY window size could not be applied"))?;
+            apply_terminal_modes(lifecycle_fd.as_raw_fd(), &pty.modes)
+                .map_err(|_| LaunchError::new("sandbox PTY terminal modes could not be applied"))?;
+
+            let stdin = PtyIo::new(write_fd)
+                .map_err(|_| LaunchError::new("sandbox PTY writer could not be initialized"))?;
+            let stdout = PtyIo::new(read_fd)
+                .map_err(|_| LaunchError::new("sandbox PTY reader could not be initialized"))?;
+            (
+                Some(Box::new(stdin) as ProcessWriter),
+                Some(Box::new(stdout) as ProcessReader),
+                Some(lifecycle_fd),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        let pid = process.process().pid();
+        let control = Arc::new(ArapucaProcessControl::new(pid, lifecycle_fd));
         let (wait_tx, wait_rx) = tokio::sync::oneshot::channel();
         let wait_control = Arc::clone(&control);
         let wait_task = task;
+        let process = process;
         let spawn_result = std::thread::Builder::new()
             .name("shbox-sandbox-wait".to_string())
-            .spawn(move || wait_process(process, wait_control, wait_task, wait_tx));
+            .spawn(move || wait_process(process.into_process(), wait_control, wait_task, wait_tx));
         if spawn_result.is_err() {
             // Dropping Process is Arapuca's force-cleanup path. It kills and
             // reaps before removing its private temp/cgroup state.
@@ -388,14 +519,21 @@ impl ProcessLauncher for ArapucaLauncher {
             ));
         }
 
-        let stdin = async_writer(stdin_parent);
-        let stdout = async_reader(stdout_parent);
-        let stderr = async_reader(stderr_parent);
+        let (stdin, stdout, stderr) = if is_pty {
+            (pty_stdin, pty_stdout, None)
+        } else {
+            (
+                Some(async_writer(stdin_parent.expect("non-PTY stdin parent"))),
+                Some(async_reader(stdout_parent.expect("non-PTY stdout parent"))),
+                Some(async_reader(stderr_parent.expect("non-PTY stderr parent"))),
+            )
+        };
         Ok(LaunchedProcess {
             control,
-            stdin: Some(stdin),
-            stdout: Some(stdout),
-            stderr: Some(stderr),
+            stdin,
+            stdout,
+            stderr,
+            window_revision: request.pty.as_ref().map_or(0, |pty| pty.window_revision),
             wait: wait_rx,
         })
     }
@@ -458,15 +596,19 @@ fn kill_descendants_after_wait(pid: u32) {
 #[cfg(target_os = "linux")]
 fn kill_descendants_after_wait(_pid: u32) {}
 
-fn kill_process_group(pid: u32) {
+fn signal_process_group(pid: u32, signal: i32) {
     if pid <= 1 {
         return;
     }
     // SAFETY: Arapuca creates a new session for the launched process, making
     // its PID the process-group ID. ESRCH simply means the group is gone.
     unsafe {
-        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        libc::kill(-(pid as libc::pid_t), signal);
     }
+}
+
+fn kill_process_group(pid: u32) {
+    signal_process_group(pid, libc::SIGKILL);
 }
 
 #[derive(Debug)]
@@ -488,16 +630,18 @@ struct ArapucaProcessControl {
     pid: u32,
     finished: AtomicBool,
     termination_requested: AtomicBool,
+    lifecycle_fd: Mutex<Option<OwnedFd>>,
     cleanup_complete: Mutex<bool>,
     cleanup_cv: Condvar,
 }
 
 impl ArapucaProcessControl {
-    fn new(pid: u32) -> Self {
+    fn new(pid: u32, lifecycle_fd: Option<OwnedFd>) -> Self {
         Self {
             pid,
             finished: AtomicBool::new(false),
             termination_requested: AtomicBool::new(false),
+            lifecycle_fd: Mutex::new(lifecycle_fd),
             cleanup_complete: Mutex::new(false),
             cleanup_cv: Condvar::new(),
         }
@@ -505,6 +649,9 @@ impl ArapucaProcessControl {
 
     fn mark_cleanup_complete(&self) {
         self.finished.store(true, Ordering::Release);
+        if let Ok(mut lifecycle_fd) = self.lifecycle_fd.lock() {
+            lifecycle_fd.take();
+        }
         if let Ok(mut complete) = self.cleanup_complete.lock() {
             *complete = true;
             self.cleanup_cv.notify_all();
@@ -542,9 +689,7 @@ impl ArapucaProcessControl {
             return;
         }
         // Arapuca's Unix launch path calls setsid(), so its returned process
-        // is the process-group leader. M5 uses a hard group teardown here;
-        // the graceful TERM→deadline→KILL protocol is completed by M6's
-        // channel lifecycle work.
+        // is the process-group leader.
         let group = -(self.pid as libc::pid_t);
         // SAFETY: `group` is a process-group target derived from the owned
         // Arapuca process PID and `signal` is supplied by the validated SSH
@@ -560,6 +705,11 @@ impl RunningProcess for ArapucaProcessControl {
         if self.termination_requested.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.signal_group(libc::SIGTERM);
+    }
+
+    fn force_terminate(&self) {
+        self.termination_requested.store(true, Ordering::Release);
         self.signal_group(libc::SIGKILL);
     }
 
@@ -572,6 +722,19 @@ impl RunningProcess for ArapucaProcessControl {
 
     fn signal(&self, number: i32) {
         self.signal_group(number);
+    }
+
+    fn resize(&self, rows: u32, cols: u32) -> bool {
+        if rows == 0 && cols == 0 {
+            return true;
+        }
+        let Ok(lifecycle_fd) = self.lifecycle_fd.lock() else {
+            return false;
+        };
+        let Some(fd) = lifecycle_fd.as_ref() else {
+            return false;
+        };
+        apply_window_size(fd.as_raw_fd(), rows, cols).is_ok()
     }
 }
 
@@ -831,7 +994,7 @@ mod tests {
         let config = crate::config::defaults();
         let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh");
         let directory = tempfile::tempdir().expect("workspace");
-        let env = policy.environment_for(directory.path());
+        let env = policy.environment_for(directory.path(), None);
         assert_eq!(
             env[0],
             ("HOME".into(), directory.path().display().to_string())
@@ -841,6 +1004,28 @@ mod tests {
             ("PWD".into(), directory.path().display().to_string())
         );
         assert_eq!(env[2], ("SHELL".into(), "/bin/sh".into()));
+    }
+
+    #[test]
+    fn requested_pty_term_overrides_the_operator_environment() {
+        let mut sandbox_env = BTreeMap::new();
+        sandbox_env.insert("TERM".to_string(), "operator-term".to_string());
+        let policy = ArapucaLaunchPolicy {
+            shell: PathBuf::from("/bin/sh"),
+            network: NetworkMode::Disabled,
+            read_paths: Vec::new(),
+            sandbox_env,
+            limits: Limits::default(),
+        };
+        let directory = tempfile::tempdir().expect("workspace");
+        let env = policy.environment_for(directory.path(), Some("xterm-256color"));
+        assert_eq!(env.iter().filter(|(name, _)| name == "TERM").count(), 1);
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "TERM")
+                .map(|(_, value)| value.as_str()),
+            Some("xterm-256color")
+        );
     }
 
     #[test]

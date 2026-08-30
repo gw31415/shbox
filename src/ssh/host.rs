@@ -10,14 +10,16 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
+use russh::Pty;
 use tokio::io::AsyncWriteExt;
 
 /// A `pty-req` captured before the operation starts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyRequest {
     pub term: String,
     pub rows: u32,
     pub cols: u32,
+    pub modes: Vec<(Pty, u32)>,
 }
 
 /// Fallback terminal size when the client sends a zero dimension.
@@ -65,9 +67,11 @@ pub struct HostProcess {
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     /// PTY master: one duplicate for reading (handed to the output pump),
-    /// one for writing (dropped on client EOF).
+    /// one for writing (dropped on client EOF), and one lifecycle duplicate
+    /// retained for resize after the client half-closes its input.
     master_read: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
     master_write: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
+    master_lifecycle: Option<std::fs::File>,
     /// Last desired PTY size. This remains available after the read end is
     /// handed to the output pump, so window-change can still issue ioctl on
     /// the write duplicate.
@@ -85,6 +89,18 @@ impl HostWaiter {
         self.task
             .await
             .unwrap_or_else(|err| Err(io::Error::other(err)))
+    }
+
+    /// Wait without consuming the waiter, so a caller can apply a force-stop
+    /// after a graceful timeout.
+    pub async fn wait(&mut self) -> Result<Exit, io::Error> {
+        (&mut self.task)
+            .await
+            .unwrap_or_else(|err| Err(io::Error::other(err)))
+    }
+
+    pub fn abort(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -137,12 +153,19 @@ impl HostProcess {
         command.kill_on_drop(true);
 
         let mut pty_master: Option<std::fs::File> = None;
-        let mut child = match &request.pty {
+        let child = match &request.pty {
             None => {
                 command
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
+                // Linux must not leave an unsupervised host process behind if
+                // the daemon is terminated abruptly. The macOS implementation
+                // is a no-op; its normal process-group cleanup remains the
+                // explicit teardown path.
+                unsafe {
+                    command.pre_exec(set_parent_death_signal);
+                }
                 command.spawn().map_err(SpawnError::Exec)?
             }
             Some(pty) => {
@@ -168,31 +191,41 @@ impl HostProcess {
                         if libc::ioctl(0, TIOCSCTTY, 0) == -1 {
                             return Err(io::Error::last_os_error());
                         }
-                        Ok(())
+                        set_parent_death_signal()
                     });
                 }
                 pty_master = Some(pty_pair.master.into());
                 command.spawn().map_err(SpawnError::Exec)?
             }
         };
+        let mut child = ChildSetupGuard::new(child);
 
-        let pid = child.id().unwrap_or(0) as libc::pid_t;
-        let (master_read, master_write) = match pty_master {
+        if let Some(pty) = request.pty.as_ref()
+            && let Some(master) = pty_master.as_ref()
+        {
+            crate::platform::apply_terminal_modes(master.as_raw_fd(), &pty.modes)
+                .map_err(SpawnError::Pty)?;
+        }
+
+        let pid = child.child().id().unwrap_or(0) as libc::pid_t;
+        let (master_read, master_write, master_lifecycle) = match pty_master {
             Some(master) => {
                 let write_dup = master.try_clone().map_err(SpawnError::Pty)?;
+                let lifecycle = master.try_clone().map_err(SpawnError::Pty)?;
                 set_nonblocking(&master).map_err(SpawnError::Pty)?;
                 set_nonblocking(&write_dup).map_err(SpawnError::Pty)?;
                 let read = tokio::io::unix::AsyncFd::new(master).map_err(SpawnError::Pty)?;
                 let write = tokio::io::unix::AsyncFd::new(write_dup).map_err(SpawnError::Pty)?;
-                (Some(read), Some(write))
+                (Some(read), Some(write), Some(lifecycle))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         if pid == 0 {
             return Err(SpawnError::Exec(io::Error::other(
                 "child exited before it could be tracked",
             )));
         }
+        let mut child = child.into_child();
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -203,6 +236,7 @@ impl HostProcess {
             stderr,
             master_read,
             master_write,
+            master_lifecycle,
             pty_size: request.pty.as_ref().map(PtyRequest::window_size),
         };
         // The waiter task owns the child from here on; the parent interacts
@@ -210,7 +244,16 @@ impl HostProcess {
         let task = tokio::task::spawn(async move {
             use std::os::unix::process::ExitStatusExt;
             let mut child = child;
-            let status = child.wait().await?;
+            let status = match child.wait().await {
+                Ok(status) => status,
+                Err(error) => {
+                    signal_process_group(pid, libc::SIGKILL);
+                    return Err(error);
+                }
+            };
+            // The direct child has been reaped, so close any descendants that
+            // inherited the dedicated process group before publishing exit.
+            signal_process_group(pid, libc::SIGKILL);
             if let Some(number) = status.signal() {
                 Ok(Exit::Signal {
                     number,
@@ -258,35 +301,130 @@ impl HostProcess {
     }
 
     /// Resize the PTY window; a zero dimension leaves that dimension alone.
-    pub fn resize(&mut self, rows: u32, cols: u32) {
+    pub fn resize(&mut self, rows: u32, cols: u32) -> bool {
         let Some(size) = self.pty_size.as_mut() else {
-            return;
+            return true;
         };
+        if rows == 0 && cols == 0 {
+            return true;
+        }
+        let Some(master) = self.master_lifecycle.as_ref() else {
+            return false;
+        };
+        if crate::platform::apply_window_size(master.as_raw_fd(), rows, cols).is_err() {
+            return false;
+        }
         if rows != 0 {
             size.ws_row = rows.clamp(1, u16::MAX as u32) as libc::c_ushort;
         }
         if cols != 0 {
             size.ws_col = cols.clamp(1, u16::MAX as u32) as libc::c_ushort;
         }
-        if rows == 0 && cols == 0 {
-            return;
-        }
-        let Some(master) = self.master_write.as_ref() else {
-            return;
-        };
-        // SAFETY: TIOCSWINSZ with a valid winsize pointer on an owned fd.
-        unsafe {
-            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, size);
-        }
+        true
     }
 
     /// Send a signal to the whole process group.
     pub fn signal_group(&self, signal: i32) -> bool {
-        if self.pid <= 0 {
+        if self.pid <= 1 {
             return false;
         }
-        // SAFETY: kill(2) with the negative pid targets the process group.
-        unsafe { libc::kill(-self.pid, signal) == 0 }
+        signal_process_group(self.pid, signal)
+    }
+}
+
+/// Owns a spawned child while PTY setup and AsyncFd construction are still
+/// fallible. Its drop path performs the same TERM/grace/KILL/reap sequence as
+/// an ordinary channel teardown, including descendants in the process group.
+struct ChildSetupGuard {
+    child: Option<tokio::process::Child>,
+    pid: libc::pid_t,
+}
+
+impl ChildSetupGuard {
+    fn new(child: tokio::process::Child) -> ChildSetupGuard {
+        let pid = child.id().unwrap_or(0) as libc::pid_t;
+        ChildSetupGuard {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    fn child(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("child setup guard")
+    }
+
+    fn into_child(mut self) -> tokio::process::Child {
+        self.child.take().expect("child setup guard")
+    }
+}
+
+impl Drop for ChildSetupGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        terminate_and_reap_child(child, self.pid);
+    }
+}
+
+fn signal_process_group(pid: libc::pid_t, signal: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: the process group was created by this spawn operation.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn set_parent_death_signal() -> io::Result<()> {
+    // The parent can die in the small interval between fork and prctl; keep
+    // the usual getppid race check alongside the kernel setting.
+    let parent = unsafe { libc::getppid() };
+    // SAFETY: prctl is called in the forked child before exec, and both
+    // arguments are fixed kernel constants.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::getppid() } != parent {
+        // SAFETY: the child is terminating itself after observing that its
+        // daemon parent already exited.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        return Err(io::Error::other("host daemon exited during spawn"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_parent_death_signal() -> io::Result<()> {
+    Ok(())
+}
+
+fn terminate_and_reap_child(child: &mut tokio::process::Child, pid: libc::pid_t) {
+    signal_process_group(pid, libc::SIGTERM);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                signal_process_group(pid, libc::SIGKILL);
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    signal_process_group(pid, libc::SIGKILL);
+    let _ = child.start_kill();
+    // `try_wait` performs the reap without requiring an async runtime. A
+    // killed process should resolve promptly; the bounded loop avoids making
+    // a setup error hang indefinitely if the OS reports an unusual failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
     }
 }
 
@@ -467,6 +605,7 @@ mod tests {
             term: "xterm".into(),
             rows: 0,
             cols: 0,
+            modes: Vec::new(),
         }
         .window_size();
         assert_eq!(size.ws_row, 24);

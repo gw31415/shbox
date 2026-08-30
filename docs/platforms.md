@@ -14,7 +14,7 @@ $XDG_DATA_HOME/shbox/sandboxes/<sandbox-id>/
 
 metadata と workspace の所有権、作成・一覧・削除、状態遷移、認可、per-ID lock は shbox の `SandboxManager` が持つ。owner fingerprint は metadata に保存し、通常鍵には自分の Sandbox だけ、admin 鍵には全 Sandbox を見せる。
 
-Arapuca v0.2.7 の通常 `Isolation::Process` は永続 Sandbox オブジェクトではない。公開されている primitive は、一回の `Sandbox::launch` と一個の `Process` handle であり、persistent resource の create/list/delete、別 process の attach、PTY resize は提供しない。したがって、同一 Sandbox の複数 shell/exec は、同じ shbox workspace を各々の disposable Arapuca process に共有させる構成になる。process、PTY、環境、外部インストールは接続終了時に残さない。
+Arapuca v0.2.7 の通常 `Isolation::Process` は永続 Sandbox オブジェクトではない。公開されている primitive は、一回の `Sandbox::launch` と一個の `Process` handle であり、persistent resource の create/list/delete、別 process の attach、高水準の PTY resize operation は提供しない。したがって、同一 Sandbox の複数 shell/exec は、同じ shbox workspace を各々の disposable Arapuca process に共有させる構成になる。process、PTY、環境、外部インストールは接続終了時に残さない。
 
 microVM の state API を通常 Process backend の代替として扱わない。永続 VM を利用する設計、VM image、guest attach、VM lifecycle は v0.1 の対象外である。
 

@@ -88,13 +88,14 @@ pub(crate) enum ChannelEvent {
     Eof,
     Close,
     Signal(i32),
-    WindowChange { rows: u32, cols: u32 },
+    WindowChange { rows: u32, cols: u32, revision: u64 },
 }
 
 /// Everything the connection handler remembers about one channel.
 #[derive(Debug, Default)]
 pub(crate) struct ChannelState {
     pub pty: Option<host::PtyRequest>,
+    pub window_revision: u64,
     /// Set once shell/exec/subsystem started; further terminal operations on
     /// the same channel are refused.
     pub started: bool,
@@ -181,23 +182,36 @@ impl ChannelRegistry {
             .unwrap_or(None)
     }
 
+    /// Return the PTY request and its desired-window revision as one snapshot.
+    /// The revision lets a bridge discard resize events queued before a newer
+    /// size was applied during process launch.
+    pub fn pty_snapshot(&self, id: ChannelId) -> Option<(host::PtyRequest, u64)> {
+        self.with_state(id, |state| {
+            state.pty.clone().map(|pty| (pty, state.window_revision))
+        })
+        .unwrap_or(None)
+    }
+
     /// Update only non-zero PTY dimensions. The zero value means "ignore this
     /// dimension" in RFC 4254, so a resize can never turn a known dimension
     /// into zero or overwrite the other dimension with a default.
-    pub fn update_window(&self, id: ChannelId, rows: u32, cols: u32) -> bool {
+    pub fn update_window(&self, id: ChannelId, rows: u32, cols: u32) -> Option<u64> {
         self.with_state(id, |state| {
-            let Some(pty) = state.pty.as_mut() else {
-                return false;
-            };
+            let pty = state.pty.as_mut()?;
+            if rows == 0 && cols == 0 {
+                return Some(state.window_revision);
+            }
+            let revision = state.window_revision.checked_add(1)?;
             if rows != 0 {
                 pty.rows = rows;
             }
             if cols != 0 {
                 pty.cols = cols;
             }
-            true
+            state.window_revision = revision;
+            Some(revision)
         })
-        .unwrap_or(false)
+        .unwrap_or(None)
     }
 
     /// Run `body` against the channel state; the lock is held only for the
@@ -273,9 +287,84 @@ pub(crate) async fn spawn_host_process(
 /// teardown. Persistent workspace deletion must not race this boundary.
 pub(crate) async fn wait_for_process_cleanup(control: Arc<dyn platform::RunningProcess>) {
     let _ = tokio::task::spawn_blocking(move || {
-        let _ = control.wait_for_cleanup(TEARDOWN_GRACE);
+        control.terminate();
+        if !control.wait_for_cleanup(TEARDOWN_GRACE) {
+            control.force_terminate();
+            let _ = control.wait_for_cleanup(TEARDOWN_GRACE);
+        }
     })
     .await;
+}
+
+/// Tear down a host process before a request can be acknowledged. The waiter
+/// remains owned until the child has been reaped, and only a timeout escalates
+/// from the process-group TERM to KILL path.
+pub(crate) async fn terminate_host_process(
+    mut process: host::HostProcess,
+    mut waiter: host::HostWaiter,
+) {
+    process.client_eof();
+    process.signal_group(libc::SIGTERM);
+    let graceful = matches!(
+        tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await,
+        Ok(Ok(_))
+    );
+    if !graceful {
+        process.signal_group(libc::SIGKILL);
+        if !matches!(
+            tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await,
+            Ok(Ok(_))
+        ) {
+            waiter.abort();
+        }
+    }
+}
+
+/// Re-apply the latest channel window before a sandbox bridge is published.
+/// A resize can arrive while the blocking adapter launch is in progress; the
+/// loop observes the state revision after each ioctl and repeats until stable.
+pub(crate) fn synchronize_sandbox_window(
+    registry: &ChannelRegistry,
+    id: ChannelId,
+    control: &dyn platform::RunningProcess,
+) -> Option<u64> {
+    let Some((mut pty, mut revision)) = registry.pty_snapshot(id) else {
+        return Some(0);
+    };
+    loop {
+        if !control.resize(pty.rows, pty.cols) {
+            return None;
+        }
+        let (latest, latest_revision) = registry.pty_snapshot(id)?;
+        if latest_revision == revision {
+            return Some(revision);
+        }
+        pty = latest;
+        revision = latest_revision;
+    }
+}
+
+/// The host adapter has the same launch race, but owns a mutable process
+/// rather than a platform control trait object.
+pub(crate) fn synchronize_host_window(
+    registry: &ChannelRegistry,
+    id: ChannelId,
+    process: &mut host::HostProcess,
+) -> Option<u64> {
+    let Some((mut pty, mut revision)) = registry.pty_snapshot(id) else {
+        return Some(0);
+    };
+    loop {
+        if !process.resize(pty.rows, pty.cols) {
+            return None;
+        }
+        let (latest, latest_revision) = registry.pty_snapshot(id)?;
+        if latest_revision == revision {
+            return Some(revision);
+        }
+        pty = latest;
+        revision = latest_revision;
+    }
 }
 
 /// Bridge an already-started host process to one SSH channel.
@@ -285,6 +374,7 @@ pub(crate) async fn run_host_process(
     mut process: host::HostProcess,
     waiter: host::HostWaiter,
     mut events: mpsc::Receiver<ChannelEvent>,
+    initial_window_revision: u64,
 ) -> ChannelResult {
     // Bounded queue of output chunks; the pumps block when full, so the child
     // blocks on its pipe once the daemon-side buffer is exhausted.
@@ -303,7 +393,7 @@ pub(crate) async fn run_host_process(
     drop(output_tx);
 
     let (exit_tx, mut exit_rx) = mpsc::channel::<ExitStatus>(1);
-    let waiter_task = tokio::task::spawn(async move {
+    let mut waiter_task = tokio::task::spawn(async move {
         let exit = match waiter.exit().await {
             Ok(host::Exit::Code(code)) => ExitStatus::Code(code.clamp(0, i32::MAX) as u32),
             Ok(host::Exit::Signal {
@@ -322,6 +412,7 @@ pub(crate) async fn run_host_process(
     });
 
     let mut client_eof = false;
+    let mut applied_window_revision = initial_window_revision;
     let mut exit_status: Option<ExitStatus> = None;
     let mut output_done = pumps.is_empty();
     let result: ChannelResult = loop {
@@ -346,8 +437,13 @@ pub(crate) async fn run_host_process(
                     Some(ChannelEvent::Signal(number)) => {
                         process.signal_group(number);
                     }
-                    Some(ChannelEvent::WindowChange { rows, cols }) => {
-                        process.resize(rows, cols);
+                    Some(ChannelEvent::WindowChange { rows, cols, revision }) => {
+                        if revision > applied_window_revision {
+                            if !process.resize(rows, cols) {
+                                break ChannelResult::Aborted;
+                            }
+                            applied_window_revision = revision;
+                        }
                     }
                     // The registry dropped the mailbox: the connection is
                     // gone; tear this channel down.
@@ -357,6 +453,9 @@ pub(crate) async fn run_host_process(
             chunk = output_rx.recv(), if !output_done => {
                 match chunk {
                     Some(chunk) => {
+                        if chunk.failed {
+                            break ChannelResult::Aborted;
+                        }
                         let sent = match chunk.ext {
                             None => handle.data(id, chunk.data).await,
                             Some(ext) => handle.extended_data(id, ext, chunk.data).await,
@@ -376,17 +475,32 @@ pub(crate) async fn run_host_process(
             break ChannelResult::Completed;
         }
     };
-    drop(waiter_task);
-
     if result != ChannelResult::Completed {
-        // Teardown: no new input, then make sure the group dies.
+        // Teardown: no new input, give the waiter a graceful window, then
+        // force the process group and join every pump before returning.
         process.client_eof();
         process.signal_group(libc::SIGTERM);
-        tokio::time::sleep(TEARDOWN_GRACE).await;
-        process.signal_group(libc::SIGKILL);
+        let graceful = matches!(
+            tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task).await,
+            Ok(Ok(()))
+        );
+        if !graceful {
+            process.signal_group(libc::SIGKILL);
+            let _ = tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task).await;
+        }
+        if !waiter_task.is_finished() {
+            waiter_task.abort();
+        }
+        let _ = waiter_task.await;
+        for pump in pumps {
+            pump.abort();
+            let _ = pump.await;
+        }
         let _ = handle.close(id).await;
         return result;
     }
+
+    drop(waiter_task);
 
     // Order the completion the SSH protocol expects: output, EOF, exit,
     // close.
@@ -462,8 +576,13 @@ pub(crate) async fn run_sandbox_process(
                     Some(ChannelEvent::Signal(number)) => {
                         process.control.signal(number);
                     }
-                    Some(ChannelEvent::WindowChange { rows, cols }) => {
-                        process.control.resize(rows, cols);
+                    Some(ChannelEvent::WindowChange { rows, cols, revision }) => {
+                        if revision > process.window_revision {
+                            if !process.control.resize(rows, cols) {
+                                break ChannelResult::Aborted;
+                            }
+                            process.window_revision = revision;
+                        }
                     }
                     None => break ChannelResult::Aborted,
                 }
@@ -471,6 +590,9 @@ pub(crate) async fn run_sandbox_process(
             chunk = output_rx.recv(), if !output_done => {
                 match chunk {
                     Some(chunk) => {
+                        if chunk.failed {
+                            break ChannelResult::Aborted;
+                        }
                         let sent = match chunk.ext {
                             None => sink.data(id, chunk.data).await,
                             Some(ext) => sink.extended_data(id, ext, chunk.data).await,
@@ -493,7 +615,6 @@ pub(crate) async fn run_sandbox_process(
 
     if result != ChannelResult::Completed {
         let control = Arc::clone(&process.control);
-        process.control.terminate();
         for pump in pumps {
             pump.abort();
         }
@@ -559,6 +680,7 @@ pub(crate) async fn finish_failed(id: ChannelId, sink: &dyn ChannelSink) -> Chan
 struct OutputChunk {
     data: Vec<u8>,
     ext: Option<u32>,
+    failed: bool,
 }
 
 /// Read one child pipe to EOF and forward bounded chunks.
@@ -571,11 +693,22 @@ fn spawn_pipe_pump(
         let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
         loop {
             match reader.read(&mut buffer).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    let _ = tx
+                        .send(OutputChunk {
+                            data: Vec::new(),
+                            ext,
+                            failed: true,
+                        })
+                        .await;
+                    break;
+                }
                 Ok(count) => {
                     let chunk = OutputChunk {
                         data: buffer[..count].to_vec(),
                         ext,
+                        failed: false,
                     };
                     if tx.send(chunk).await.is_err() {
                         break;
@@ -595,11 +728,23 @@ fn spawn_pty_pump(
         let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
         loop {
             match host::read_some_fd(&mut master, &mut buffer).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(_) => {
+                    let _ = tx
+                        .send(OutputChunk {
+                            data: Vec::new(),
+                            ext: None,
+                            failed: true,
+                        })
+                        .await;
+                    break;
+                }
                 Ok(count) => {
                     let chunk = OutputChunk {
                         data: buffer[..count].to_vec(),
                         ext: None,
+                        failed: false,
                     };
                     if tx.send(chunk).await.is_err() {
                         break;
@@ -763,6 +908,31 @@ mod tests {
         assert_eq!(registry.count(), 1);
     }
 
+    #[test]
+    fn window_revision_preserves_zero_dimensions_and_ignores_non_pty_channels() {
+        let registry = ChannelRegistry::new();
+        let id = channel_id(10);
+        let no_pty = channel_id(11);
+        registry.open(id);
+        registry.open(no_pty);
+        registry.with_state(id, |state| {
+            state.pty = Some(host::PtyRequest {
+                term: "xterm".into(),
+                rows: 24,
+                cols: 80,
+                modes: Vec::new(),
+            });
+        });
+
+        assert_eq!(registry.update_window(id, 0, 0), Some(0));
+        assert_eq!(registry.update_window(id, 40, 0), Some(1));
+        assert_eq!(registry.update_window(id, 0, 120), Some(2));
+        let (pty, revision) = registry.pty_snapshot(id).expect("pty snapshot");
+        assert_eq!((pty.rows, pty.cols, revision), (40, 120, 2));
+        assert_eq!(registry.update_window(no_pty, 50, 150), None);
+        assert_eq!(registry.pty_snapshot(no_pty), None);
+    }
+
     #[tokio::test]
     async fn sandbox_bridge_keeps_streams_separate_and_finishes_in_order() {
         let launcher = FakeLauncher::default();
@@ -798,6 +968,7 @@ mod tests {
             .send(ChannelEvent::WindowChange {
                 rows: 30,
                 cols: 100,
+                revision: 1,
             })
             .await
             .expect("resize event");
@@ -840,6 +1011,8 @@ mod tests {
                 term: "xterm".into(),
                 rows: 24,
                 cols: 80,
+                modes: Vec::new(),
+                window_revision: 0,
             })))
             .expect("fake launch");
         let fake = launcher.last_process().expect("fake process");
@@ -874,6 +1047,48 @@ mod tests {
             ]
         );
         let _ = events_tx;
+    }
+
+    #[tokio::test]
+    async fn sandbox_bridge_discards_resize_events_older_than_launch_snapshot() {
+        let launcher = FakeLauncher::default();
+        let launched = launcher
+            .launch(request(Some(PtySpec {
+                term: "xterm".into(),
+                rows: 24,
+                cols: 80,
+                modes: Vec::new(),
+                window_revision: 2,
+            })))
+            .expect("fake launch");
+        let fake = launcher.last_process().expect("fake process");
+        let sink = RecordingSink::default();
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let id = channel_id(12);
+        let bridge_sink = sink.clone();
+        let bridge = tokio::spawn(async move {
+            run_sandbox_process(id, &bridge_sink, launched, events_rx).await
+        });
+
+        events_tx
+            .send(ChannelEvent::WindowChange {
+                rows: 30,
+                cols: 100,
+                revision: 1,
+            })
+            .await
+            .expect("stale resize");
+        events_tx
+            .send(ChannelEvent::WindowChange {
+                rows: 40,
+                cols: 120,
+                revision: 3,
+            })
+            .await
+            .expect("new resize");
+        fake.finish(ProcessExit::Code(0)).await;
+        assert_eq!(bridge.await.expect("bridge join"), ChannelResult::Completed);
+        assert_eq!(fake.resizes(), vec![(40, 120)]);
     }
 
     #[tokio::test]

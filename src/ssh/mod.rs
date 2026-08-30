@@ -127,11 +127,13 @@ impl ConnHandler {
         let pty = self
             .conn
             .registry
-            .pty(channel)
-            .map(|pty| platform::PtySpec {
+            .pty_snapshot(channel)
+            .map(|(pty, window_revision)| platform::PtySpec {
                 term: pty.term,
                 rows: pty.rows,
                 cols: pty.cols,
+                modes: pty.modes,
+                window_revision,
             });
         let manager = Arc::clone(&self.shared.sandbox);
         let launch = tokio::task::spawn_blocking(move || {
@@ -156,10 +158,23 @@ impl ConnHandler {
             }
         };
         let lease = managed.lease.clone();
-        let process = managed.process;
+        let mut process = managed.process;
+        let Some(window_revision) = channel::synchronize_sandbox_window(
+            &self.conn.registry,
+            channel,
+            process.control.as_ref(),
+        ) else {
+            let control = Arc::clone(&process.control);
+            channel::wait_for_process_cleanup(control).await;
+            self.shared.sandbox.clear_runtime(&lease);
+            let handle = session.handle();
+            let _ = channel::finish_failed(channel, &handle).await;
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
+        process.window_revision = window_revision;
         if session.channel_success(channel).is_err() {
             let control = Arc::clone(&process.control);
-            process.control.terminate();
             channel::wait_for_process_cleanup(control).await;
             self.shared.sandbox.clear_runtime(&lease);
             self.conn.registry.remove(channel);
@@ -277,11 +292,7 @@ impl ConnHandler {
                 Ok(())
             }
             Ok(Route::Host) => {
-                let pty = self
-                    .conn
-                    .registry
-                    .with_state(channel, |state| state.pty.clone())
-                    .unwrap_or(None);
+                let pty = self.conn.registry.pty_snapshot(channel).map(|(pty, _)| pty);
                 let request = channel::host_request(
                     &operation,
                     &self.shared.account.host_shell(),
@@ -322,12 +333,18 @@ impl ConnHandler {
                 return Ok(());
             }
         };
+        let mut process = process;
+        let Some(window_revision) =
+            channel::synchronize_host_window(&self.conn.registry, channel, &mut process)
+        else {
+            channel::terminate_host_process(process, waiter).await;
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
         if session.channel_success(channel).is_err() {
             // The transport is already unavailable; stop the process rather
             // than leaving a waiter-owned child behind.
-            process.signal_group(libc::SIGTERM);
-            process.signal_group(libc::SIGKILL);
-            drop(waiter);
+            channel::terminate_host_process(process, waiter).await;
             self.conn.registry.remove(channel);
             return Ok(());
         }
@@ -336,7 +353,15 @@ impl ConnHandler {
         tokio::spawn(async move {
             // The bridge task owns the channel end to end; the handler only
             // routes further client events into the mailbox.
-            channel::run_host_process(channel, handle, process, waiter, events).await;
+            channel::run_host_process(
+                channel,
+                handle,
+                process,
+                waiter,
+                events,
+                window_revision,
+            )
+            .await;
             conn.registry.remove(channel);
         });
         Ok(())
@@ -461,7 +486,7 @@ impl russh::server::Handler for ConnHandler {
         row_height: u32,
         _pix_width: u32,
         _pix_height: u32,
-        _modes: &[(Pty, u32)],
+        modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if term.len() > MAX_TERM_BYTES || term.contains('\0') {
@@ -476,6 +501,7 @@ impl russh::server::Handler for ConnHandler {
                 term: term.to_string(),
                 rows: row_height,
                 cols: col_width,
+                modes: modes.to_vec(),
             });
             true
         });
@@ -586,18 +612,25 @@ impl russh::server::Handler for ConnHandler {
     ) -> Result<(), Self::Error> {
         // RFC 4254: normally want_reply=false, so no success/failure reply.
         // Without a PTY request the change is ignored without side effects.
-        if self
+        if let Some(revision) = self
             .conn
             .registry
             .update_window(channel, row_height, col_width)
-        {
-            self.conn.registry.try_send(
+            && (row_height != 0 || col_width != 0)
+            && !self.conn.registry.try_send(
                 channel,
                 ChannelEvent::WindowChange {
                     rows: row_height,
                     cols: col_width,
+                    revision,
                 },
-            );
+            )
+        {
+            // The desired state was updated, but the bounded mailbox no
+            // longer has room to wake a running bridge. Remove the channel so
+            // a pre-launch synchronizer cannot publish a PTY with an
+            // unobservable resize.
+            self.conn.registry.remove(channel);
         }
         Ok(())
     }
@@ -627,18 +660,24 @@ impl russh::server::Handler for ConnHandler {
         &mut self,
         channel: ChannelId,
         signal: russh::Sig,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         let name = sig_name(&signal);
         match host::signal_from_name(&name) {
             Some(number) => {
-                self.conn
+                if !self
+                    .conn
                     .registry
-                    .try_send(channel, ChannelEvent::Signal(number));
+                    .try_send(channel, ChannelEvent::Signal(number))
+                {
+                    let _ = session.close(channel);
+                    self.conn.registry.remove(channel);
+                }
                 Ok(())
             }
             None => {
                 // Unrecognized signal names are refused, never forwarded.
+                let _ = session.channel_failure(channel);
                 Ok(())
             }
         }

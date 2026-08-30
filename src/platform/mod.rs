@@ -16,9 +16,13 @@ use crate::sandbox::SandboxId;
 
 #[cfg(unix)]
 mod arapuca;
+#[cfg(unix)]
+mod terminal;
 
 #[cfg(unix)]
 pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
+#[cfg(unix)]
+pub(crate) use self::terminal::{PtyIo, apply_terminal_modes, apply_window_size, duplicate_fd};
 
 /// Serialize every daemon-owned process spawn with adapter pipe creation.
 ///
@@ -43,14 +47,16 @@ pub(crate) enum LaunchOperation {
     Exec(Vec<u8>),
 }
 
-/// PTY settings captured before launch.  Terminal modes are intentionally
-/// added by the later PTY milestone; M4 only preserves the selector, stream,
-/// and lifecycle semantics.
+/// PTY settings captured before launch.  The revision is a channel-local
+/// desired-window sequence number; it lets the bridge discard stale
+/// window-change events that were queued while a process was launching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PtySpec {
     pub(crate) term: String,
     pub(crate) rows: u32,
     pub(crate) cols: u32,
+    pub(crate) modes: Vec<(russh::Pty, u32)>,
+    pub(crate) window_revision: u64,
 }
 
 /// The private request passed from SandboxManager to a process adapter.
@@ -67,6 +73,12 @@ pub(crate) struct LaunchRequest {
 pub(crate) trait RunningProcess: fmt::Debug + Send + Sync {
     fn terminate(&self);
 
+    /// Force-stop after the graceful termination deadline. Keeping this as a
+    /// separate seam lets cleanup preserve a real TERM grace period.
+    fn force_terminate(&self) {
+        self.terminate();
+    }
+
     /// Wait until the adapter has reaped the process and released all
     /// platform-owned resources. Delete uses this before removing a
     /// workspace, so termination is not merely an asynchronous signal.
@@ -78,7 +90,9 @@ pub(crate) trait RunningProcess: fmt::Debug + Send + Sync {
 
     /// Apply a desired PTY size.  A process adapter may ignore this until its
     /// PTY has been created; the channel state remains authoritative.
-    fn resize(&self, _rows: u32, _cols: u32) {}
+    fn resize(&self, _rows: u32, _cols: u32) -> bool {
+        true
+    }
 }
 
 /// Normalized process exit used by the channel bridge.  The manager does not
@@ -99,6 +113,7 @@ pub(crate) struct LaunchedProcess {
     pub(crate) stdin: Option<ProcessWriter>,
     pub(crate) stdout: Option<ProcessReader>,
     pub(crate) stderr: Option<ProcessReader>,
+    pub(crate) window_revision: u64,
     /// In PTY mode `stdout` is already the merged terminal stream and
     /// `stderr` is `None`.  The write duplicate is represented by `stdin` and
     /// is dropped on client EOF.
@@ -242,6 +257,7 @@ impl ProcessLauncher for FakeLauncher {
                 stdout_rx
             }))),
             stderr: (!pty_mode).then(|| Box::new(FakeReader::new(stderr_rx)) as ProcessReader),
+            window_revision: request.pty.as_ref().map_or(0, |pty| pty.window_revision),
             wait: wait_rx,
         })
     }
@@ -456,11 +472,12 @@ impl RunningProcess for FakeProcess {
         self.signals.lock().expect("fake signals").push(number);
     }
 
-    fn resize(&self, rows: u32, cols: u32) {
+    fn resize(&self, rows: u32, cols: u32) -> bool {
         self.resizes
             .lock()
             .expect("fake resizes")
             .push((rows, cols));
+        true
     }
 }
 
@@ -484,6 +501,8 @@ mod tests {
             term: "xterm".into(),
             rows: 40,
             cols: 120,
+            modes: Vec::new(),
+            window_revision: 0,
         }));
         let _process = launcher.launch(request.clone()).expect("fake launch");
         assert_eq!(launcher.last_request(), Some(request));
@@ -519,6 +538,8 @@ mod tests {
                 term: "xterm".into(),
                 rows: 24,
                 cols: 80,
+                modes: Vec::new(),
+                window_revision: 0,
             })))
             .expect("fake launch");
         assert!(launched.stderr.is_none());
