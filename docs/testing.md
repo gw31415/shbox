@@ -174,7 +174,7 @@ RUSTC_WRAPPER= cargo test --locked --test ssh_auth -- --test-threads=1
 RUSTC_WRAPPER= cargo +1.91.0 test --locked --test ssh_auth -- --test-threads=1
 ```
 
-リポジトリの通常 OpenSSH test は、wrapper と delegated cgroup がない開発環境でも安全性を検証できるよう、sandbox request が status 111 の generic failure になることを既定の合格条件にする。実 Arapuca の成功経路を試験する場合だけ `SHBOX_RUN_ARAPUCA_INTEGRATION=1` を test process と daemon に継承させ、sandbox exec が status 0 と期待 output を返すことを要求する。両方の結果を一つの `or` 条件で合格扱いにしてはならない。
+Linux の通常 OpenSSH test は、wrapper と delegated cgroup がない開発環境でも安全性を検証できるよう、sandbox request が status 111 の generic failure になることを既定の合格条件にする。Linux で実 Arapuca の成功経路を試験する場合だけ `SHBOX_RUN_ARAPUCA_INTEGRATION=1` を test process と daemon に継承させ、sandbox exec が status 0 と期待 output を返すことを要求する。macOS arm64 は shbox 自身の embedded rlimit wrapper を使うため、通常の OpenSSH test が Seatbelt の成功経路を実行する。両方の結果を一つの `or` 条件で合格扱いにしてはならない。
 
 ### 6.1 exec、ownership、list、delete
 

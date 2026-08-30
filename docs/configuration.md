@@ -268,7 +268,7 @@ admin key が一つ以上ある managed mode では、host selector `_` を reco
 sandbox-only mode は有効な構成だが、port 22 の listener に admin recovery route が無い
 ことを startup log で warning として一度通知する。
 
-Arapuca backend の初期化や sandbox capability の検証に失敗しても daemon は起動できる。managed mode では SSH/host route を利用でき、sandbox-only mode でも reconciliation の完了後は listener を公開する。どちらの mode でも Arapuca が必要な sandbox shell/exec/PTY は fail closed とし、ホスト上で直接 command を実行する fallback はない。metadata に基づく認可済み `list`/`delete` は reconciliation 後に利用できる。backend は SIGHUP で再構築せず、sandbox process の復旧には daemon restart が必要である。
+Arapuca backend の初期化や sandbox capability の検証に失敗しても daemon は起動できる。managed mode では SSH/host route を利用でき、sandbox-only mode でも reconciliation の完了後は listener を公開する。Linux で外部 `arapuca` wrapper または delegated cgroup が利用できない場合、または対応外 platform の場合、Arapuca が必要な sandbox shell/exec/PTY は fail closed とし、ホスト上で直接 command を実行する fallback はない。macOS arm64 では、別途 `arapuca` を PATH にインストールしていなくても、shbox 自身が rlimit wrapper として動作する。metadata に基づく認可済み `list`/`delete` は reconciliation 後に利用できる。backend は SIGHUP で再構築せず、sandbox process の復旧には daemon restart が必要である。
 
 ## 6. Reload
 

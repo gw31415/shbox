@@ -648,12 +648,13 @@ fn run_ssh_command(
         .expect("ssh runs")
 }
 
-/// Real Arapuca execution is an explicit environment-gated acceptance test.
-/// Ordinary CI and developer runs must prove the fail-closed path when the
-/// wrapper/delegated cgroup is not provisioned; a successful branch is never
-/// accepted merely because the adapter happened to be unavailable.
+/// Real Arapuca execution is an explicit environment-gated acceptance test on
+/// Linux. macOS arm64 has an embedded rlimit wrapper, so its normal OpenSSH
+/// harness exercises the real Seatbelt path without a separately installed
+/// `arapuca` binary.
 fn arapuca_integration_enabled() -> bool {
-    std::env::var_os("SHBOX_RUN_ARAPUCA_INTEGRATION").is_some()
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        || std::env::var_os("SHBOX_RUN_ARAPUCA_INTEGRATION").is_some()
 }
 
 /// The `_` host route runs the daemon account's login shell and command.

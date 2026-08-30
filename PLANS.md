@@ -60,10 +60,10 @@ selector、installer、永続 terminal session はありません。
   barrier を持つ。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M5--M7 の formal platform acceptance は、外部の Arapuca wrapper と Linux の delegated
-  cgroup child 作成権限が必要なため、現 macOS 開発環境では fail-closed が観測された状態で
-  ある。wrapper を含む実行環境での full exec/environment/network/descendant evidence は
-  M8 の release gate に残る。M7 の reload、shutdown、recovery、dynamic limits、hostile
+- M5--M7 の formal platform acceptance は、Linux の外部 Arapuca wrapper と delegated cgroup
+  child 作成権限、macOS の固定 OS/version 上での Seatbelt evidence が必要であり、M8 の
+  release gate に残る。macOS arm64 の通常実行は別 wrapper が PATH に無くても shbox 内の
+  rlimit wrapper を使える。M7 の reload、shutdown、recovery、dynamic limits、hostile
   concurrency 実装と local suite は完了している。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
@@ -163,7 +163,15 @@ evidence が揃うまで行わない。
   `33323095132` は stable と Rust 1.91 の quality job が clippy で失敗し、Linux/macOS の
   real-platform jobs は skipped になった。失敗原因は Linux cfg でのみ生きる RAII field の
   dead-code 警告と、Linux の `mode_t` に対する不要な同型 cast であり、working tree で修正済み
-  である。修正を follow-up commit に archive してから hosted run を再実行する。
+  である。
+- follow-up commit `1a393e9` の hosted run `33323898522` でも stable と Rust 1.91 の quality
+  job が `clippy::useless_conversion`（Linux の `mode_t = u32` に対する `u32::from`）で失敗し、
+  real-platform jobs は再び skipped になった。Linux は直接 mask、非 Linux は cast を使う cfg
+  分岐を working tree で修正済みである。GitHub Actions はクレジットを消費するため、以後は
+  ユーザー指定どおり aarch64 Docker と native macOS arm64 で検証し、hosted run は再実行しない。
+- 2026-08-31 の native macOS `26.6.2` / arm64 では、外部 `arapuca` が PATH に無い状態で
+  embedded rlimit wrapper を通る real OpenSSH harness が `21 passed` になった。Linux の
+  aarch64 Docker では stable/MSRV の quality check と SSH sandbox request/build を実行した。
 - Linux と macOS 15 の専用 runner、および修正後の同一 commit の hosted workflow log は未取得である。
 - 上記が完了するまで M8 と release status は `[ ]` / `BLOCKED — UNVERIFIED` のままにする。
 

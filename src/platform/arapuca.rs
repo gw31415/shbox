@@ -3,8 +3,9 @@
 //! The rest of shbox deliberately knows only the private `ProcessLauncher`
 //! seam in `platform::mod`.  This module owns the Arapuca-specific profile,
 //! task-id, pipe, signal, and wait/cleanup details.  It is initialized once
-//! during daemon bootstrap; a missing wrapper or platform prerequisite is a
-//! normal fail-closed state for sandbox launches, not a host-process fallback.
+//! during daemon bootstrap; a missing external wrapper or platform prerequisite
+//! is a normal fail-closed state for sandbox launches, not a host-process
+//! fallback. macOS arm64 can use shbox's embedded rlimit wrapper.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -223,9 +224,7 @@ impl ArapucaLauncher {
             ));
         }
 
-        let wrapper = ::arapuca::env::wrapper_path().ok_or_else(|| {
-            LaunchError::new("sandbox process adapter unavailable: arapuca wrapper is missing")
-        })?;
+        let wrapper = resolve_wrapper()?;
         ensure_executable_file(&wrapper)?;
 
         #[cfg(target_os = "linux")]
@@ -802,6 +801,27 @@ fn ensure_executable_file(path: &Path) -> Result<(), LaunchError> {
     Ok(())
 }
 
+fn resolve_wrapper() -> Result<PathBuf, LaunchError> {
+    if let Some(wrapper) = ::arapuca::env::wrapper_path() {
+        return Ok(wrapper);
+    }
+
+    // Darwin's Seatbelt backend needs only the rlimit part of the standalone
+    // wrapper. The daemon handles that boundary before exec and asks Arapuca
+    // to resolve the current executable for subsequent launches.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        ::arapuca::selfexec::enable_selfexec_mode();
+        if let Some(wrapper) = ::arapuca::env::wrapper_path() {
+            return Ok(wrapper);
+        }
+    }
+
+    Err(LaunchError::new(
+        "sandbox process adapter unavailable: arapuca wrapper is missing",
+    ))
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -989,7 +1009,12 @@ mod tests {
         assert_eq!(profile.write_paths, vec![directory.path().to_path_buf()]);
         assert_eq!(profile.max_open_files, 1024);
         assert_eq!(profile.seccomp_profile, ::arapuca::SeccompProfile::Strict);
-        assert!(profile.read_paths.iter().any(|path| path.ends_with("sh")));
+        let shell = std::fs::canonicalize("/bin/sh").expect("canonical shell");
+        assert!(
+            profile.read_paths.iter().any(|path| path == &shell),
+            "canonical shell {shell:?} is not readable: {:?}",
+            profile.read_paths
+        );
     }
 
     #[test]

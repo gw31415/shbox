@@ -23,6 +23,9 @@ use std::fmt;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::os::unix::process::CommandExt;
+
 use crate::auth::KeyFingerprint;
 
 use tracing::level_filters::LevelFilter;
@@ -40,6 +43,11 @@ use tracing::{debug, error, info, warn};
 struct Args {}
 
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if embedded_arapuca_wrapper_invocation() {
+        return run_embedded_arapuca_wrapper();
+    }
+
     let _args = Args::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -55,6 +63,57 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// macOS does not need Arapuca's Linux Landlock/seccomp wrapper, but it still
+/// needs the wrapper boundary for per-process rlimits. Reuse the daemon
+/// executable for that small boundary when a standalone `arapuca` binary is
+/// not installed. The environment sentinel is set only by Arapuca's own
+/// launch path; ordinary `shbox` invocations continue through the CLI parser.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn embedded_arapuca_wrapper_invocation() -> bool {
+    std::env::var_os("ARAPUCA_WRAPPER").as_deref() == Some(std::ffi::OsStr::new("1"))
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--"))
+}
+
+/// Apply the rlimits prepared by Arapuca and replace this process with the
+/// Seatbelt command. This mirrors the standalone Arapuca wrapper contract:
+/// ARAPUCA_* control variables are consumed here and never reach the
+/// sandboxed command.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_embedded_arapuca_wrapper() -> ExitCode {
+    let mut args = std::env::args_os();
+    let _executable = args.next();
+    let separator = args.next();
+    let Some(command) = args.next() else {
+        eprintln!("shbox: embedded arapuca wrapper: missing command after --");
+        return ExitCode::FAILURE;
+    };
+    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
+        eprintln!("shbox: embedded arapuca wrapper: invalid invocation");
+        return ExitCode::FAILURE;
+    }
+
+    if let Err(error) = ::arapuca::rlimit::apply_from_env() {
+        eprintln!("shbox: embedded arapuca wrapper: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut child = std::process::Command::new(command);
+    child.args(args);
+    child.env_clear();
+    for (name, value) in std::env::vars_os() {
+        let is_arapuca_control = name
+            .to_str()
+            .is_some_and(|name| name.starts_with("ARAPUCA_"));
+        if !is_arapuca_control {
+            child.env(name, value);
+        }
+    }
+
+    let error = child.exec();
+    eprintln!("shbox: embedded arapuca wrapper: exec failed: {error}");
+    ExitCode::FAILURE
 }
 
 /// A bootstrap failure with the startup step that produced it.

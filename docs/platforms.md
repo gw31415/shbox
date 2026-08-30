@@ -180,7 +180,7 @@ WantedBy=multi-user.target
 
 ### 4.3 macOS prerequisites
 
-macOS backend は `sandbox-exec` が利用できることを要求する。Arapuca は Seatbelt の deny-default profile と rlimit/watchdog を使用するが、cgroups v2、Linux の CPU quota、PID limit、per-host network filtering は提供しない。memory は RSS polling の best effort、CPU percentage は Linux quota と同じ意味ではない。対応表に「適用されない」制限を適用済みとして表示しない。
+macOS backend は `sandbox-exec` が利用できることを要求する。Arapuca は Seatbelt の deny-default profile と rlimit/watchdog を使用するが、cgroups v2、Linux の CPU quota、PID limit、per-host network filtering は提供しない。memory は RSS polling の best effort、CPU percentage は Linux quota と同じ意味ではない。macOS arm64 では shbox が自身を Arapuca の rlimit wrapper として再利用できるため、別途 `arapuca` 実行ファイルを PATH に置く必要はない。対応表に「適用されない」制限を適用済みとして表示しない。
 
 固定先 `c948...` は、v0.2.7 tag に無かった次の修正を含む。
 
