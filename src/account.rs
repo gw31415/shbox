@@ -18,8 +18,6 @@ use crate::paths;
 #[derive(Debug, Clone)]
 pub struct Account {
     pub name: String,
-    /// Consumed by host mode in Milestone 2 (initial working directory).
-    #[allow(dead_code)]
     pub home: PathBuf,
     /// passwd login shell; empty entry means the account has no shell set.
     pub shell: String,

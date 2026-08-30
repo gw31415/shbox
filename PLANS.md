@@ -32,23 +32,23 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 は完了し、検証証跡ごと git history に archive 済みである。local では stable
-  1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) / `cargo test --locked` (56 test)
-  が通ることを確認済み。
+- Milestone 1 と Milestone 2 は完了し、検証証跡ごと git history に archive 済みである。
+  stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
+  `cargo test --locked --all-targets` が通り、M2 の実 OpenSSH harness は 9 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
   rand 0.10 (`rand::rng()`) に依存する。
-- src/ の現状: `main.rs` (Tokio bootstrap、SIGINT/SIGTERM で終了、SIGHUP は未実装を
-  log するだけ)、`config.rs` (typed TOML snapshot、欠落時は built-in default)、
-  `paths.rs`、`lockfile.rs` (registry.lock → state lock の順で non-blocking flock、
-  失敗時 rollback)、`hostkey.rs` (link(2) による atomic create、既存鍵は決して置換
-  しない)、`auth.rs` (KeyFingerprint 型と authorized_keys の file-level 検証のみ)、
-  `account.rs`、`logging.rs` (reload 可能な level filter、まだ SIGHUP 非接続)、
-  `server.rs` (`probe_listen` の all-or-nothing bind 検証)、`sandbox/id.rs`、
-  `platform/mod.rs` (Arapuca 公開 API の compile probe のみ)。
-- Milestone 2 は `server.rs` の `probe_listen` を実際の russh listener に置き換え、
-  `auth.rs` に authorized_keys の行 parse と connection-scoped Principal を追加する。
+- src/ の現状: `main.rs` は validated snapshot を組み立て、実際の russh listener を
+  SIGINT/SIGTERM まで serve する。`auth.rs` は bounded な Ed25519 authorized_keys parser、
+  ownership-safe file validation、connection-scoped Principal を持つ。`server.rs` は
+  concurrent connection handling、handshake/auth timeout、connection/auth caps、
+  all-or-nothing bind を持つ。`ssh/` は session channel、admin-only `_` host shell/exec/PTY、
+  generic unavailable な sandbox/list/delete placeholder と request rejection を実装済み。
+  `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
+  `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
+- M2 の後続依存: sandbox request は SandboxManager 実装まで unavailable のまま、terminal
+  modes は M6、SIGHUP reload と `max_host_processes` enforcement は M7 の作業である。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
   shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
@@ -104,7 +104,6 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 
 ## 進捗
 
-- [ ] Milestone 2 — public-key SSH server と admin host route
 - [ ] Milestone 3 — durable SandboxManager storage と ownership
 - [ ] Milestone 4 — deterministic launcher による SSH request semantics
 - [ ] Milestone 5 — production Arapuca non-PTY process Adapter
@@ -116,55 +115,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 2 — public-key SSH server と admin host route
-
-### 目標
-
-OpenSSH client が authorized Ed25519 key で認証できます。通常ユーザーは host へ escape
-できず、admin は _ を使って daemon-account の login shell または remote command を実行
-できます。sandbox request は、後の milestone まで意図した unavailable response を返しても
-構いません。
-
-### 編集内容
-
-1. bounded な OpenSSH authorized-keys subset を parse し、SHA-256 fingerprint を計算し、
-   admin_keys を検証して、auth_publickey からだけ connection-scoped Principal を生成する
-   src/auth.rs を追加します。auth_publickey_offered は決して使いません。
-2. public-key-only の russh::server::Config、Ed25519 host key、handshake/auth timeout、
-   auth-attempt/connection caps、all-or-nothing listener binding を備えた src/server.rs を
-   追加します。
-3. src/ssh/ の下に per-connection/per-channel state を追加します。session channel だけを
-   accept し、forwarding、agent、X11、streamlocal、SFTP、client environment、その他すべての
-   unused request を reject します。
-4. _ の authorization と host shell/exec/PTY spawning を実装します。daemon account の login
-   shell、その account home を cwd、既存の HOME を含む daemon service environment 全体、
-   daemon uid/gid を使います。interactive shell は login mode、remote command は同じ shell
-   と -c を使います。
-5. role と auth/config snapshot を connection-scoped に保ちます。複数 channel は principal を
-  共有しますが、request/PTY/process state は独立して保持します。
-6. 生成した Ed25519 key を使い、accepted/rejected role/username pair と confirmed session
-   channel より前に受信した channel request をテストします。
-
-### 成果
-
-- ssh _@host と ssh _@host command は admin key だけで動作します。
-- 通常の authorized key が _ を使った場合、および none/password/keyboard-interactive
-  authentication はすべて、role や key-set を漏らさず失敗します。
-- 既存の authenticated connection は切断まで自身の role を保持します。
-
-### 検証
-
-isolated test config/listener を使い、repository integration harness と直接 OpenSSH を実行:
-
-```console
-cargo test --locked --test ssh_auth -- --test-threads=1
-ssh -F tests/fixtures/ssh_config _@127.0.0.1 'printf host-ok'
-```
-
-期待結果: admin command は正確に host-ok を出力して exit 0。normal key で同じ command は
-reject。forwarding と env request は reject。reject された channel が connection 上の他の
-channel を終了させないこと。
 
 ## Milestone 3 — durable SandboxManager storage と ownership
 

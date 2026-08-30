@@ -1,10 +1,10 @@
 //! shbox: a foreground SSH daemon that maps authenticated keys onto
 //! persistent sandbox workspaces.
 //!
-//! Milestone 1 bootstrap: parse the command line, resolve and validate every
-//! local input (XDG paths, advisory daemon locks, optional config,
-//! authorized-keys file, host key, shell, listen addresses), then wait on the
-//! signal loop. The SSH listener itself arrives in Milestone 2.
+//! Milestone 2 bootstrap: resolve and validate every local input, then run
+//! the public-key SSH server with the admin-only `_` host route. Sandbox
+//! shell/exec/list/delete still answer the intentional unavailable response
+//! until the SandboxManager arrives.
 
 mod account;
 mod auth;
@@ -16,9 +16,11 @@ mod paths;
 mod platform;
 mod sandbox;
 mod server;
+mod ssh;
 
 use std::fmt;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use crate::auth::KeyFingerprint;
 
@@ -93,7 +95,7 @@ fn report(error: &BootstrapError) {
     }
 }
 
-/// Resolve and validate every local input, then wait on the signal loop.
+/// Resolve and validate every local input, then serve SSH until shutdown.
 async fn run() -> Result<(), BootstrapError> {
     // Logging starts at info so early failures are visible; the configured
     // level replaces it as soon as the config snapshot exists.
@@ -124,15 +126,13 @@ async fn run() -> Result<(), BootstrapError> {
         .map_err(|err| fail("resolving authorized_keys", err))?;
     auth::validate_authorized_keys_file(&authorized_keys)
         .map_err(|err| fail("validating authorized_keys", err))?;
+    let auth_snapshot = auth::AuthSnapshot::load(&authorized_keys, app_config.admin_keys())
+        .map_err(|err| fail("loading the authentication snapshot", err))?;
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
 
-    server::probe_listen(app_config.listen())
-        .map_err(|err| fail("binding listen addresses", err))?;
-
     debug!(
-        sandboxes_root = %paths.sandboxes_root().display(),
         limits = ?app_config.limits(),
         caps = ?app_config.caps(),
         read_paths = app_config.read_paths().len(),
@@ -141,12 +141,17 @@ async fn run() -> Result<(), BootstrapError> {
     );
     if app_config.managed_mode() {
         info!(
-            admins = app_config.admin_keys().len(),
+            admins = auth_snapshot.admin_count(),
             user = %account.name,
             "managed mode: host selector \"_\" is available to admin keys"
         );
         debug!(
-            admins = %app_config.admin_keys().iter().map(KeyFingerprint::to_string).collect::<Vec<_>>().join(","),
+            admins = %app_config
+                .admin_keys()
+                .iter()
+                .map(KeyFingerprint::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             "admin fingerprints"
         );
     } else {
@@ -159,16 +164,38 @@ async fn run() -> Result<(), BootstrapError> {
             "network = \"outbound\": sandbox network isolation is reduced; restrict reachability with a host firewall"
         );
     }
+
+    let account_name = account.name.clone();
+    let shared = ssh::Shared {
+        auth: Arc::new(auth_snapshot),
+        config: Arc::new(app_config.clone()),
+        account: Arc::new(account),
+    };
+    let server = Arc::new(server::SshServer::new(
+        shared,
+        host_key.key().clone(),
+        &app_config,
+    ));
+    let sockets = server::bind_all(app_config.listen())
+        .await
+        .map_err(|err| fail("binding listen addresses", err))?;
+    let bound: Vec<_> = sockets
+        .iter()
+        .filter_map(|listener| listener.local_addr().ok())
+        .collect();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let serve_task = tokio::spawn(server.serve(sockets, shutdown_rx));
     info!(
-        user = %account.name,
-        listen = ?app_config.listen(),
+        user = %account_name,
+        listen = ?bound,
         host_key_fingerprint = %host_key.key().fingerprint(russh::keys::HashAlg::Sha256),
-        authorized_keys = %authorized_keys.display(),
-        sandbox_shell = %sandbox_shell.display(),
-        "startup validation complete; the SSH listener arrives with the next milestone"
+        "shbox ready"
     );
 
     wait_for_signals().await;
+    let _ = shutdown_tx.send(true);
+    let _ = serve_task.await;
     drop(locks);
     info!("shutdown complete");
     Ok(())

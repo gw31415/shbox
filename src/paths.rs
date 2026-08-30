@@ -97,6 +97,8 @@ impl Paths {
     }
 
     /// Directory holding per-sandbox metadata and workspace directories.
+    /// Consumed by the Milestone 3 SandboxManager storage.
+    #[allow(dead_code)]
     pub fn sandboxes_root(&self) -> &Path {
         &self.sandboxes_root
     }

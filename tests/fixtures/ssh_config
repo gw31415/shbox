@@ -1,0 +1,22 @@
+# OpenSSH client configuration for talking to a local shbox test daemon.
+#
+# Manual verification (PLANS.md Milestone 2 gate):
+#
+#   1. Start a daemon with an isolated XDG tree and a test listener, e.g.
+#        XDG_CONFIG_HOME=$TMP/config XDG_DATA_HOME=$TMP/data \
+#        XDG_STATE_HOME=$TMP/state shbox
+#      with config.toml pointing listen at a free port.
+#   2. Replace the Port below with that port, or pass -p on the command line:
+#
+#   ssh -F tests/fixtures/ssh_config -i $ADMIN_KEY -p $PORT _@127.0.0.1 'printf host-ok'
+#
+# Expected output is exactly `host-ok` and exit status 0 for an admin key.
+
+Host 127.0.0.1
+  Port 22
+
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  IdentitiesOnly yes
+  LogLevel ERROR

@@ -15,7 +15,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::paths::{self};
@@ -153,9 +153,10 @@ pub fn resolve_authorized_keys_path(configured: Option<&Path>) -> Result<PathBuf
 
 /// Validate file-level safety of the authorized-keys file: it must exist, be a
 /// regular file the daemon user owns, be group/world unwritable, fit the size
-/// limit, and be non-empty. Line-level parsing arrives in Milestone 2.
+/// limit, and be non-empty. The descriptor is opened without following the
+/// final path component.
 pub fn validate_authorized_keys_file(path: &Path) -> Result<(), Error> {
-    let metadata = fs::metadata(path).map_err(|err| match err.kind() {
+    let metadata = fs::symlink_metadata(path).map_err(|err| match err.kind() {
         io::ErrorKind::NotFound => Error::NotFound {
             path: path.to_path_buf(),
         },
@@ -169,6 +170,12 @@ pub fn validate_authorized_keys_file(path: &Path) -> Result<(), Error> {
         return Err(Error::Invalid {
             path: path.to_path_buf(),
             reason: "not a regular file".into(),
+        });
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(Error::Invalid {
+            path: path.to_path_buf(),
+            reason: "file must not be a symlink".into(),
         });
     }
     if metadata.len() == 0 {
@@ -195,7 +202,86 @@ pub fn validate_authorized_keys_file(path: &Path) -> Result<(), Error> {
             reason: "group or world writable".into(),
         });
     }
+    validate_authorized_keys_parents(path)?;
     Ok(())
+}
+
+/// Validate the containing directory chain before opening the key file. The
+/// immediate parent must belong to the daemon account and must not be a
+/// symlink; higher ancestors may be system-owned (macOS commonly exposes
+/// `/var` this way), but none may be writable by group/other.
+fn validate_authorized_keys_parents(path: &Path) -> Result<(), Error> {
+    let mut current = path.parent();
+    let mut immediate = true;
+    while let Some(directory) = current {
+        let link_metadata = fs::symlink_metadata(directory).map_err(|err| Error::Io {
+            path: directory.to_path_buf(),
+            message: "cannot stat authorized_keys parent".into(),
+            source: err,
+        })?;
+        if immediate && link_metadata.file_type().is_symlink() {
+            return Err(Error::Invalid {
+                path: directory.to_path_buf(),
+                reason: "authorized_keys parent must not be a symlink".into(),
+            });
+        }
+        let metadata = fs::metadata(directory).map_err(|err| Error::Io {
+            path: directory.to_path_buf(),
+            message: "cannot stat authorized_keys parent".into(),
+            source: err,
+        })?;
+        if !metadata.is_dir() {
+            return Err(Error::Invalid {
+                path: directory.to_path_buf(),
+                reason: "authorized_keys parent is not a directory".into(),
+            });
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(Error::Invalid {
+                path: directory.to_path_buf(),
+                reason: "authorized_keys parent is group or world writable".into(),
+            });
+        }
+        if immediate && metadata.uid() != paths::euid() {
+            return Err(Error::Invalid {
+                path: directory.to_path_buf(),
+                reason: "authorized_keys parent is not owned by the daemon user".into(),
+            });
+        }
+        immediate = false;
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        current = Some(parent);
+    }
+    Ok(())
+}
+
+/// Read through an `O_NOFOLLOW` descriptor after the metadata checks. This
+/// closes the check/use race for the final authorized_keys path.
+fn read_authorized_keys(path: &Path) -> Result<Vec<u8>, Error> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| Error::Io {
+            path: path.to_path_buf(),
+            message: "cannot open authorized_keys".into(),
+            source: err,
+        })?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.take(MAX_AUTHORIZED_KEYS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| Error::Io {
+            path: path.to_path_buf(),
+            message: "cannot read authorized_keys".into(),
+            source: err,
+        })?;
+    Ok(bytes)
 }
 
 /// Authorized-keys file errors.
@@ -246,11 +332,272 @@ impl std::error::Error for Error {
     }
 }
 
+/// One accepted authorized-keys entry.
+#[derive(Debug, Clone)]
+pub struct AuthorizedKey {
+    pub fingerprint: KeyFingerprint,
+}
+
+/// The authenticated identity of an SSH connection, fixed for its lifetime.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub fingerprint: KeyFingerprint,
+    pub role: Role,
+}
+
+/// Role granted to a key at authentication time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Normal,
+    Admin,
+}
+
+/// The validated authentication snapshot: exactly the authorized Ed25519 keys
+/// plus the admin fingerprint subset. Connections capture their own clone, so
+/// a later reload can only affect new connections.
+#[derive(Debug, Clone, Default)]
+pub struct AuthSnapshot {
+    keys: Vec<AuthorizedKey>,
+    admin: std::collections::BTreeSet<KeyFingerprint>,
+}
+
+impl AuthSnapshot {
+    /// Parse an authorized-keys file with the strict bare subset:
+    /// `ssh-ed25519 <base64> [comment]`. Options, certificates, non-Ed25519
+    /// keys, malformed lines, and duplicate keys invalidate the whole file.
+    pub fn parse_authorized_keys(bytes: &[u8]) -> Result<Vec<AuthorizedKey>, Error> {
+        if bytes.len() as u64 > MAX_AUTHORIZED_KEYS_BYTES {
+            return Err(Error::Invalid {
+                path: PathBuf::from("<authorized_keys>"),
+                reason: "file exceeds the 1 MiB limit".into(),
+            });
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| Error::Invalid {
+            path: PathBuf::from("<authorized_keys>"),
+            reason: "file is not valid UTF-8".into(),
+        })?;
+        let mut keys: Vec<AuthorizedKey> = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            if line.len() > MAX_AUTHORIZED_KEYS_LINE_BYTES {
+                return Err(Error::Invalid {
+                    path: PathBuf::from("<authorized_keys>"),
+                    reason: format!("line {number} exceeds the 8 KiB limit"),
+                });
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut fields = trimmed.split_ascii_whitespace();
+            let algorithm = fields.next().unwrap_or_default();
+            let blob = fields.next().unwrap_or_default();
+            if algorithm != "ssh-ed25519" || blob.is_empty() {
+                // Options, certificates, and other algorithms all fail this
+                // first-field check, so the bare form is enforced by
+                // construction; a trailing comment is still allowed.
+                return Err(Error::Invalid {
+                    path: PathBuf::from("<authorized_keys>"),
+                    reason: format!("line {number} is not bare `ssh-ed25519 <base64> [comment]`"),
+                });
+            }
+            let key =
+                russh::keys::PublicKey::from_openssh(trimmed).map_err(|_| Error::Invalid {
+                    path: PathBuf::from("<authorized_keys>"),
+                    reason: format!("line {number} contains an invalid public key"),
+                })?;
+            if key.algorithm() != russh::keys::Algorithm::Ed25519 {
+                return Err(Error::Invalid {
+                    path: PathBuf::from("<authorized_keys>"),
+                    reason: format!("line {number} is not an Ed25519 key"),
+                });
+            }
+            let fingerprint = KeyFingerprint::from_ssh_key(&key);
+            if keys
+                .iter()
+                .any(|existing| existing.fingerprint == fingerprint)
+            {
+                return Err(Error::Invalid {
+                    path: PathBuf::from("<authorized_keys>"),
+                    reason: format!("line {number} duplicates an earlier key"),
+                });
+            }
+            drop(key);
+            keys.push(AuthorizedKey { fingerprint });
+        }
+        if keys.is_empty() {
+            return Err(Error::Invalid {
+                path: PathBuf::from("<authorized_keys>"),
+                reason: "no valid Ed25519 key found".into(),
+            });
+        }
+        Ok(keys)
+    }
+
+    /// Load and validate the full authentication snapshot: authorized keys
+    /// plus the admin subset from configuration.
+    pub fn load(
+        authorized_keys_path: &Path,
+        admin_keys: &[KeyFingerprint],
+    ) -> Result<AuthSnapshot, Error> {
+        validate_authorized_keys_file(authorized_keys_path)?;
+        let bytes = read_authorized_keys(authorized_keys_path).map_err(|err| match err {
+            Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                Error::NotFound {
+                    path: authorized_keys_path.to_path_buf(),
+                }
+            }
+            other => other,
+        })?;
+        let keys = Self::parse_authorized_keys(&bytes).map_err(|mut err| {
+            if let Error::Invalid { path, .. } = &mut err {
+                *path = authorized_keys_path.to_path_buf();
+            }
+            err
+        })?;
+        let known: std::collections::BTreeSet<&KeyFingerprint> =
+            keys.iter().map(|entry| &entry.fingerprint).collect();
+        let mut admin = std::collections::BTreeSet::new();
+        for fingerprint in admin_keys {
+            if !known.contains(fingerprint) {
+                return Err(Error::Invalid {
+                    path: authorized_keys_path.to_path_buf(),
+                    reason: format!("admin key {fingerprint} is not present in authorized_keys"),
+                });
+            }
+            admin.insert(fingerprint.clone());
+        }
+        Ok(AuthSnapshot { keys, admin })
+    }
+
+    /// Look up an authenticated key and derive its role.
+    pub fn authenticate(&self, key: &russh::keys::PublicKey) -> Option<Principal> {
+        if key.algorithm() != russh::keys::Algorithm::Ed25519 {
+            return None;
+        }
+        let candidate = KeyFingerprint::from_ssh_key(key);
+        self.keys
+            .iter()
+            .any(|entry| entry.fingerprint == candidate)
+            .then(|| {
+                let role = if self.admin.contains(&candidate) {
+                    Role::Admin
+                } else {
+                    Role::Normal
+                };
+                Principal {
+                    fingerprint: candidate,
+                    role,
+                }
+            })
+    }
+
+    /// Accepted fingerprints, in file order (test and audit surface).
+    #[allow(dead_code)]
+    pub fn keys(&self) -> &[AuthorizedKey] {
+        &self.keys
+    }
+
+    pub fn admin_count(&self) -> usize {
+        self.admin.len()
+    }
+}
+
+/// Maximum size of a single authorized_keys line.
+pub const MAX_AUTHORIZED_KEYS_LINE_BYTES: usize = 8 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
     use tempfile::TempDir;
+
+    /// Generate a fresh Ed25519 keypair and return the authorized-keys line
+    /// plus its fingerprint.
+    fn generated_key() -> (String, KeyFingerprint) {
+        let key =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .expect("generate");
+        let public = key.public_key().clone();
+        let line = public.to_openssh().expect("encode");
+        (line, KeyFingerprint::from_ssh_key(&public))
+    }
+
+    #[test]
+    fn parses_bare_authorized_keys() {
+        let (line_a, fp_a) = generated_key();
+        let (line_b, fp_b) = generated_key();
+        let text = format!("\n# comment\n{line_a}\n\n{line_b} extra comment here\n");
+        let parsed = AuthSnapshot::parse_authorized_keys(text.as_bytes()).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].fingerprint, fp_a);
+        assert_eq!(parsed[1].fingerprint, fp_b);
+    }
+
+    #[test]
+    fn rejects_options_certificates_and_other_algorithms() {
+        let (line, _) = generated_key();
+        let blob = line.split_whitespace().nth(1).unwrap().to_string();
+        for bad in [
+            format!("restrict {line}"),
+            format!("command=\"sh\",pty {line}"),
+            format!("ssh-ed25519-cert-v01@openssh.com {blob}"),
+            format!("ssh-rsa {blob}"),
+            format!("ecdsa-sha2-nistp256 {blob}"),
+            "ssh-ed25519 not-base64!!".to_string(),
+            "ssh-ed25519".to_string(),
+        ] {
+            let err = AuthSnapshot::parse_authorized_keys(bad.as_bytes()).expect_err(&bad);
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_duplicates_empty_and_oversized_lines() {
+        let (line, _) = generated_key();
+        assert!(AuthSnapshot::parse_authorized_keys(b"").is_err());
+        let duplicate = format!("{line}\n{line}\n");
+        assert!(AuthSnapshot::parse_authorized_keys(duplicate.as_bytes()).is_err());
+        let long_line = format!("ssh-ed25519 {} x\n", "A".repeat(9 * 1024));
+        assert!(AuthSnapshot::parse_authorized_keys(long_line.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn snapshot_load_validates_admin_subset() {
+        let home = TempDir::new().expect("tempdir");
+        let path = home.path().join("authorized_keys");
+        let (line_a, fp_a) = generated_key();
+        let (line_b, _fp_b) = generated_key();
+        let (key_a, key_b) = {
+            let parse = |line: &str| russh::keys::PublicKey::from_openssh(line).expect("parse");
+            (parse(&line_a), parse(&line_b))
+        };
+        std::fs::write(&path, format!("{line_a}\n{line_b}\n")).expect("write");
+
+        let snapshot = AuthSnapshot::load(&path, std::slice::from_ref(&fp_a)).expect("load");
+        assert_eq!(snapshot.keys().len(), 2);
+        assert_eq!(snapshot.admin_count(), 1);
+        assert_eq!(snapshot.authenticate(&key_a).unwrap().role, Role::Admin);
+        assert_eq!(snapshot.authenticate(&key_b).unwrap().role, Role::Normal);
+
+        // An admin fingerprint absent from authorized_keys is a config error.
+        let (line_c, fp_c) = generated_key();
+        std::fs::write(home.path().join("c"), &line_c).expect("write c");
+        assert!(AuthSnapshot::load(&path, std::slice::from_ref(&fp_c)).is_err());
+    }
+
+    #[test]
+    fn authenticate_rejects_unknown_keys() {
+        let home = TempDir::new().expect("tempdir");
+        let path = home.path().join("authorized_keys");
+        let (line_a, fp_a) = generated_key();
+        std::fs::write(&path, &line_a).expect("write");
+        let snapshot = AuthSnapshot::load(&path, &[]).expect("load");
+        let (foreign_line, _) = generated_key();
+        let foreign_key = russh::keys::PublicKey::from_openssh(&foreign_line).expect("parse");
+        assert!(snapshot.authenticate(&foreign_key).is_none());
+        assert_eq!(snapshot.keys()[0].fingerprint, fp_a);
+    }
 
     /// Encode bytes as canonical unpadded standard base64 (test-local, so the
     /// parser is checked against an independent implementation).
