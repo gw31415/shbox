@@ -65,9 +65,26 @@ enum RuntimeMarker {
 
 #[derive(Debug)]
 struct RuntimeEntry {
+    sandbox_id: SandboxId,
     marker: RuntimeMarker,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     process: Option<Arc<dyn platform::RunningProcess>>,
+}
+
+/// Opaque token for one channel/process lease.  A sandbox may have several
+/// live leases at once; cleanup must never remove a newer lease by ID alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeLease {
+    token: u64,
+    sandbox_id: SandboxId,
+}
+
+/// A launched process together with the manager lease that owns its runtime
+/// entry.  The SSH bridge releases exactly this lease when it finishes.
+#[derive(Debug)]
+pub(crate) struct ManagedProcess {
+    pub(crate) process: platform::LaunchedProcess,
+    pub(crate) lease: RuntimeLease,
 }
 
 #[derive(Debug, Default)]
@@ -77,7 +94,8 @@ struct Ledger {
     unknown_entries: usize,
     owner_counts: BTreeMap<KeyFingerprint, usize>,
     reserved_sandboxes: usize,
-    runtime: HashMap<SandboxId, RuntimeEntry>,
+    runtime: HashMap<u64, RuntimeEntry>,
+    next_runtime_token: u64,
 }
 
 /// Persistent sandbox lifecycle service.  The type is intentionally
@@ -86,6 +104,7 @@ struct Ledger {
 pub(crate) struct SandboxManager {
     storage: Storage,
     caps: Caps,
+    launcher: Arc<dyn ProcessLauncher>,
     ledger: Mutex<Ledger>,
     lifecycle_locks: Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
 }
@@ -95,7 +114,15 @@ impl SandboxManager {
     /// deletion failure leaves its valid Deleting record in place and does not
     /// prevent unrelated IDs from being served.
     pub(crate) fn open(paths: &Paths, caps: Caps) -> Result<SandboxManager, Error> {
-        Self::open_with_faults(paths, caps, None)
+        Self::open_with_launcher(paths, caps, Arc::new(platform::UnavailableLauncher))
+    }
+
+    pub(crate) fn open_with_launcher(
+        paths: &Paths,
+        caps: Caps,
+        launcher: Arc<dyn ProcessLauncher>,
+    ) -> Result<SandboxManager, Error> {
+        Self::open_with_faults_and_launcher(paths, caps, None, launcher)
     }
 
     pub(crate) fn open_with_faults(
@@ -103,11 +130,26 @@ impl SandboxManager {
         caps: Caps,
         faults: Option<Arc<storage::FaultInjector>>,
     ) -> Result<SandboxManager, Error> {
+        Self::open_with_faults_and_launcher(
+            paths,
+            caps,
+            faults,
+            Arc::new(platform::UnavailableLauncher),
+        )
+    }
+
+    pub(crate) fn open_with_faults_and_launcher(
+        paths: &Paths,
+        caps: Caps,
+        faults: Option<Arc<storage::FaultInjector>>,
+        launcher: Arc<dyn ProcessLauncher>,
+    ) -> Result<SandboxManager, Error> {
         let storage =
             Storage::with_faults(paths.sandboxes_root(), faults).map_err(Error::Storage)?;
         let manager = SandboxManager {
             storage,
             caps,
+            launcher,
             ledger: Mutex::new(Ledger::default()),
             lifecycle_locks: Mutex::new(HashMap::new()),
         };
@@ -251,37 +293,56 @@ impl SandboxManager {
         self.ledger.lock().expect("sandbox ledger").records.len()
     }
 
+    #[cfg(test)]
+    fn runtime_count(&self) -> usize {
+        self.ledger.lock().expect("sandbox ledger").runtime.len()
+    }
+
     /// Register a launch marker and invoke the private process seam. A delete
     /// racing with the adapter sets the cancellation flag; a process returned
     /// after that point is terminated before it can escape the registry.
-    pub(crate) fn launch_with(
+    /// Claim or reuse an ID, reserve one process lease, and launch through the
+    /// manager-owned adapter.  SSH never handles a workspace path or a
+    /// runtime marker directly.
+    pub(crate) fn launch(
+        &self,
+        principal: &Principal,
+        id: &SandboxId,
+        operation: platform::LaunchOperation,
+        pty: Option<platform::PtySpec>,
+    ) -> Result<ManagedProcess, Error> {
+        let handle = self.claim(principal, id)?;
+        self.launch_handle(&handle, operation, pty)
+    }
+
+    fn launch_handle(
         &self,
         handle: &SandboxHandle,
-        launcher: &dyn ProcessLauncher,
-    ) -> Result<Arc<dyn platform::RunningProcess>, Error> {
-        let cancelled = self.begin_launch(handle)?;
+        operation: platform::LaunchOperation,
+        pty: Option<platform::PtySpec>,
+    ) -> Result<ManagedProcess, Error> {
+        let lease = self.begin_launch(handle)?;
         let request = LaunchRequest {
             sandbox_id: handle.id.clone(),
             workspace: handle.workspace.clone(),
+            operation,
+            pty,
         };
-        let process = match launcher.launch(request) {
+        let process = match self.launcher.launch(request) {
             Ok(process) => process,
             Err(error) => {
-                self.clear_runtime_if(handle.id(), &cancelled);
+                self.clear_runtime_if(&lease);
                 return Err(Error::Launch(error));
             }
         };
-        if !self.finish_launch(handle.id(), &cancelled, Arc::clone(&process)) {
-            process.terminate();
+        if !self.finish_launch(&lease, Arc::clone(&process.control)) {
+            process.control.terminate();
             return Err(Error::Unavailable);
         }
-        Ok(process)
+        Ok(ManagedProcess { process, lease })
     }
 
-    fn begin_launch(
-        &self,
-        handle: &SandboxHandle,
-    ) -> Result<Arc<std::sync::atomic::AtomicBool>, Error> {
+    fn begin_launch(&self, handle: &SandboxHandle) -> Result<RuntimeLease, Error> {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
         let Some(metadata) = ledger.records.get(handle.id()) else {
             return Err(Error::Unavailable);
@@ -289,36 +350,37 @@ impl SandboxManager {
         if metadata.state() != State::Active || metadata.owner() != handle.owner() {
             return Err(Error::Unavailable);
         }
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if ledger
-            .runtime
-            .insert(
-                handle.id().clone(),
-                RuntimeEntry {
-                    marker: RuntimeMarker::Launching,
-                    cancelled: Arc::clone(&cancelled),
-                    process: None,
-                },
-            )
-            .is_some()
-        {
-            return Err(Error::AlreadyRunning);
+        if ledger.runtime.len() >= self.caps.max_sandbox_processes as usize {
+            return Err(Error::Limit("max_sandbox_processes"));
         }
-        Ok(cancelled)
+        let token = next_runtime_token(&mut ledger);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ledger.runtime.insert(
+            token,
+            RuntimeEntry {
+                sandbox_id: handle.id().clone(),
+                marker: RuntimeMarker::Launching,
+                cancelled: Arc::clone(&cancelled),
+                process: None,
+            },
+        );
+        Ok(RuntimeLease {
+            token,
+            sandbox_id: handle.id().clone(),
+        })
     }
 
     fn finish_launch(
         &self,
-        id: &SandboxId,
-        cancelled: &Arc<std::sync::atomic::AtomicBool>,
+        lease: &RuntimeLease,
         process: Arc<dyn platform::RunningProcess>,
     ) -> bool {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
-        match ledger.runtime.get_mut(id) {
+        match ledger.runtime.get_mut(&lease.token) {
             Some(entry)
                 if entry.marker == RuntimeMarker::Launching
-                    && Arc::ptr_eq(&entry.cancelled, cancelled)
-                    && !cancelled.load(std::sync::atomic::Ordering::Acquire) =>
+                    && entry.sandbox_id == lease.sandbox_id
+                    && !entry.cancelled.load(std::sync::atomic::Ordering::Acquire) =>
             {
                 entry.marker = RuntimeMarker::Running;
                 entry.process = Some(process);
@@ -328,33 +390,43 @@ impl SandboxManager {
         }
     }
 
-    pub(crate) fn clear_runtime(&self, id: &SandboxId) {
-        self.ledger
-            .lock()
-            .expect("sandbox ledger")
+    pub(crate) fn clear_runtime(&self, lease: &RuntimeLease) {
+        let mut ledger = self.ledger.lock().expect("sandbox ledger");
+        if ledger
             .runtime
-            .remove(id);
+            .get(&lease.token)
+            .is_some_and(|entry| entry.sandbox_id == lease.sandbox_id)
+        {
+            ledger.runtime.remove(&lease.token);
+        }
     }
 
-    fn clear_runtime_if(&self, id: &SandboxId, cancelled: &Arc<std::sync::atomic::AtomicBool>) {
+    fn clear_runtime_if(&self, lease: &RuntimeLease) {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
         let remove = ledger
             .runtime
-            .get(id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.cancelled, cancelled));
+            .get(&lease.token)
+            .is_some_and(|entry| entry.sandbox_id == lease.sandbox_id);
         if remove {
-            ledger.runtime.remove(id);
+            ledger.runtime.remove(&lease.token);
         }
     }
 
     fn cancel_runtime(&self, id: &SandboxId) {
-        let entry = self
-            .ledger
-            .lock()
-            .expect("sandbox ledger")
-            .runtime
-            .remove(id);
-        if let Some(entry) = entry {
+        let entries = {
+            let mut ledger = self.ledger.lock().expect("sandbox ledger");
+            let tokens: Vec<u64> = ledger
+                .runtime
+                .iter()
+                .filter(|(_, entry)| entry.sandbox_id == *id)
+                .map(|(token, _)| *token)
+                .collect();
+            tokens
+                .into_iter()
+                .filter_map(|token| ledger.runtime.remove(&token))
+                .collect::<Vec<_>>()
+        };
+        for entry in entries {
             entry
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -543,6 +615,17 @@ impl SandboxManager {
     }
 }
 
+fn next_runtime_token(ledger: &mut Ledger) -> u64 {
+    loop {
+        ledger.next_runtime_token = ledger.next_runtime_token.wrapping_add(1);
+        if ledger.next_runtime_token != 0
+            && !ledger.runtime.contains_key(&ledger.next_runtime_token)
+        {
+            return ledger.next_runtime_token;
+        }
+    }
+}
+
 fn authorized(principal: &Principal, owner: &KeyFingerprint) -> bool {
     principal.role == Role::Admin || principal.fingerprint == *owner
 }
@@ -569,7 +652,16 @@ fn remove_record_from_ledger(ledger: &mut Ledger, id: &SandboxId) {
     if let Some(metadata) = ledger.records.remove(id) {
         decrement_owner(&mut ledger.owner_counts, metadata.owner());
     }
-    if let Some(entry) = ledger.runtime.remove(id) {
+    let tokens: Vec<u64> = ledger
+        .runtime
+        .iter()
+        .filter(|(_, entry)| entry.sandbox_id == *id)
+        .map(|(token, _)| *token)
+        .collect();
+    for token in tokens {
+        let Some(entry) = ledger.runtime.remove(&token) else {
+            continue;
+        };
         entry
             .cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -587,7 +679,6 @@ pub(crate) enum Error {
     Cleanup { source: storage::Error },
     Launch(platform::LaunchError),
     Limit(&'static str),
-    AlreadyRunning,
     Unavailable,
 }
 
@@ -598,7 +689,6 @@ impl fmt::Display for Error {
             Error::Cleanup { source } => write!(f, "sandbox cleanup failed: {source}"),
             Error::Launch(source) => write!(f, "sandbox process launch failed: {source}"),
             Error::Limit(name) => write!(f, "sandbox capacity limit reached: {name}"),
-            Error::AlreadyRunning => f.write_str("sandbox channel is already running"),
             Error::Unavailable => f.write_str("sandbox is unavailable"),
         }
     }
@@ -642,6 +732,15 @@ mod tests {
         let paths = paths_for(&root);
         paths.ensure().expect("paths");
         let manager = SandboxManager::open(&paths, caps).expect("manager");
+        (root, manager)
+    }
+
+    fn manager_with_fake(caps: Caps, launcher: &FakeLauncher) -> (TempDir, SandboxManager) {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let manager = SandboxManager::open_with_launcher(&paths, caps, Arc::new(launcher.clone()))
+            .expect("manager");
         (root, manager)
     }
 
@@ -1006,14 +1105,13 @@ mod tests {
 
     #[test]
     fn launch_failure_keeps_the_claim_and_clears_the_runtime_marker() {
-        let (_root, manager) = manager(Caps::default());
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
         let owner = principal('A', Role::Normal);
         let id = SandboxId::parse("dev").expect("id");
-        let handle = manager.claim(&owner, &id).expect("claim");
-        let launcher = FakeLauncher::default();
         launcher.fail_next();
         assert!(matches!(
-            manager.launch_with(&handle, &launcher),
+            manager.launch(&owner, &id, platform::LaunchOperation::Shell, None),
             Err(Error::Launch(_))
         ));
         assert_eq!(launcher.launch_count(), 1);
@@ -1021,20 +1119,110 @@ mod tests {
     }
 
     #[test]
+    fn launch_passes_validated_request_details_to_the_adapter() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let managed = manager
+            .launch_handle(
+                &handle,
+                platform::LaunchOperation::Exec(b"printf fake".to_vec()),
+                Some(platform::PtySpec {
+                    term: "xterm-256color".into(),
+                    rows: 40,
+                    cols: 120,
+                }),
+            )
+            .expect("launch");
+        assert_eq!(
+            launcher.last_request(),
+            Some(platform::LaunchRequest {
+                sandbox_id: id,
+                workspace: handle.workspace().clone(),
+                operation: platform::LaunchOperation::Exec(b"printf fake".to_vec()),
+                pty: Some(platform::PtySpec {
+                    term: "xterm-256color".into(),
+                    rows: 40,
+                    cols: 120,
+                }),
+            })
+        );
+        assert_eq!(manager.runtime_count(), 1);
+        manager.clear_runtime(&managed.lease);
+        managed.process.control.terminate();
+        assert_eq!(manager.runtime_count(), 0);
+    }
+
+    #[test]
+    fn one_sandbox_allows_parallel_leases_and_delete_terminates_each_remaining_lease() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let first = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        let first_process = launcher.last_process().expect("first process");
+        let second = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("second launch");
+        let second_process = launcher.last_process().expect("second process");
+        assert_eq!(manager.runtime_count(), 2);
+
+        manager.clear_runtime(&first.lease);
+        assert_eq!(manager.runtime_count(), 1);
+        assert!(!first_process.terminated());
+        assert_eq!(
+            manager.delete(&owner, &id).expect("delete"),
+            DeleteResult::Deleted
+        );
+        assert!(second_process.terminated());
+        assert!(!first_process.terminated());
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn sandbox_process_cap_is_atomic_across_parallel_launches() {
+        let launcher = FakeLauncher::default();
+        let caps = Caps {
+            max_sandbox_processes: 1,
+            ..Caps::default()
+        };
+        let (_root, manager) = manager_with_fake(caps, &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let first = manager
+            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        assert!(matches!(
+            manager.launch_handle(&handle, platform::LaunchOperation::Shell, None),
+            Err(Error::Limit("max_sandbox_processes"))
+        ));
+        manager.clear_runtime(&first.lease);
+        first.process.control.terminate();
+        assert_eq!(manager.runtime_count(), 0);
+    }
+
+    #[test]
     fn delete_wins_against_a_barriered_launch_and_terminates_late_process() {
-        let (_root, manager) = manager(Caps::default());
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
         let manager = Arc::new(manager);
         let owner = principal('A', Role::Normal);
         let id = SandboxId::parse("dev").expect("id");
         let handle = manager.claim(&owner, &id).expect("claim");
-        let launcher = FakeLauncher::default();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         launcher.set_barrier(Arc::clone(&barrier));
         let launch_manager = Arc::clone(&manager);
         let launch_handle = handle.clone();
-        let launch_launcher = launcher.clone();
-        let join =
-            thread::spawn(move || launch_manager.launch_with(&launch_handle, &launch_launcher));
+        let join = thread::spawn(move || {
+            launch_manager.launch_handle(&launch_handle, platform::LaunchOperation::Shell, None)
+        });
         for _ in 0..100 {
             if launcher.launch_count() == 1 {
                 break;

@@ -1639,6 +1639,7 @@ dependencies = [
  "rand 0.10.2",
  "russh",
  "serde",
+ "ssh-encoding",
  "ssh-key",
  "tempfile",
  "tokio",

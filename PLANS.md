@@ -32,9 +32,9 @@ selector、installer、永続 terminal session はありません。
 
 ## 現在の状態
 
-- Milestone 1 から Milestone 3 までは完了し、検証証跡ごと git history に archive 済みである。
+- Milestone 1 から Milestone 4 までは完了し、各検証証跡ごと git history に archive 済みである。
   stable 1.97 と MSRV 1.91 の両方で fmt / clippy (`-D warnings`) /
-  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 9 test を通過する。
+  `cargo test --locked --all-targets` が通り、実 OpenSSH harness は 10 test を通過する。
 - Cargo.lock に重要 dependency が固定されて記録されている: arapuca 0.2.7 git rev
   `c94802c4d8b6b880334c0d643b16b7326ec7f039`、russh 0.63.1 (default-features 無効 + `ring`
   backend)、usage-rs 6.5.0、xdg 3.0.0。russh 経由の鍵生成は ssh-key 0.7.0-rc.11 と
@@ -46,12 +46,14 @@ selector、installer、永続 terminal session はありません。
   all-or-nothing bind を持つ。`ssh/` は session channel、admin-only `_` host shell/exec/PTY、
   generic unavailable な未接続 request と request rejection を実装済み。`sandbox/` は
   v1 metadata、fd-relative no-follow storage、owner/count admission、Active/Deleting
-  lifecycle、filtered list/delete、startup reconciliation、runtime launcher seam を持ち、
-  `main.rs` は bind 前に registry を scan/reconcile する。
+  lifecycle、filtered list/delete、startup reconciliation、manager-owned runtime launcher seam、
+  per-launch lease を持つ。`ssh/` は manager-backed list/delete と bounded sandbox stream
+  bridge を持ち、`main.rs` は bind 前に registry を scan/reconcile する。
   `config.rs`、`paths.rs`、`lockfile.rs`、`hostkey.rs`、`account.rs`、`logging.rs`、
   `sandbox/id.rs`、`platform/mod.rs` は引き続き各 domain の基盤である。
-- M3 の後続依存: sandbox request は M4 の SSH wiring まで unavailable のまま、terminal
-  modes は M6、SIGHUP reload と `max_host_processes` enforcement は M7 の作業である。
+- M4 の残存依存: production Arapuca non-PTY adapter は M5、terminal modes と実 PTY は M6、
+  SIGHUP reload と `max_host_processes` enforcement は M7 の作業である。現在の production
+  launcher は adapter 未接続時に fail closed し、host process へ fallback しない。
 - 実装時に判明した依存の挙動: `xdg` 3.0.0 の `BaseDirectories::with_prefix` は
   `get_*_home()` の戻り値に既に prefix を付けるため、`Paths::from_roots` は
   shbox-scoped root を受ける。usage-rs の `Cli` derive は `parse()` 自体が process
@@ -107,7 +109,7 @@ SandboxId、key fingerprint、selector、principal、metadata state、connection
 
 ## 進捗
 
-- [ ] Milestone 4 — deterministic launcher による SSH request semantics
+- [x] Milestone 4 — deterministic launcher による SSH request semantics
 - [ ] Milestone 5 — production Arapuca non-PTY process Adapter
 - [ ] Milestone 6 — PTY、terminal modes、resize、signals、bounded bridging
 - [ ] Milestone 7 — recovery、reload、shutdown、limits、hostile concurrency
@@ -117,56 +119,6 @@ milestone は、proof を実行し、ユーザーから観測可能な結果が�
 してください。作業が uncommitted の間は、実際の command/result を記録します。commit が
 求められた場合は、repository の commit skill で検証済みの完了コンテキストを archive してから、
 未完了作業と現在の制約だけが残るようにこの plan を compact します。
-
-## Milestone 4 — deterministic launcher による SSH request semantics
-
-### 目標
-
-OS process の複雑さを導入する前に、fake launcher を使って、すべての user-visible SSH
-shell/exec/list/delete semantics、stream、exit notification、role filtering、capacity limit、
-channel isolation を動作させます。
-
-### 編集内容
-
-1. session handler を小さな Interface だけを通じて SandboxManager に接続します。
-2. channel ごとに terminal operation を一つだけ実装します。shell、exec、subsystem のいずれか
-   が成功した channel では、後続の terminal operation を fail させます。先行する PTY request
-   は channel state になります。
-3. non-PTY の stdin/stdout/stderr を実装し、stderr は SSH extended data type 1 にします。
-   PTY は一つの terminal stream とします。
-4. client EOF 後は既受信入力を drain し、新しい入力を process へ送りません。fake launcher
-   では、non-PTY の stdin pipe close と、PTY の write 側だけを閉じて child EOF を保証しない
-   state を別々にモデル化します。いずれも output を drain し、指定された順序で EOF、
-   exit-status または exit-signal、close を送信します。PTY に `VEOF` byte を合成しません。
-5. exact な list と delete subsystem behavior を実装します。list は admin の全 sandbox
-   list に _ を受け付けます。delete は通常の SandboxId を必要とします。両方とも PTY を
-   reject します。
-6. request size、channel/process/count、per-owner、global limit を atomic に enforce します。
-   bridge queue をすべて bounded にし、backpressure を伝播させます。
-7. internal failure を stable な generic client error に map し、command text や terminal I/O
-   を log しないようにします。
-
-### 成果
-
-- 通常の list は所有する Active ID だけを返し、admin list はすべての Active ID を ASCII 順で
- 返します。
-- absent または inaccessible な valid ID を delete すると、output なし・exit 0 になります。
-  実際の deletion failure は non-zero です。
-- 一つの channel を閉じるとその process だけを kill します。delete は対象 process/channel
-  を閉じますが、無関係な sandbox や multiplexed SSH connection 全体には影響しません。
-
-### 検証
-
-```console
-cargo test --locked --test ssh_protocol -- --test-threads=1
-cargo test --locked --test ssh_concurrency -- --test-threads=1
-cargo test --locked --test ssh_backpressure -- --test-threads=1
-```
-
-期待結果: byte-for-byte の list output、分離された non-PTY stderr、PTY の merged output、
-non-PTY/PTY それぞれの EOF semantics、終了 ordering、exit status/signal、generic failure、
-multi-channel isolation が
-[docs/ssh-protocol.md](docs/ssh-protocol.md) と一致すること。
 
 ## Milestone 5 — production Arapuca non-PTY process Adapter
 

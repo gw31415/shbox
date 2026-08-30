@@ -1,5 +1,6 @@
 //! OpenSSH integration harness for the public-key server and the admin host
-//! route (PLANS.md Milestone 2).
+//! route and the first SandboxManager management operations (PLANS.md
+//! Milestones 2-4).
 //!
 //! Every test starts a real daemon binary with a temporary XDG tree and its
 //! own listener, then drives it with the real `ssh` client. Tests share
@@ -379,9 +380,8 @@ fn unregistered_key_and_non_publickey_methods_are_refused() {
     assert!(stderr.contains("Permission denied"), "{stderr}");
 }
 
-/// A normal key with a valid sandbox selector reaches the intentional
-/// unavailable placeholder (Milestones 3-4), which is a generic non-zero
-/// completion rather than a crash or an authorization leak.
+/// Sandbox process launch is still unavailable until the production adapter,
+/// but claiming an ID is durable so management requests can observe it.
 #[test]
 fn sandbox_requests_are_currently_unavailable() {
     let daemon = TestDaemon::start(&["admin"]);
@@ -389,6 +389,43 @@ fn sandbox_requests_are_currently_unavailable() {
     assert!(!result.ok(), "sandbox route is not implemented yet");
     assert_eq!(result.status, 111, "generic unavailable status");
     assert!(!result.stdout.contains("nope"));
+}
+
+/// The real OpenSSH subsystem reaches the manager for owner-filtered and
+/// admin-wide list, then performs an idempotent delete.
+#[test]
+fn sandbox_list_and_delete_are_wired_to_the_manager() {
+    let daemon = TestDaemon::start(&["admin"]);
+
+    // The terminal adapter is intentionally not ready in this milestone, but
+    // the request still exercises lazy first-owner claim.
+    let claim = daemon.ssh(&daemon.normal_key, "dev", "printf ignored", &["-T"]);
+    assert_eq!(claim.status, 111, "launch failure is generic");
+
+    // The list username is only connection context; owner filtering uses the
+    // authenticated fingerprint, so it need not itself be a SandboxId.
+    let owner_list = daemon.ssh(&daemon.normal_key, "list-user", "list", &["-T", "-s"]);
+    assert!(owner_list.ok(), "owner list failed: {owner_list:?}");
+    assert_eq!(owner_list.stdout, "dev\n");
+    assert!(owner_list.stderr.is_empty(), "list stderr: {owner_list:?}");
+
+    let admin_list = daemon.ssh(&daemon.admin_key, "_", "list", &["-T", "-s"]);
+    assert!(admin_list.ok(), "admin list failed: {admin_list:?}");
+    assert_eq!(admin_list.stdout, "dev\n");
+
+    let delete = daemon.ssh(&daemon.normal_key, "dev", "delete", &["-T", "-s"]);
+    assert!(delete.ok(), "delete failed: {delete:?}");
+    assert!(delete.stdout.is_empty(), "delete stdout: {delete:?}");
+    assert!(delete.stderr.is_empty(), "delete stderr: {delete:?}");
+
+    let absent = daemon.ssh(&daemon.normal_key, "dev", "delete", &["-T", "-s"]);
+    assert!(absent.ok(), "absent delete must be a no-op: {absent:?}");
+    assert!(absent.stdout.is_empty());
+    assert!(absent.stderr.is_empty());
+
+    let empty = daemon.ssh(&daemon.admin_key, "_", "list", &["-T", "-s"]);
+    assert!(empty.ok(), "post-delete list failed: {empty:?}");
+    assert!(empty.stdout.is_empty());
 }
 
 /// Client `env` requests are rejected but never kill the connection; an

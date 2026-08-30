@@ -17,7 +17,8 @@ use russh::{ChannelId, Pty};
 use crate::account::Account;
 use crate::auth::{AuthSnapshot, Principal, Role};
 use crate::config::Config;
-use crate::sandbox::SandboxId;
+use crate::platform;
+use crate::sandbox::{SandboxId, SandboxManager};
 
 use channel::{ChannelEvent, ChannelOperation, ChannelRegistry};
 
@@ -28,6 +29,7 @@ pub(crate) struct Shared {
     pub auth: Arc<AuthSnapshot>,
     pub config: Arc<Config>,
     pub account: Arc<Account>,
+    pub sandbox: Arc<SandboxManager>,
 }
 
 /// Per-connection state; the authenticated principal is fixed once set.
@@ -98,24 +100,107 @@ impl ConnHandler {
         }
     }
 
-    /// The sandbox placeholder response until Milestones 3-4 wire sandbox
-    /// operations: the channel completes with a generic non-zero exit.
-    async fn sandbox_unavailable(
+    /// Mark a sandbox terminal channel as consumed, claim its durable
+    /// workspace, and invoke the private process seam off the async runtime's
+    /// hot path. A successful request is acknowledged only after the adapter
+    /// returns a process and its I/O endpoints.
+    async fn start_sandbox_terminal(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
+        id: SandboxId,
+        operation: ChannelOperation,
     ) -> Result<(), crate::server::HandlerError> {
-        let _ = session.extended_data(channel, 1, format!("{}\r\n", UNAVAILABLE_MESSAGE));
-        let _ = session.eof(channel);
-        let _ = session.exit_status_request(channel, UNAVAILABLE_EXIT);
+        let Some(events) = self.conn.registry.start(channel) else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+        let Some(principal) = self.conn.principal() else {
+            let _ = session.channel_failure(channel);
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
+        let launch_operation = match operation {
+            ChannelOperation::Shell => platform::LaunchOperation::Shell,
+            ChannelOperation::Exec { command } => platform::LaunchOperation::Exec(command),
+        };
+        let pty = self
+            .conn
+            .registry
+            .pty(channel)
+            .map(|pty| platform::PtySpec {
+                term: pty.term,
+                rows: pty.rows,
+                cols: pty.cols,
+            });
+        let manager = Arc::clone(&self.shared.sandbox);
+        let launch = tokio::task::spawn_blocking(move || {
+            manager.launch(&principal, &id, launch_operation, pty)
+        })
+        .await;
+        let managed = match launch {
+            Ok(Ok(process)) => process,
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "sandbox process launch failed");
+                let handle = session.handle();
+                let _ = channel::finish_failed(channel, &handle).await;
+                self.conn.registry.remove(channel);
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "sandbox launch task failed");
+                let handle = session.handle();
+                let _ = channel::finish_failed(channel, &handle).await;
+                self.conn.registry.remove(channel);
+                return Ok(());
+            }
+        };
+        let lease = managed.lease.clone();
+        let process = managed.process;
+        if session.channel_success(channel).is_err() {
+            process.control.terminate();
+            self.shared.sandbox.clear_runtime(&lease);
+            self.conn.registry.remove(channel);
+            return Ok(());
+        }
+        let handle = session.handle();
+        let conn = Arc::clone(&self.conn);
+        let manager = Arc::clone(&self.shared.sandbox);
+        tokio::spawn(async move {
+            channel::run_sandbox_process(channel, &handle, process, events).await;
+            manager.clear_runtime(&lease);
+            conn.registry.remove(channel);
+        });
+        Ok(())
+    }
+
+    async fn complete_management(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        result: Result<Vec<u8>, crate::sandbox::manager::Error>,
+    ) -> Result<(), crate::server::HandlerError> {
+        match result {
+            Ok(output) => {
+                if !output.is_empty() {
+                    let _ = session.data(channel, output);
+                }
+                let _ = session.eof(channel);
+                let _ = session.exit_status_request(channel, 0);
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "sandbox management request failed");
+                let _ = session.extended_data(channel, 1, format!("{}\r\n", UNAVAILABLE_MESSAGE));
+                let _ = session.eof(channel);
+                let _ = session.exit_status_request(channel, UNAVAILABLE_EXIT);
+            }
+        }
         let _ = session.close(channel);
         self.conn.registry.remove(channel);
         Ok(())
     }
 
-    /// Complete a validated but not-yet-implemented operation without
-    /// acknowledging a second operation on the same channel.
-    async fn start_sandbox_unavailable(
+    async fn start_list(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
@@ -125,7 +210,54 @@ impl ConnHandler {
             let _ = session.channel_failure(channel);
             return Ok(());
         }
-        self.sandbox_unavailable(channel, session).await
+        let Some(principal) = self.conn.principal() else {
+            let _ = session.channel_failure(channel);
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
+        let manager = Arc::clone(&self.shared.sandbox);
+        let list = tokio::task::spawn_blocking(move || manager.list(&principal)).await;
+        let output = match list {
+            Ok(result) => result.map(|ids| {
+                ids.into_iter()
+                    .map(|id| format!("{id}\n"))
+                    .collect::<String>()
+                    .into_bytes()
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "sandbox list task failed");
+                Err(crate::sandbox::manager::Error::Unavailable)
+            }
+        };
+        self.complete_management(channel, session, output).await
+    }
+
+    async fn start_delete(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        id: SandboxId,
+    ) -> Result<(), crate::server::HandlerError> {
+        if self.conn.registry.pty(channel).is_some() || self.conn.registry.start(channel).is_none()
+        {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        }
+        let Some(principal) = self.conn.principal() else {
+            let _ = session.channel_failure(channel);
+            self.conn.registry.remove(channel);
+            return Ok(());
+        };
+        let manager = Arc::clone(&self.shared.sandbox);
+        let result =
+            match tokio::task::spawn_blocking(move || manager.delete(&principal, &id)).await {
+                Ok(result) => result.map(|_| Vec::new()),
+                Err(error) => {
+                    tracing::warn!(error = %error, "sandbox delete task failed");
+                    Err(crate::sandbox::manager::Error::Unavailable)
+                }
+            };
+        self.complete_management(channel, session, result).await
     }
 
     /// Approve the single terminal operation for a channel and dispatch it.
@@ -156,10 +288,9 @@ impl ConnHandler {
                 );
                 self.dispatch_host_channel(channel, session, request).await
             }
-            Ok(Route::Sandbox(_id)) => {
-                // A validated sandbox selector: intentionally unavailable
-                // until the SandboxManager exists (Milestones 3-4).
-                self.start_sandbox_unavailable(channel, session).await
+            Ok(Route::Sandbox(id)) => {
+                self.start_sandbox_terminal(channel, session, id, operation)
+                    .await
             }
         }
     }
@@ -247,14 +378,13 @@ impl russh::server::Handler for ConnHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let cap = self.shared.config.caps().max_channels_per_connection as usize;
-        if self.conn.registry.count() >= cap {
+        let id = channel.id();
+        if !self.conn.registry.try_open(id, cap) {
             let _ = reply
                 .reject(russh::ChannelOpenFailure::ResourceShortage)
                 .await;
             return Ok(());
         }
-        let id = channel.id();
-        self.conn.registry.open(id);
         reply.accept().await;
         // The channel object is dropped on purpose: incoming client data is
         // delivered to the `data` callback, and the internal queue stays
@@ -360,7 +490,7 @@ impl russh::server::Handler for ConnHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.start_operation(channel, session, ChannelOperation::HostShell)
+        self.start_operation(channel, session, ChannelOperation::Shell)
             .await
     }
 
@@ -370,14 +500,14 @@ impl russh::server::Handler for ConnHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if data.len() > host::MAX_COMMAND_BYTES {
+        if data.len() > host::MAX_COMMAND_BYTES || data.contains(&0) {
             let _ = session.channel_failure(channel);
             return Ok(());
         }
         self.start_operation(
             channel,
             session,
-            ChannelOperation::HostExec {
+            ChannelOperation::Exec {
                 command: data.to_vec(),
             },
         )
@@ -396,24 +526,31 @@ impl russh::server::Handler for ConnHandler {
         }
         match name {
             "list" => {
-                // The SandboxManager arrives in Milestones 3-4; the route is
-                // still validated and the channel is consumed exactly once.
-                if self.conn.principal().is_none() {
+                let username = self.username.clone().unwrap_or_default();
+                let Some(principal) = self.conn.principal() else {
+                    let _ = session.channel_failure(channel);
+                    return Ok(());
+                };
+                if username == "_" && principal.role != Role::Admin {
                     let _ = session.channel_failure(channel);
                     return Ok(());
                 }
-                self.start_sandbox_unavailable(channel, session).await
+                self.start_list(channel, session).await
             }
             "delete" => {
                 // `_` is a host context, never a delete target. Other
                 // selectors must be valid SandboxIds before they can reach
                 // the later manager implementation.
                 let username = self.username.clone().unwrap_or_default();
-                if username == "_" || SandboxId::parse(&username).is_err() {
+                if username == "_" {
                     let _ = session.channel_failure(channel);
                     return Ok(());
                 }
-                self.start_sandbox_unavailable(channel, session).await
+                let Ok(id) = SandboxId::parse(&username) else {
+                    let _ = session.channel_failure(channel);
+                    return Ok(());
+                };
+                self.start_delete(channel, session, id).await
             }
             _ => {
                 // SFTP and every unknown subsystem are rejected explicitly.

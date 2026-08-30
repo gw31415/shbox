@@ -1,10 +1,10 @@
 //! shbox: a foreground SSH daemon that maps authenticated keys onto
 //! persistent sandbox workspaces.
 //!
-//! Milestone 3 bootstrap: resolve and validate every local input, reconcile
+//! Milestone 4 bootstrap: resolve and validate every local input, reconcile
 //! durable sandbox metadata, then run the public-key SSH server with the
-//! admin-only `_` host route. Sandbox process requests remain unavailable
-//! until the process launcher milestones connect to the manager.
+//! admin-only `_` host route. The production sandbox adapter remains
+//! fail-closed until the Arapuca milestone connects it.
 
 mod account;
 mod auth;
@@ -131,8 +131,10 @@ async fn run() -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    let _sandbox_manager = sandbox::SandboxManager::open(&paths, *app_config.caps())
-        .map_err(|err| fail("reconciling sandbox registry", err))?;
+    let sandbox_manager = Arc::new(
+        sandbox::SandboxManager::open(&paths, *app_config.caps())
+            .map_err(|err| fail("reconciling sandbox registry", err))?,
+    );
 
     debug!(
         limits = ?app_config.limits(),
@@ -172,6 +174,7 @@ async fn run() -> Result<(), BootstrapError> {
         auth: Arc::new(auth_snapshot),
         config: Arc::new(app_config.clone()),
         account: Arc::new(account),
+        sandbox: sandbox_manager,
     };
     let server = Arc::new(server::SshServer::new(
         shared,
