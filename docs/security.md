@@ -247,7 +247,7 @@ Arapuca を使い、test adapter は故障・競合を決定的に注入でき�
 
 Arapuca 固有の profile、`task_id`、cgroup path、wrapper、network syscall flag
 などは shbox の設定項目として直接公開しない。利用者が設定できるのは shbox の
-domain semantics（network、read-only path、shell、resource cap など）だけで、
+domain semantics（CLI network、read-only path、shell、sandbox environment）だけで、
 Arapuca への mapping は adapter の内部実装とする。
 
 ### 5.2 identity、environment、path
@@ -269,7 +269,8 @@ Arapuca への mapping は adapter の内部実装とする。
 
 ### 5.3 network
 
-network policy は全 sandbox 共通の `disabled` または `outbound` だけである。
+network policy は daemon 起動時の `--network` で選ぶ、全 sandbox 共通の `disabled` または
+`outbound` だけである。
 per-sandbox、per-owner、inbound listener の設定はない。
 
 - `disabled` は strict な network denial を使用する。
@@ -283,8 +284,8 @@ operator は機密情報を workspace、環境、read-only path に置かない�
 
 ### 5.4 resource cap
 
-既定の同時実行上限は次のとおりである。設定で変更できる値も daemon 全体または
-sandbox 全体の policy とし、owner ごとの任意 override は設けない。
+既定の同時実行上限は次のとおりである。これらは daemon 全体または sandbox 全体の
+built-in safety policy であり、config file や reload から変更できない。
 
 | 対象 | 既定値 |
 |---|---:|
@@ -302,8 +303,8 @@ sandbox 全体の policy とし、owner ごとの任意 override は設けない
 | open files | 1024 |
 | Linux `max_pids` cgroup limit | 256 |
 
-`[limits]` の resource 値 `0` はその limit がないことを意味する。一方、`[caps]` の
-connection、channel、process、sandbox、timeout 上限に `0` は指定できない。Linux の
+resource limit の組み込み値 `0` はその limit がないことを意味する。一方、connection、
+channel、process、sandbox、timeout 上限の組み込み値はすべて 1 以上である。Linux の
 process、memory、CPU、file、cgroup の強制方法と macOS の best-effort な差異は
 platform 文書で定める。macOS で Linux の cgroup/pid/CPU quota と同じ強度を
 主張しない。
@@ -316,7 +317,8 @@ daemon を配置する。Arapuca は現在の process の cgroup scope を自動
 
 ## 6. host mode の特別な境界
 
-admin key だけが `_` selector を使える。
+admin key だけが `_` selector を使える。`--authorized-keys-host-access` を指定した daemon
+では、authorized_keys にある全 key が Admin role となり、この route を使える。
 
 ```console
 ssh _@host
@@ -336,8 +338,9 @@ service unit や launchd の environment に token、秘密鍵、database passwo
 environment を運用で与えない。通常の sandbox mode は server が作る clean
 environment を使い、service environment 全体を継承しない。
 
-admin key を設定しない場合は sandbox-only mode で `_` route は認証されない。
-admin key がある managed mode では `_` listener を先に公開して復旧経路を確保
+admin key も host-access flag も設定しない場合は sandbox-only mode で `_` route は認証
+されない。admin key がある、または host-access flag を指定した managed mode では `_`
+listener を先に公開して復旧経路を確保
 できるが、filesystem reconciliation が終わるまで sandbox 操作は fail closed
 とする。sandbox-only mode は reconciliation 完了後に listener を公開する。
 
@@ -381,9 +384,9 @@ stdout/stderr は変換・記録せず、process の出力をそのまま転送�
 ### 8.2 log
 
 `tracing` の structured compact text を stderr に出力し、UTC RFC3339 の timestamp
-を付ける。file log、rotation、`RUST_LOG` は v0.1 にない。`log_level` は
-`error`、`warn`、`info`、`debug`、`trace` から設定し、既定は `info`、SIGHUP で
-reload する。
+を付ける。file log、rotation、`RUST_LOG` は v0.1 にない。`--log-level` は
+`error`、`warn`、`info`、`debug`、`trace` から設定し、既定は `info`。process-lifetime
+の値であり、SIGHUP では reload しない。
 
 必要な監査情報として、connection ID、channel ID、remote IP、key fingerprint、
 role、selector/ID、operation、result、duration、exit status を記録してよい。
@@ -403,10 +406,11 @@ invariant violation は位置と backtrace を log して daemon を abort す�
 
 ## 9. reload と shutdown
 
-SIGHUP は authorized_keys/admin_keys、shell、sandbox environment、network policy、
-read-only paths、resource caps、connection caps、log level を全体検証したうえで
-atomic に反映する。listen address、host key、data root の変更は restart-only
-とし、SIGHUP で既存 listener を切り替えない。reload failure は古い設定を保持する。
+SIGHUP は authorized_keys/admin_keys、shell、sandbox environment、read-only paths を
+全体検証したうえで atomic に反映する。`--listen`、`--network`、`--log-level`、
+`--authorized-keys-host-access` と built-in resource caps/limits、host key、data root の
+変更は process-lifetime または restart-only とし、SIGHUP で既存 listener や safety policy
+を切り替えない。reload failure は古い設定を保持する。
 
 最後の admin key を reload で削除すると、新規 connection は sandbox-only mode になり、
 新しい admin/host access はできなくなる。既存の admin connection は connection

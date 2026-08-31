@@ -84,6 +84,13 @@ fn help_and_version_print_and_exit_successfully() {
     let (help, _) = stdout_of(shbox().arg("--help"));
     assert!(help.contains("--completions"), "help lists --completions");
     assert!(help.contains("--man"), "help lists --man");
+    assert!(help.contains("--listen"), "help lists --listen");
+    assert!(help.contains("--network"), "help lists --network");
+    assert!(help.contains("--log-level"), "help lists --log-level");
+    assert!(
+        help.contains("--authorized-keys-host-access"),
+        "help lists --authorized-keys-host-access"
+    );
 }
 
 #[test]

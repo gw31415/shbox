@@ -193,19 +193,21 @@ src/
 
 startup は概ね次の順序で行う。
 
-1. XDG path を解決し、data の `registry.lock`、state の `lock` の順に non-blocking で取得する。
+1. CLI を parse し、listener、network、log level、host-access policy を固定する。
+2. XDG path を解決し、data の `registry.lock`、state の `lock` の順に non-blocking で取得する。
    どちらか一方でも失敗したら、取得済み lock を解放して起動を失敗させる。
-2. optional config を読み、built-in defaults と合成し、全体を検証する。
-3. authorized keys を読み、admin fingerprint との整合を検証する。
-4. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
-5. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
-6. managed mode なら listener を全 address へ bind し、`_` host route だけを ready にする。
-7. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
-8. sandbox operation を ready にし、sandbox-only mode ならここで listener を bind する。
+3. optional config を読み、file-backed policy を検証する。
+4. authorized keys を読み、admin fingerprint との整合を検証する。
+5. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
+6. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
+7. managed mode（admin key または host-access flag）なら listener を全 address へ bind し、
+   `_` host route だけを ready にする。
+8. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
+9. sandbox operation を ready にし、sandbox-only mode ならここで listener を bind する。
 
 config file は存在しなくてもよい。authorized keys は存在し、少なくとも一つの valid
-Ed25519 key を含まなければならない。config に admin key が一つ以上ある状態を
-**managed mode**、それ以外を **sandbox-only mode** と呼ぶ。
+Ed25519 key を含まなければならない。config に admin key が一つ以上ある、または
+host-access flag が有効な状態を **managed mode**、それ以外を **sandbox-only mode** と呼ぶ。
 
 - managed mode は、repair のため registry reconciliation 中でも listener と `_` の
   host shell/exec を利用可能にする。この期間の sandbox 操作は一律 unavailable とする。
@@ -260,7 +262,7 @@ out-of-band access で調査・修復する。
 
 - sandbox workspace を process の `HOME` と初期 cwd にする。
 - configured sandbox shell、固定の managed environment、validated sandbox environment、
-  network policy、read-only paths、resource limits を shbox domain value から組み立てる。
+  CLI network policy、read-only paths、built-in resource limits を shbox domain value から組み立てる。
 - workspace だけを sandbox 固有の read/write tree とする。
 - `Config.env` による `HOME` 上書きを使う現在の Arapuca behavior は固定 revision 上で
   Linux/macOS integration test を行い、上流の未固定契約として一般化しない。
@@ -350,10 +352,9 @@ reload の適用範囲は次のとおりである。
 
 - 新しい connection: 新しい auth/admin snapshot
 - 既存 connection: 認証時の principal/role を切断まで保持
-- 新しい process: 新しい shell/env/network/read path/limit snapshot
+- 新しい process: 新しい shell/env/read path snapshot と、固定 CLI network/built-in limits
 - 実行中 process: 変更しない
-- log level と capacity: 新 snapshot（既存利用量を強制終了させない）
-- listen address: restart-only
+- CLI の log level、host-access、network、listener と built-in capacity/limits: 固定
 - host key、storage root、Arapuca backend: 固定、reload しない
 
 reload により最後の admin を削除して sandbox-only mode へ移行できる。既存 admin connection

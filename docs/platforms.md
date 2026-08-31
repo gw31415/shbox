@@ -54,7 +54,10 @@ arapuca = { git = "https://github.com/LeGambiArt/arapuca", rev = "c94802c4d8b6b8
 
 この revision の package version は `0.2.7` のままだが、`v0.2.7` tag の正式リリースではない。PR #82 由来の macOS PTY `file-ioctl` と `/var` ancestor 修正を含む未リリースの累積 tip である。仕様、Cargo.lock、リリースノートには package version と full revision の両方を記録する。正式版へ移行する場合も、差分確認と全統合試験を先に行う。
 
-shbox の設定は `network = "disabled" | "outbound"`、共通 resource limit、追加 read-only path、workspace 環境変数などの shbox 用語だけを公開する。`Isolation`、`seccomp_profile`、`cgroup_policy`、`allow_exec`、`use_netns`、`task_id` などの Arapuca option を TOML の直接の露出名にはしない。内部 adapter が固定した安全な mapping を使う。
+shbox の設定 file は追加 read-only path、workspace 環境変数などの file-backed policy だけを
+公開する。network は CLI の `--network` で選び、resource limits/caps は組み込み値である。
+`Isolation`、`seccomp_profile`、`cgroup_policy`、`allow_exec`、`use_netns`、`task_id` などの
+Arapuca option を TOML の直接の露出名にはしない。内部 adapter が固定した安全な mapping を使う。
 
 ### 2.1 Profile の mapping
 
@@ -65,7 +68,9 @@ shbox の設定は `network = "disabled" | "outbound"`、共通 resource limit�
 - daemon の UID/GID の切り替えは行わない。host mode も同じ daemon service account で動き、別 identity は sudo、service manager、OS 側の配備責務とする。
 - 同一 workspace への同時 read/write は許可する。shbox はファイル lock や単一 writer を提供せず、更新の整合性は利用するプログラムと通常の filesystem semantics に委ねる。
 
-resource の既定値は、`max_open_files = 1024`、Linux の `max_pids = 256`、その他の memory/CPU/time/file-size limit は `0`（無制限）とする。workspace 全体の disk quota は設けず、必要なら per-file size limit と operator の filesystem 監視で扱う。
+resource の組み込み値は、`max_open_files = 1024`、Linux の `max_pids = 256`、その他の
+memory/CPU/time/file-size limit は `0`（無制限）とする。workspace 全体の disk quota は
+設けず、必要なら operator の filesystem 監視で扱う。
 
 Linux の固定 curated read set は、存在する次の path に限る。
 
@@ -100,7 +105,7 @@ workspace 以外の追加 write path は作らない。
 
 ## 3. Network policy
 
-ネットワーク設定は全 Sandbox 共通で、次の二つだけとする。
+ネットワーク設定は daemon 起動時の `--network` で選び、全 Sandbox 共通で次の二つだけとする。
 
 | shbox 設定 | 内部の意味 | 契約 |
 |---|---|---|
@@ -110,7 +115,7 @@ workspace 以外の追加 write path は作らない。
 inbound listener、port forwarding、per-Sandbox allowlist、proxy endpoint の設定は v0.1 で提供しない。`outbound` は初期版から実装し、ユーザーが利用する唯一の許可ネットワーク形態とする。ここでも Arapuca の raw network option や syscall profile 名は公開しない。
 
 `outbound` の内部 profile は `disabled` より syscall/network isolation が弱い。選択時は
-startup/reload の host log に warning を残す。shbox は inbound port mapping を作らないが、
+startup の host log に warning を残す。shbox は inbound port mapping を作らないが、
 Baseline と host network namespace の組合せは全 OS で bind/listen を禁止する egress-only
 security boundary ではない。外部からの到達は host firewall で制御し、正式 platform ごとに
 実際の socket behavior を記録する。
@@ -165,7 +170,7 @@ Wants=network-online.target
 Type=simple
 User=shbox
 Group=shbox
-ExecStart=/usr/local/bin/shbox
+ExecStart=/usr/local/bin/shbox --listen 0.0.0.0:22 --network disabled --log-level info
 Restart=on-failure
 Delegate=cpu cpuset memory pids
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -202,6 +207,12 @@ macOS の launchd 配備例は次のように、persistent path を持つ専用 
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/shbox</string>
+    <string>--listen</string>
+    <string>0.0.0.0:22</string>
+    <string>--network</string>
+    <string>disabled</string>
+    <string>--log-level</string>
+    <string>info</string>
   </array>
   <key>UserName</key>
   <string>shbox</string>
