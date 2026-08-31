@@ -330,8 +330,7 @@ mod tests {
         let (_home, paths) = temp_paths();
         fs::create_dir(paths.config_dir()).expect("create config dir");
         paths.ensure().expect("writable config dir passes");
-        fs::set_permissions(paths.config_dir(), fs::Permissions::from_mode(0o730))
-            .expect("chmod");
+        fs::set_permissions(paths.config_dir(), fs::Permissions::from_mode(0o730)).expect("chmod");
         let err = paths.ensure().expect_err("group writable config dir");
         assert!(err.to_string().contains("group or world writable"), "{err}");
     }
