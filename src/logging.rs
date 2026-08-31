@@ -1,6 +1,9 @@
 //! Structured logging: `tracing` compact text on stderr with UTC RFC 3339
-//! timestamps. The level is a process-lifetime CLI choice (`--log-level`);
-//! SIGHUP cannot change it.
+//! timestamps. The level is fixed once at startup, from the config file's
+//! `log_level` with the `--log-level` flag layered on top; SIGHUP cannot
+//! change it.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::time::UtcTime;
@@ -8,8 +11,10 @@ use tracing_subscriber::prelude::*;
 
 use crate::config::LogLevel;
 
-/// Install the global subscriber at the CLI-selected level. Panics only if
-/// called twice in one process.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Install the global subscriber at the startup-selected level. Panics only
+/// if called twice in one process.
 pub fn init(level: LevelFilter) {
     tracing_subscriber::registry()
         .with(
@@ -20,9 +25,17 @@ pub fn init(level: LevelFilter) {
         )
         .with(level)
         .init();
+    INITIALIZED.store(true, Ordering::Release);
 }
 
-/// The tracing filter matching the CLI-selected `--log-level`.
+/// Whether `init` has installed the global subscriber. Startup can fail
+/// before `init` runs — the config file is one of its own inputs — and such
+/// failures must fall back to plain stderr reporting.
+pub fn initialized() -> bool {
+    INITIALIZED.load(Ordering::Acquire)
+}
+
+/// The tracing filter matching the startup-selected log level.
 pub fn level_filter(level: LogLevel) -> LevelFilter {
     match level {
         LogLevel::Error => LevelFilter::ERROR,

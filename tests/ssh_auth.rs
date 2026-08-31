@@ -256,11 +256,9 @@ impl TestDaemon {
         }
     }
 
-    /// Add a retired listener field to exercise fail-closed reload parsing.
-    fn add_legacy_listen_field(&self, port: u16) {
-        let current = std::fs::read_to_string(&self.config_path).expect("read config");
-        let updated = format!("listen = [\"127.0.0.1:{port}\"]\n{current}");
-        std::fs::write(&self.config_path, updated).expect("write config");
+    /// Replace the whole config file content with a complete new document.
+    fn set_config(&self, content: &str) {
+        std::fs::write(&self.config_path, content).expect("write config");
     }
 
     /// Send a signal to the child owned by this harness.
@@ -1039,7 +1037,7 @@ fn arapuca_sandbox_maps_environment_and_workspace() {
 
     let daemon = TestDaemon::start_with_config(
         &["admin"],
-        "[sandbox_env]\nM8_SANDBOX_TOKEN = \"configured-token\"\n",
+        "[sandbox.env]\nM8_SANDBOX_TOKEN = \"configured-token\"\n",
     );
     let id = "m8-environment";
     let marker = daemon.sandbox_workspace(id).join("m8-workspace-marker");
@@ -1407,20 +1405,36 @@ fn sighup_admin_keys_update_new_connections_and_preserve_existing_role() {
     let _ = std::fs::remove_file(control_path);
 }
 
-/// A retired listener field rejects the whole reload, preserving the prior
-/// auth snapshot instead of applying only the other changed fields.
+/// Changing a process-lifetime field (`listen`, `log_level`,
+/// `[sandbox] network`) in the config file rejects the whole reload,
+/// preserving the prior snapshot instead of applying only the other changed
+/// fields. Each document is a complete, individually valid config, so the
+/// rejection is exactly the startup-only-field rule.
 #[test]
-fn sighup_retired_listener_field_is_rejected_atomically() {
+fn sighup_startup_only_field_change_is_rejected_atomically() {
     let daemon = TestDaemon::start(&["admin"]);
-    daemon.add_legacy_listen_field(free_port());
-    daemon.set_admin_keys(&[]);
-    daemon.reload();
+    let changes = [
+        (
+            "listen",
+            format!("listen = [\"127.0.0.1:{}\"]\n", free_port()),
+        ),
+        ("log_level", "log_level = \"debug\"\n".to_string()),
+        ("network", "[sandbox]\nnetwork = \"outbound\"\n".to_string()),
+    ];
+    for (name, config) in changes {
+        daemon.set_config(&config);
+        daemon.set_admin_keys(&[]);
+        daemon.reload();
 
-    let result = retry_until("admin access after restart-only reload", || {
-        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-listener", &["-T"]);
-        (result.ok() && result.stdout == "old-listener").then_some(result)
-    });
-    assert_eq!(result.stdout, "old-listener");
+        let result = retry_until(&format!("admin access after {name} change reload"), || {
+            let result = daemon.ssh(&daemon.admin_key, "_", "printf old-snapshot", &["-T"]);
+            (result.ok() && result.stdout == "old-snapshot").then_some(result)
+        });
+        assert_eq!(
+            result.stdout, "old-snapshot",
+            "{name} change must not reload"
+        );
+    }
 }
 
 /// Emptying both key files on reload causes an empty union error, keeping the

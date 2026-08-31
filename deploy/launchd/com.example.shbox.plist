@@ -19,8 +19,6 @@
     <string>/usr/local/bin/shbox</string>
     <string>--listen</string>
     <string>0.0.0.0:22</string>
-    <string>--network</string>
-    <string>disabled</string>
     <string>--log-level</string>
     <string>info</string>
   </array>

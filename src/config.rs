@@ -1,10 +1,12 @@
 //! Typed TOML configuration, built-in defaults, validation, and immutable
 //! runtime snapshots.
 //!
-//! The v0.1 schema is exactly the one in `docs/configuration.md`: an optional
+//! The schema is exactly the one in `docs/configuration.md`: an optional
 //! `config.toml`, unknown fields rejected, and no silent coercion of invalid
-//! values. Process-lifetime operational settings and resource safety limits
-//! are intentionally outside this file.
+//! values. The top level carries the operational settings (`listen`,
+//! `log_level`); the CLI flags are a thin layer on top of exactly those
+//! top-level fields and never mirror anything under `[sandbox]`. Resource
+//! safety limits stay built-in constants, outside this file.
 //! Parsing (schema) and validation (semantics that need the filesystem) are
 //! separate steps so that reload can reuse both independently.
 
@@ -13,8 +15,10 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
@@ -27,11 +31,16 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 
 /// Immutable, fully validated configuration snapshot.
 ///
-/// Only file-backed policy lives here. Process-lifetime operational settings
-/// (`listen`, `network`, and `log level`) are CLI options, and
-/// `Caps`/`Limits` are built-in constants.
+/// The top-level operational settings (`listen`, `log_level`) and the
+/// `[sandbox] network` mode are process-lifetime: they are read once at
+/// startup, the CLI flags layer on top of the first two, and a SIGHUP reload
+/// that changes any of them is rejected whole. `Caps`/`Limits` are built-in
+/// constants.
 #[derive(Debug, Clone)]
 pub struct Config {
+    listen: Vec<SocketAddr>,
+    log_level: LogLevel,
+    network: NetworkMode,
     sandbox_shell: Option<PathBuf>,
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
@@ -64,6 +73,21 @@ impl Config {
             }
             None => build(RawConfig::default(), paths),
         }
+    }
+
+    /// Listener addresses to bind, with the built-in default applied.
+    pub fn listen(&self) -> &[SocketAddr] {
+        &self.listen
+    }
+
+    /// Daemon log verbosity for this run.
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level
+    }
+
+    /// Sandbox network policy for this run.
+    pub fn network(&self) -> NetworkMode {
+        self.network
     }
 
     /// Configured sandbox shell override.
@@ -137,14 +161,79 @@ fn parse_file(path: &Path) -> Result<RawConfig, Error> {
 }
 
 pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
-    let sandbox_shell = validate_configured_path(raw.sandbox_shell.as_deref(), "sandbox_shell")?;
-    let read_paths = validate_read_paths(raw.read_paths.as_deref(), paths)?;
-    let sandbox_env = validate_sandbox_env(raw.sandbox_env.as_ref())?;
+    let listen = validate_listen(raw.listen.as_deref())?;
+    let log_level = validate_log_level(raw.log_level.as_deref())?;
+    let sandbox = raw.sandbox.unwrap_or_default();
+    let network = validate_network(sandbox.network.as_deref())?;
+    let sandbox_shell = validate_configured_path(sandbox.shell.as_deref(), "sandbox.shell")?;
+    let read_paths = validate_read_paths(sandbox.read_paths.as_deref(), paths)?;
+    let sandbox_env = validate_sandbox_env(sandbox.env.as_ref())?;
     Ok(Config {
+        listen,
+        log_level,
+        network,
         sandbox_shell,
         read_paths,
         sandbox_env,
         loaded_from_file: false,
+    })
+}
+
+/// The listener the daemon binds when the config file names none.
+pub fn default_listen() -> Vec<SocketAddr> {
+    vec![SocketAddr::from(([0, 0, 0, 0], 22))]
+}
+
+fn validate_listen(raw: Option<&[String]>) -> Result<Vec<SocketAddr>, Error> {
+    let Some(values) = raw else {
+        return Ok(default_listen());
+    };
+    if values.is_empty() {
+        return Err(Error::Invalid {
+            field: "listen",
+            message: "listen must not be empty; omit it to use the default listener".into(),
+        });
+    }
+    let mut listen = Vec::with_capacity(values.len());
+    for value in values {
+        let address = SocketAddr::from_str(value).map_err(|err| Error::Invalid {
+            field: "listen",
+            message: format!("listen entry {value:?} is not a valid socket address: {err}"),
+        })?;
+        if listen.contains(&address) {
+            return Err(Error::Invalid {
+                field: "listen",
+                message: format!("duplicate listen address {address}"),
+            });
+        }
+        listen.push(address);
+    }
+    Ok(listen)
+}
+
+fn validate_log_level(raw: Option<&str>) -> Result<LogLevel, Error> {
+    let Some(word) = raw else {
+        return Ok(LogLevel::Info);
+    };
+    LogLevel::from_word(word).ok_or_else(|| Error::Invalid {
+        field: "log_level",
+        message: format!(
+            "log_level must be one of {}, got {word:?}",
+            LogLevel::WORDS.join(", ")
+        ),
+    })
+}
+
+fn validate_network(raw: Option<&str>) -> Result<NetworkMode, Error> {
+    let Some(word) = raw else {
+        return Ok(NetworkMode::Disabled);
+    };
+    NetworkMode::from_word(word).ok_or_else(|| Error::Invalid {
+        field: "sandbox.network",
+        message: format!(
+            "sandbox.network must be one of {}, got {word:?}",
+            NetworkMode::WORDS.join(", ")
+        ),
     })
 }
 
@@ -194,18 +283,18 @@ fn validate_read_paths(raw: Option<&[String]>, paths: &Paths) -> Result<Vec<Path
     for value in raw.unwrap_or(&[]) {
         if value.is_empty() || !value.starts_with('/') {
             return Err(Error::Invalid {
-                field: "read_paths",
+                field: "sandbox.read_paths",
                 message: format!("read path must be absolute, got {value:?}"),
             });
         }
         if value.bytes().any(|byte| byte == 0) {
             return Err(Error::Invalid {
-                field: "read_paths",
+                field: "sandbox.read_paths",
                 message: "read path must not contain NUL".into(),
             });
         }
         let resolved = fs::canonicalize(value).map_err(|err| Error::Io {
-            field: "read_paths",
+            field: "sandbox.read_paths",
             message: format!("read path {value:?} does not exist or is not accessible: {err}"),
             source: err,
         })?;
@@ -221,14 +310,14 @@ fn validate_read_paths(raw: Option<&[String]>, paths: &Paths) -> Result<Vec<Path
             };
             if Paths::contains(&root, &resolved) {
                 return Err(Error::Invalid {
-                    field: "read_paths",
+                    field: "sandbox.read_paths",
                     message: format!("read path {value:?} exposes the shbox {role}"),
                 });
             }
         }
         if canonical.contains(&resolved) {
             return Err(Error::Invalid {
-                field: "read_paths",
+                field: "sandbox.read_paths",
                 message: format!("duplicate read path {value:?}"),
             });
         }
@@ -267,13 +356,13 @@ pub fn is_valid_env_name(name: &str) -> bool {
 fn validate_env_name(name: &str) -> Result<(), Error> {
     if !is_valid_env_name(name) {
         return Err(Error::Invalid {
-            field: "sandbox_env",
+            field: "sandbox.env",
             message: format!("environment name {name:?} is not a POSIX identifier"),
         });
     }
     if RESERVED_ENV_NAMES.contains(&name) {
         return Err(Error::Invalid {
-            field: "sandbox_env",
+            field: "sandbox.env",
             message: format!("environment name {name:?} is managed by shbox and cannot be set"),
         });
     }
@@ -282,7 +371,7 @@ fn validate_env_name(name: &str) -> Result<(), Error> {
         .any(|prefix| name.starts_with(prefix))
     {
         return Err(Error::Invalid {
-            field: "sandbox_env",
+            field: "sandbox.env",
             message: format!("environment name {name:?} uses a reserved prefix"),
         });
     }
@@ -292,13 +381,13 @@ fn validate_env_name(name: &str) -> Result<(), Error> {
 fn validate_env_value(name: &str, value: &str) -> Result<(), Error> {
     if value.bytes().any(|byte| byte == 0) {
         return Err(Error::Invalid {
-            field: "sandbox_env",
+            field: "sandbox.env",
             message: format!("environment value for {name:?} contains NUL"),
         });
     }
     if value.len() > MAX_ENV_VALUE_BYTES {
         return Err(Error::Invalid {
-            field: "sandbox_env",
+            field: "sandbox.env",
             message: format!(
                 "environment value for {name:?} exceeds the {MAX_ENV_VALUE_BYTES} byte limit"
             ),
@@ -384,16 +473,32 @@ const RESERVED_ENV_PREFIXES: &[&str] = &[
     "SHBOX_", "ARAPUCA_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
 ];
 
-/// Sandbox network policy. Chosen on the command line at daemon start and
-/// never reloaded; the `ValueEnum` words are the CLI spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, usage_rs::ValueEnum)]
+/// Sandbox network policy. File-backed under `[sandbox]`, chosen once at
+/// daemon start, and never reloaded; there is deliberately no CLI mirror for
+/// this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkMode {
     Disabled,
     Outbound,
 }
 
-/// Structured log verbosity. Chosen on the command line at daemon start and
-/// never reloaded; the `ValueEnum` words are the CLI spellings.
+impl NetworkMode {
+    /// The schema words for the sandbox network modes.
+    pub const WORDS: [&str; 2] = ["disabled", "outbound"];
+
+    /// Parse the schema word for a network mode.
+    pub fn from_word(word: &str) -> Option<NetworkMode> {
+        match word {
+            "disabled" => Some(NetworkMode::Disabled),
+            "outbound" => Some(NetworkMode::Outbound),
+            _ => None,
+        }
+    }
+}
+
+/// Structured log verbosity. File-backed at the top level with the
+/// `--log-level` flag layered on top; chosen once at daemon start and never
+/// reloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage_rs::ValueEnum)]
 pub enum LogLevel {
     Error,
@@ -401,6 +506,25 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+impl LogLevel {
+    /// The config and CLI words for the levels, in filter order. The
+    /// contract test keeps these identical to the `ValueEnum` spellings of
+    /// `--log-level`.
+    pub const WORDS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+
+    /// Parse the schema word for a level.
+    pub fn from_word(word: &str) -> Option<LogLevel> {
+        match word {
+            "error" => Some(LogLevel::Error),
+            "warn" => Some(LogLevel::Warn),
+            "info" => Some(LogLevel::Info),
+            "debug" => Some(LogLevel::Debug),
+            "trace" => Some(LogLevel::Trace),
+            _ => None,
+        }
+    }
 }
 
 /// Resource limits for sandbox processes; `0` means "no limit".
@@ -484,15 +608,29 @@ impl Default for Caps {
     }
 }
 
-/// Schema-level view of the TOML document. `listen`, `network`, and
-/// `log_level` were removed in favor of CLI options; `deny_unknown_fields`
-/// turns any leftover copy of them into an explicit configuration error.
+/// Schema-level view of the TOML document. The top level carries the
+/// process-lifetime operational settings (`listen`, `log_level`) that the
+/// CLI flags may layer over; the `[sandbox]` table carries file-backed
+/// sandbox policy, which has no CLI mirror. `deny_unknown_fields` turns any
+/// other key — including the retired spellings `sandbox_shell`, top-level
+/// `read_paths`, `[sandbox_env]`, and top-level `network` — into an explicit
+/// configuration error.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
-    sandbox_shell: Option<String>,
+    listen: Option<Vec<String>>,
+    log_level: Option<String>,
+    sandbox: Option<RawSandbox>,
+}
+
+/// Schema-level view of the `[sandbox]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSandbox {
+    shell: Option<String>,
+    network: Option<String>,
     read_paths: Option<Vec<String>>,
-    sandbox_env: Option<BTreeMap<String, String>>,
+    env: Option<BTreeMap<String, String>>,
 }
 
 /// Configuration errors.
@@ -579,6 +717,9 @@ mod tests {
     fn missing_file_uses_builtin_defaults() {
         let (_home, paths) = test_paths();
         let config = Config::load_snapshot(&paths).expect("defaults");
+        assert_eq!(config.listen(), default_listen().as_slice());
+        assert_eq!(config.log_level(), LogLevel::Info);
+        assert_eq!(config.network(), NetworkMode::Disabled);
         assert!(config.read_paths().is_empty());
         assert!(config.sandbox_env().is_empty());
         assert!(!config.loaded_from_file());
@@ -624,14 +765,28 @@ mod tests {
     fn full_document_parses() {
         let config = build_ok(
             r#"
-            sandbox_shell = "/bin/bash"
+            listen = ["127.0.0.1:2222", "[::1]:2222"]
+            log_level = "debug"
+
+            [sandbox]
+            shell = "/bin/bash"
+            network = "outbound"
             read_paths = ["/usr/share/terminfo"]
 
-            [sandbox_env]
+            [sandbox.env]
             LANG = "C.UTF-8"
             EDITOR_DEFAULT = "vi"
             "#,
         );
+        assert_eq!(
+            config.listen(),
+            &[
+                SocketAddr::from(([127, 0, 0, 1], 2222)),
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 2222)),
+            ]
+        );
+        assert_eq!(config.log_level(), LogLevel::Debug);
+        assert_eq!(config.network(), NetworkMode::Outbound);
         assert_eq!(config.read_paths().len(), 1);
         assert_eq!(
             config.sandbox_env().get("LANG").map(String::as_str),
@@ -640,15 +795,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_operational_fields_moved_to_the_cli() {
+    fn operational_fields_live_in_their_new_homes() {
         for text in [
             r#"listen = ["127.0.0.1:2222"]"#,
-            r#"network = "outbound""#,
             r#"log_level = "debug""#,
+            "[sandbox]\nnetwork = \"outbound\"",
+        ] {
+            assert!(build_toml(text).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn rejects_retired_field_spellings() {
+        for text in [
+            r#"sandbox_shell = "/bin/bash""#,
+            r#"read_paths = ["/usr/share/terminfo"]"#,
+            "[sandbox_env]\nLANG = \"C.UTF-8\"",
+            // The mode lives only under `[sandbox]`; the CLI has no mirror
+            // and the top level never carried it.
+            r#"network = "outbound""#,
+            "[sandbox]\nsandbox_shell = \"/bin/bash\"",
         ] {
             let message = build_err(text);
             assert!(message.contains("unknown field"), "{text}: {message}");
         }
+    }
+
+    #[test]
+    fn listen_rejects_empty_malformed_and_duplicate_entries() {
+        let message = build_err("listen = []");
+        assert!(message.contains("must not be empty"), "{message}");
+        let message = build_err(r#"listen = ["127.0.0.1"]"#);
+        assert!(message.contains("not a valid socket address"), "{message}");
+        let message = build_err(r#"listen = ["127.0.0.1:2222", "127.0.0.1:2222"]"#);
+        assert!(message.contains("duplicate listen address"), "{message}");
+    }
+
+    #[test]
+    fn log_level_and_network_accept_only_the_documented_words() {
+        for word in LogLevel::WORDS {
+            let config = build_ok(&format!(r#"log_level = "{word}""#));
+            assert_eq!(config.log_level(), LogLevel::from_word(word).expect("word"));
+        }
+        assert_eq!(build_ok("").log_level(), LogLevel::Info);
+        assert!(build_err(r#"log_level = "verbose""#).contains("log_level must be one of"));
+
+        for word in NetworkMode::WORDS {
+            let config = build_ok(&format!("[sandbox]\nnetwork = \"{word}\""));
+            assert_eq!(
+                config.network(),
+                NetworkMode::from_word(word).expect("word")
+            );
+        }
+        assert_eq!(build_ok("").network(), NetworkMode::Disabled);
+        assert!(
+            build_err("[sandbox]\nnetwork = \"proxy\"").contains("sandbox.network must be one of")
+        );
     }
 
     #[test]
@@ -678,50 +880,84 @@ mod tests {
 
     #[test]
     fn rejects_malformed_toml() {
-        assert!(toml::from_str::<RawConfig>("listen = [").is_err());
+        assert!(toml::from_str::<RawConfig>("sandbox = [").is_err());
     }
 
     #[test]
     fn rejects_relative_paths() {
-        assert!(build_err(r#"sandbox_shell = "bin/bash""#).contains("absolute path"));
-        assert!(build_err(r#"sandbox_shell = "~/bin/bash""#).contains("absolute path"));
-        assert!(build_err(r#"read_paths = ["relative/path"]"#).contains("absolute"));
-        assert!(build_err(r#"read_paths = [""]"#).contains("absolute"));
+        assert!(
+            build_err(
+                r#"[sandbox]
+shell = "bin/bash""#
+            )
+            .contains("absolute path")
+        );
+        assert!(
+            build_err(
+                r#"[sandbox]
+read_paths = ["relative/path"]"#
+            )
+            .contains("absolute")
+        );
+        assert!(
+            build_err(
+                r#"[sandbox]
+read_paths = [""]"#
+            )
+            .contains("absolute")
+        );
     }
 
     #[test]
-    fn value_enum_words_match_the_cli_contract() {
+    fn enum_words_match_the_schema_and_cli_contract() {
         // The CLI spellings are part of the contract; keep the enum variants
         // mapped to the documented words.
         use usage_rs::spec::ValueEnum;
         assert_eq!(
-            <NetworkMode as ValueEnum>::CHOICES,
-            &["disabled", "outbound"]
-        );
-        assert_eq!(
             <LogLevel as ValueEnum>::CHOICES,
             &["error", "warn", "info", "debug", "trace"]
         );
+        assert_eq!(LogLevel::WORDS.as_slice(), <LogLevel as ValueEnum>::CHOICES);
+        for word in LogLevel::WORDS {
+            assert!(LogLevel::from_word(word).is_some(), "{word}");
+        }
+        assert!(LogLevel::from_word("verbose").is_none());
+        // `network` has no CLI mirror, so its words are config-only.
+        assert_eq!(NetworkMode::WORDS, ["disabled", "outbound"]);
+        for word in NetworkMode::WORDS {
+            assert!(NetworkMode::from_word(word).is_some(), "{word}");
+        }
+        assert!(NetworkMode::from_word("proxy").is_none());
     }
 
     #[test]
     fn read_paths_must_exist_and_stay_out_of_shbox_roots() {
         let (home, paths) = test_paths();
-        let raw: RawConfig = toml::from_str(r#"read_paths = ["/definitely/not/here"]"#).unwrap();
+        let raw: RawConfig = toml::from_str(
+            r#"[sandbox]
+read_paths = ["/definitely/not/here"]"#,
+        )
+        .unwrap();
         let message = build(raw, &paths).expect_err("missing path").to_string();
         assert!(message.contains("does not exist"), "{message}");
 
         let inside_data = paths.data_dir().join("exposed");
         std::fs::create_dir_all(&inside_data).expect("create");
-        let raw: RawConfig =
-            toml::from_str(&format!(r#"read_paths = [{:?}]"#, inside_data.display())).unwrap();
+        let raw: RawConfig = toml::from_str(&format!(
+            "[sandbox]\nread_paths = [{:?}]",
+            inside_data.display()
+        ))
+        .unwrap();
         let message = build(raw, &paths).expect_err("data root").to_string();
         assert!(message.contains("sandbox data root"), "{message}");
 
         let inside_state = paths.state_dir().join("exposed");
         std::fs::create_dir_all(&inside_state).expect("create");
-        let raw: RawConfig =
-            toml::from_str(&format!(r#"read_paths = [{:?}]"#, inside_state.display())).unwrap();
+        let raw: RawConfig = toml::from_str(&format!(
+            "[sandbox]\nread_paths = [{:?}]",
+            inside_state.display()
+        ))
+        .unwrap();
         let message = build(raw, &paths).expect_err("state root").to_string();
         assert!(message.contains("state root"), "{message}");
 
@@ -730,7 +966,7 @@ mod tests {
         let allowed = home.path().join("extra");
         std::fs::create_dir_all(&allowed).expect("create");
         let raw: RawConfig = toml::from_str(&format!(
-            r#"read_paths = [{:?}, {:?}]"#,
+            "[sandbox]\nread_paths = [{:?}, {:?}]",
             allowed.display(),
             allowed.display()
         ))
@@ -762,7 +998,7 @@ mod tests {
             "_JAVA_OPTIONS",
             "__COMPAT_LAYER",
         ] {
-            let text = format!("[sandbox_env]\n{name} = \"x\"");
+            let text = format!("[sandbox.env]\n{name} = \"x\"");
             let message = build_err(&text);
             assert!(
                 message.contains("managed by shbox") || message.contains("reserved prefix"),
@@ -773,7 +1009,7 @@ mod tests {
 
     #[test]
     fn sandbox_env_allows_path_and_lang_overrides() {
-        let config = build_ok("[sandbox_env]\nPATH = \"/opt/bin\"\nLANG = \"ja_JP.UTF-8\"\n");
+        let config = build_ok("[sandbox.env]\nPATH = \"/opt/bin\"\nLANG = \"ja_JP.UTF-8\"\n");
         assert_eq!(
             config.sandbox_env().get("PATH").map(String::as_str),
             Some("/opt/bin")
@@ -786,14 +1022,14 @@ mod tests {
 
     #[test]
     fn sandbox_env_rejects_invalid_names_and_values() {
-        assert!(build_err("[sandbox_env]\n\"1BAD\" = \"x\"").contains("POSIX identifier"));
-        assert!(build_err("[sandbox_env]\n\"A B\" = \"x\"").contains("POSIX identifier"));
-        assert!(build_err("[sandbox_env]\n\"WITH-NUL\" = \"a\\u0000b\"").contains("NUL"));
+        assert!(build_err("[sandbox.env]\n\"1BAD\" = \"x\"").contains("POSIX identifier"));
+        assert!(build_err("[sandbox.env]\n\"A B\" = \"x\"").contains("POSIX identifier"));
+        assert!(build_err("[sandbox.env]\n\"WITH-NUL\" = \"a\\u0000b\"").contains("NUL"));
         let big = "x".repeat(MAX_ENV_VALUE_BYTES + 1);
-        assert!(build_err(&format!("[sandbox_env]\nBIG = \"{big}\"")).contains("limit"));
+        assert!(build_err(&format!("[sandbox.env]\nBIG = \"{big}\"")).contains("limit"));
         let ok = "x".repeat(MAX_ENV_VALUE_BYTES);
         assert!(
-            build_ok(&format!("[sandbox_env]\nBIG = \"{ok}\""))
+            build_ok(&format!("[sandbox.env]\nBIG = \"{ok}\""))
                 .sandbox_env()
                 .contains_key("BIG")
         );
@@ -809,7 +1045,7 @@ mod tests {
         );
         paths.ensure().expect("ensure");
         let path = paths.config_file();
-        std::fs::write(path, "listen = [\"127.0.0.1:0\"]").expect("write config");
+        std::fs::write(path, "[sandbox]\nnetwork = \"disabled\"").expect("write config");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
         let message = match Config::load_snapshot(&paths) {
             Err(err) => err.to_string(),

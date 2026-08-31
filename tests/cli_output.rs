@@ -85,17 +85,22 @@ fn help_and_version_print_and_exit_successfully() {
     assert!(help.contains("--completions"), "help lists --completions");
     assert!(help.contains("--man"), "help lists --man");
     assert!(help.contains("--listen"), "help lists --listen");
-    assert!(help.contains("--network"), "help lists --network");
     assert!(help.contains("--log-level"), "help lists --log-level");
     assert!(
-        !help.contains("authorized-keys"),
+        !help.contains("authorized-keys") && !help.contains("--network"),
         "help must not list retired flags: {help}"
     );
 }
 
 #[test]
 fn unknown_flags_fail() {
-    for flag in ["--no-such-flag", "--authorized-keys-host-access"] {
+    // `--network` retired with the CLI layer: the mode now lives only in the
+    // config file, under `[sandbox]`.
+    for flag in [
+        "--no-such-flag",
+        "--authorized-keys-host-access",
+        "--network",
+    ] {
         let output = shbox().arg(flag).output().expect("spawn shbox");
         assert_ne!(output.status.code(), Some(0), "{flag} must exit non-zero");
     }

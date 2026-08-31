@@ -35,21 +35,20 @@ use tracing::{debug, error, info, warn};
 /// The command line has no subcommands: `parse` is the process entry.
 /// `--help`/`--version` print and exit 0, parse failures print to stderr and
 /// exit non-zero. `--completions`/`--man` print their artifact and exit
-/// without touching any daemon input. The operational options
-/// (`--listen`, `--network`, `--log-level`) are process-lifetime: SIGHUP
-/// never re-reads them, and the file config has no say in them.
+/// without touching any daemon input. The flags are a thin layer on top of
+/// the top-level config fields: `--listen` and `--log-level` override the
+/// file's `listen` and `log_level` when given, and there is deliberately no
+/// flag for anything under `[sandbox]` (`network` included). Every setting
+/// resolved this way is process-lifetime: SIGHUP never re-reads it.
 #[derive(usage_rs::Cli)]
 #[usage(bin = "shbox", version, completion)]
 struct Args {
-    /// SSH listener address; repeat the flag for additional listeners.
-    /// Defaults to 0.0.0.0:22.
+    /// SSH listener address; repeat the flag to override the config file's
+    /// `listen` entirely. Defaults to the config file value, or 0.0.0.0:22.
     #[usage(long, value_name = "ADDR")]
-    listen: Vec<std::net::SocketAddr>,
-    /// Sandbox network policy for every sandbox process. Defaults to
-    /// disabled.
-    #[usage(long, value_name = "MODE", value_enum)]
-    network: Option<config::NetworkMode>,
-    /// Daemon log verbosity. Defaults to info.
+    listen: Option<Vec<std::net::SocketAddr>>,
+    /// Daemon log verbosity; overrides the config file's `log_level`.
+    /// Defaults to the config file value, or info.
     #[usage(long, value_name = "LEVEL", value_enum)]
     log_level: Option<config::LogLevel>,
     /// Print a completion script for SHELL on stdout and exit.
@@ -90,13 +89,17 @@ enum OutputAction {
     Man,
 }
 
-/// The listener addresses the daemon binds, with the default applied.
-/// All-or-nothing binding stays the binding-time rule; this only normalizes
-/// the CLI input.
-fn effective_listen(listen: &[std::net::SocketAddr]) -> Result<Vec<std::net::SocketAddr>, String> {
-    if listen.is_empty() {
-        return Ok(vec![std::net::SocketAddr::from(([0, 0, 0, 0], 22))]);
-    }
+/// The listener addresses the daemon binds: the CLI layer on top of the
+/// config file's `listen`. An absent `--listen` keeps the config value, which
+/// `config::build` has already defaulted and validated; a present one
+/// replaces it wholesale. All-or-nothing binding stays the binding-time rule.
+fn effective_listen(
+    cli: Option<&[std::net::SocketAddr]>,
+    from_config: &[std::net::SocketAddr],
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let Some(listen) = cli else {
+        return Ok(from_config.to_vec());
+    };
     let mut seen = Vec::with_capacity(listen.len());
     for address in listen {
         if seen.contains(address) {
@@ -105,6 +108,15 @@ fn effective_listen(listen: &[std::net::SocketAddr]) -> Result<Vec<std::net::Soc
         seen.push(*address);
     }
     Ok(seen)
+}
+
+/// The daemon log verbosity: the CLI layer on top of the config file's
+/// `log_level`.
+fn effective_log_level(
+    cli: Option<config::LogLevel>,
+    from_config: config::LogLevel,
+) -> config::LogLevel {
+    cli.unwrap_or(from_config)
 }
 
 impl Args {
@@ -118,16 +130,6 @@ impl Args {
             }
             (None, false) => Ok(None),
         }
-    }
-
-    /// Sandbox network policy for this daemon run.
-    fn network_mode(&self) -> config::NetworkMode {
-        self.network.unwrap_or(config::NetworkMode::Disabled)
-    }
-
-    /// Daemon log verbosity for this daemon run.
-    fn log_level(&self) -> config::LogLevel {
-        self.log_level.unwrap_or(config::LogLevel::Info)
     }
 }
 
@@ -194,18 +196,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let listen = match effective_listen(&args.listen) {
-        Ok(listen) => listen,
-        Err(message) => {
-            eprintln!("shbox: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(run(&args, listen)),
+        Ok(runtime) => runtime.block_on(run(&args)),
         Err(err) => Err(fail("building the async runtime", err)),
     };
     match result {
@@ -297,9 +292,15 @@ where
     }
 }
 
-/// Print the error chain to stderr for the operator.
+/// Print the error chain to stderr for the operator. Startup can fail before
+/// logging exists — the config file is one of logging's own inputs — so fall
+/// back to a plain stderr headline when no subscriber is installed.
 fn report(error: &BootstrapError) {
-    error!(step = error.step, "startup failed: {error}");
+    if logging::initialized() {
+        error!(step = error.step, "startup failed: {error}");
+    } else {
+        eprintln!("shbox: {error}");
+    }
     let mut cause = std::error::Error::source(error);
     while let Some(current) = cause {
         eprintln!("shbox: caused by: {current}");
@@ -308,13 +309,10 @@ fn report(error: &BootstrapError) {
 }
 
 /// Resolve and validate every local input, then serve SSH until shutdown.
-/// `listen`, `network`, and `log_level` arrive from the CLI and stay
-/// fixed for the process lifetime; the file config only carries file-backed
-/// policy.
-async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), BootstrapError> {
-    let network = args.network_mode();
-    logging::init(logging::level_filter(args.log_level()));
-
+/// The config file carries every setting, including the top-level operational
+/// ones; the CLI flags layer on top of `listen` and `log_level` only. All of
+/// them stay fixed for the process lifetime.
+async fn run(args: &Args) -> Result<(), BootstrapError> {
     let paths = paths::Paths::resolve().map_err(|err| fail("resolving XDG paths", err))?;
     paths
         .ensure()
@@ -323,6 +321,20 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
         lockfile::Locks::acquire(&paths).map_err(|err| fail("acquiring daemon locks", err))?;
     let app_config =
         config::Config::load_snapshot(&paths).map_err(|err| fail("loading configuration", err))?;
+
+    // The config file is a logging input (`log_level`), so the subscriber is
+    // installed only after the snapshot exists.
+    let listen =
+        effective_listen(args.listen.as_deref(), app_config.listen()).map_err(|message| {
+            fail(
+                "resolving the listen addresses",
+                std::io::Error::other(message),
+            )
+        })?;
+    logging::init(logging::level_filter(effective_log_level(
+        args.log_level,
+        app_config.log_level(),
+    )));
 
     let account =
         account::current_account().map_err(|err| fail("resolving the daemon account", err))?;
@@ -342,8 +354,7 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    let launch_policy =
-        platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell, network);
+    let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
     let (launcher, arapuca_launcher): (
         Arc<dyn platform::ProcessLauncher>,
         Option<Arc<platform::ArapucaLauncher>>,
@@ -393,9 +404,9 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
             "sandbox-only mode: no admin key is configured, the host selector has no recovery route"
         );
     }
-    if network == config::NetworkMode::Outbound {
+    if app_config.network() == config::NetworkMode::Outbound {
         warn!(
-            "--network outbound: sandbox network isolation is reduced; restrict reachability with a host firewall"
+            "sandbox.network = \"outbound\": sandbox network isolation is reduced; restrict reachability with a host firewall"
         );
     }
 
@@ -448,14 +459,7 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
             }
             signal = signals.recv() => match signal {
                 DaemonSignal::Reload => {
-                        match load_reload_snapshot(
-                            &paths,
-                            &current_config,
-                            &account,
-                            network,
-                        )
-                        .await
-                        {
+                        match load_reload_snapshot(&paths, &current_config, &account).await {
                         Ok(snapshot) => {
                             if let Some(launcher) = arapuca_launcher.as_ref()
                                 && let Err(error) = launcher.reload_policy(snapshot.policy.clone())
@@ -545,13 +549,16 @@ impl fmt::Display for ReloadError {
 impl std::error::Error for ReloadError {}
 
 /// Load and validate every reload input before publishing any part of it.
-/// Only file-backed policy participates: the CLI options and the built-in
-/// caps/limits are process-lifetime invariants a reload cannot touch.
+/// The top-level operational settings (`listen`, `log_level`) and the
+/// `[sandbox] network` mode are process-lifetime: a config file that changes
+/// any of them is rejected whole, keeping the previous snapshot, because only
+/// a restart can rebind the listener, re-resolve the verbosity, or re-select
+/// the sandbox network policy. The built-in caps/limits are equally
+/// process-lifetime invariants.
 async fn load_reload_snapshot(
     paths: &paths::Paths,
     previous: &config::Config,
     account: &account::Account,
-    network: config::NetworkMode,
 ) -> Result<ReloadSnapshot, ReloadError> {
     let paths = paths.clone();
     let previous = previous.clone();
@@ -564,6 +571,20 @@ async fn load_reload_snapshot(
                 "configuration file disappeared after a file-backed snapshot".into(),
             ));
         }
+        let lifetime_changed: Vec<&str> = [
+            (previous.listen() != config.listen()).then_some("listen"),
+            (previous.log_level() != config.log_level()).then_some("log_level"),
+            (previous.network() != config.network()).then_some("sandbox.network"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !lifetime_changed.is_empty() {
+            return Err(ReloadError(format!(
+                "process-lifetime settings changed in the config file ({}); restart the daemon to apply them",
+                lifetime_changed.join(", ")
+            )));
+        }
         let sandbox_shell = account
             .sandbox_shell(&config)
             .map_err(|error| ReloadError(format!("selecting the sandbox shell: {error}")))?;
@@ -573,7 +594,7 @@ async fn load_reload_snapshot(
             .map_err(|error| ReloadError(format!("resolving authorized_keys: {error}")))?;
         let auth = auth::AuthSnapshot::load(&host_path, paths.allowed_keys_file())
             .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
-        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell, network);
+        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell);
         Ok(ReloadSnapshot {
             config,
             auth,
@@ -635,33 +656,62 @@ mod tests {
     fn no_flags_requests_no_output_action() {
         let args = parse(&[]).expect("empty argv parses");
         assert_eq!(args.output_action().expect("no conflict"), None);
-        assert_eq!(args.network_mode(), config::NetworkMode::Disabled);
-        assert_eq!(args.log_level(), config::LogLevel::Info);
-        assert_eq!(
-            effective_listen(&args.listen).expect("default listener"),
-            vec![std::net::SocketAddr::from(([0, 0, 0, 0], 22))]
-        );
+        // Without the CLI layer the config file decides, including its
+        // defaults; the merge point asserts that in
+        // `cli_flags_layer_on_top_of_the_config_values`.
+        assert_eq!(args.listen, None);
+        assert_eq!(args.log_level, None);
     }
 
     #[test]
-    fn operational_cli_options_parse_and_reject_duplicate_listeners() {
+    fn cli_flags_layer_on_top_of_the_config_values() {
         let args = parse(&[
             "--listen",
             "127.0.0.1:2222",
             "--listen",
             "[::1]:2222",
-            "--network",
-            "outbound",
             "--log-level",
             "debug",
         ])
         .expect("operational options parse");
-        assert_eq!(args.network_mode(), config::NetworkMode::Outbound);
-        assert_eq!(args.log_level(), config::LogLevel::Debug);
-        assert_eq!(args.listen.len(), 2);
+        assert_eq!(args.log_level, Some(config::LogLevel::Debug));
+        let listen = args.listen.expect("listeners given");
+        assert_eq!(listen.len(), 2);
+
+        // The CLI layer wins over whatever the config file carries...
+        let from_config = [std::net::SocketAddr::from(([192, 168, 0, 1], 2200))];
+        assert_eq!(
+            effective_listen(Some(&listen), &from_config).expect("layered listen"),
+            listen
+        );
+        assert_eq!(
+            effective_log_level(Some(config::LogLevel::Debug), config::LogLevel::Info),
+            config::LogLevel::Debug
+        );
+        // ...and without the layer the config snapshot (already defaulted
+        // and validated) applies untouched.
+        assert_eq!(
+            effective_listen(None, &from_config).expect("config listen"),
+            from_config.to_vec()
+        );
+        assert_eq!(
+            effective_log_level(None, config::LogLevel::Warn),
+            config::LogLevel::Warn
+        );
+    }
+
+    #[test]
+    fn duplicate_cli_listeners_are_rejected() {
         let duplicate = parse(&["--listen", "127.0.0.1:2222", "--listen", "127.0.0.1:2222"])
             .expect("duplicate addresses parse before semantic validation");
-        assert!(effective_listen(&duplicate.listen).is_err());
+        let message = effective_listen(duplicate.listen.as_deref(), &config::default_listen())
+            .expect_err("duplicates rejected");
+        assert!(message.contains("duplicate --listen"), "{message}");
+    }
+
+    #[test]
+    fn retired_network_flag_is_rejected() {
+        assert!(parse(&["--network", "outbound"]).is_err());
     }
 
     #[test]

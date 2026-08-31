@@ -193,17 +193,18 @@ src/
 
 startup は概ね次の順序で行う。
 
-1. CLI を parse し、listener、network、log level を固定する。
+1. CLI を parse し、`listen` と `log_level` の上書き要求を保持する。
 2. XDG path を解決し、data の `registry.lock`、state の `lock` の順に non-blocking で取得する。
    どちらか一方でも失敗したら、取得済み lock を解放して起動を失敗させる。
-3. optional config を読み、file-backed policy を検証する。
-4. host authorized_keys と sandbox allowed_keys を読み、合成 authentication snapshot を検証する。
-5. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
-6. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
-7. 初期 authentication snapshot に Admin key があれば managed mode として扱い、listener を
+3. optional config を読み、file-backed policy とトップレベルの operational 設定を検証する。
+4. `listen` と `log_level` を config 値と CLI 層から確定し、logging を初期化する。
+5. host authorized_keys と sandbox allowed_keys を読み、合成 authentication snapshot を検証する。
+6. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
+7. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
+8. 初期 authentication snapshot に Admin key があれば managed mode として扱い、listener を
    全 address へ bind して `_` host route を有効にする。
-8. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
-9. sandbox operation を ready にする。sandbox-only mode では `_` host route だけを無効にする。
+9. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
+10. sandbox operation を ready にする。sandbox-only mode では `_` host route だけを無効にする。
 
 config file と各 key source は存在しなくてもよいが、合成 snapshot には少なくとも一つの
 valid Ed25519 key が必要である。host authorized_keys 由来の Admin key が一つ以上ある状態を
@@ -262,7 +263,7 @@ out-of-band access で調査・修復する。
 
 - sandbox workspace を process の `HOME` と初期 cwd にする。
 - configured sandbox shell、固定の managed environment、validated sandbox environment、
-  CLI network policy、read-only paths、built-in resource limits を shbox domain value から組み立てる。
+  `[sandbox] network` policy、read-only paths、built-in resource limits を shbox domain value から組み立てる。
 - workspace だけを sandbox 固有の read/write tree とする。
 - `Config.env` による `HOME` 上書きを使う現在の Arapuca behavior は固定 revision 上で
   Linux/macOS integration test を行い、上流の未固定契約として一般化しない。
@@ -352,9 +353,10 @@ reload の適用範囲は次のとおりである。
 
 - 新しい connection: 新しい auth/admin snapshot
 - 既存 connection: 認証時の principal/role を切断まで保持
-- 新しい process: 新しい shell/env/read path snapshot と、固定 CLI network/built-in limits
+- 新しい process: 新しい shell/env/read path snapshot と、不変の `[sandbox] network`/built-in limits
 - 実行中 process: 変更しない
-- CLI の log level、network、listener と built-in capacity/limits: 固定
+- `listen`、`log_level`、`[sandbox] network` と built-in capacity/limits: 固定。config file
+  でこれらを変えた SIGHUP は reload 全体を拒否する
 - host key、storage root、Arapuca backend: 固定、reload しない
 
 reload により最後の admin を削除して sandbox-only mode へ移行できる。既存 admin connection
