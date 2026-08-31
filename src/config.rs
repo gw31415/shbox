@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::Deserialize;
+use serde_with::{OneOrMany, serde_as};
 
 use crate::paths::{self, Paths};
 
@@ -614,21 +615,26 @@ impl Default for Caps {
 /// sandbox policy, which has no CLI mirror. `deny_unknown_fields` turns any
 /// other key — including the retired spellings `sandbox_shell`, top-level
 /// `read_paths`, `[sandbox_env]`, and top-level `network` — into an explicit
-/// configuration error.
+/// configuration error. Every string-array field also accepts a single bare
+/// string, read as a one-element array.
+#[serde_as]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
+    #[serde_as(as = "Option<OneOrMany<_>>")]
     listen: Option<Vec<String>>,
     log_level: Option<String>,
     sandbox: Option<RawSandbox>,
 }
 
 /// Schema-level view of the `[sandbox]` table.
+#[serde_as]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSandbox {
     shell: Option<String>,
     network: Option<String>,
+    #[serde_as(as = "Option<OneOrMany<_>>")]
     read_paths: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
 }
@@ -829,6 +835,26 @@ mod tests {
         assert!(message.contains("not a valid socket address"), "{message}");
         let message = build_err(r#"listen = ["127.0.0.1:2222", "127.0.0.1:2222"]"#);
         assert!(message.contains("duplicate listen address"), "{message}");
+    }
+
+    #[test]
+    fn string_array_fields_accept_a_single_bare_string() {
+        let config = build_ok(r#"listen = "127.0.0.1:2222""#);
+        assert_eq!(config.listen(), &[SocketAddr::from(([127, 0, 0, 1], 2222))]);
+        let config = build_ok("[sandbox]\nread_paths = \"/usr/share/terminfo\"");
+        assert_eq!(config.read_paths(), &[PathBuf::from("/usr/share/terminfo")]);
+    }
+
+    #[test]
+    fn string_array_fields_reject_non_string_values() {
+        let message = build_err("listen = 2222");
+        assert!(
+            message.contains("could not deserialize any variant"),
+            "{message}"
+        );
+        assert!(message.contains("expected a string"), "{message}");
+        let message = build_err("[sandbox]\nread_paths = [42]");
+        assert!(message.contains("invalid type: integer `42`"), "{message}");
     }
 
     #[test]

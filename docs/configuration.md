@@ -21,6 +21,9 @@ CLI はこのトップレベル項目にだけ存在し、`[sandbox]` 以下の�
 この例は全 target で使える field を示す。コメントは説明用であり、指定しない
 field は built-in default が適用される。`[sandbox] shell` や `[sandbox] read_paths`
 のような path は、設定ファイルに明示する場合は絶対 path でなければならない。
+文字列配列の項目（`listen`、`[sandbox] read_paths`）は、要素 1 つの配列の代わりに
+単一 string も受け付ける。`listen = "127.0.0.1:2222"` は
+`listen = ["127.0.0.1:2222"]` と同じであり、これ以外の型は parse error になる。
 
 ```toml
 # SSH listener の bind address 配列。省略時は ["0.0.0.0:22"]。
@@ -63,7 +66,9 @@ shbox --listen 127.0.0.1:2222 --log-level debug
 
 ### 3.1 `listen`
 
-SSH listener の bind address 配列で、default は `["0.0.0.0:22"]`。CLI `--listen` を一つでも
+SSH listener の bind address 配列で、default は `["0.0.0.0:22"]`。文字列配列項目共通の
+規則に従い、単一 string も受け付ける（`listen = "127.0.0.1:2222"` は
+`listen = ["127.0.0.1:2222"]` と同じ）。CLI `--listen` を一つでも
 指定すると config 値を完全に置き換え、repeat して複数 address を指定できる。複数指定時は
 すべての address を bind できた場合だけ起動を成功とし、一つでも失敗したら全体を失敗させる。
 `2222` などへの自動 fallback はない。IPv6 wildcard は `listen = ["[::]:22"]` または
@@ -122,7 +127,7 @@ config file 上で変えた SIGHUP は reload 全体を拒否する。変更に�
 
 ### 3.6 `[sandbox] read_paths`
 
-sandbox process が追加で read-only で参照できる絶対 path の配列である。default は空配列だが、実装は OS と Arapuca の実行に必要な system/runtime/TLS path を内部の curated set として追加する。利用者が指定した path は write permission を付与しない。
+sandbox process が追加で read-only で参照できる絶対 path の配列である。default は空配列だが、実装は OS と Arapuca の実行に必要な system/runtime/TLS path を内部の curated set として追加する。文字列配列項目共通の規則に従い、単一 string も受け付ける。利用者が指定した path は write permission を付与しない。
 
 各 path は startup/reload 時に存在を確認し、canonical absolute path に解決する。`~`、environment variable、relative path、NUL、重複、存在しない path は拒否する。shbox の state/data/private root、他 sandbox の workspace、管理用 lock/host-key path を追加 read path にすることも拒否する。通常の OS DAC が先に適用され、read path の指定によって権限が昇格することはない。
 
