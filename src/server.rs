@@ -14,7 +14,7 @@ use russh::server::{self, Config};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
-use crate::config::{Caps, Config as AppConfig};
+use crate::config::Caps;
 use russh::{MethodKind, MethodSet};
 
 use crate::ssh::ConnHandler;
@@ -23,10 +23,10 @@ use crate::ssh::ConnHandler;
 /// handled inside the handlers and never reach this type.
 pub type HandlerError = russh::Error;
 
-/// Connection admission counters for the configured caps.
+/// Connection admission counters for the built-in caps.
 #[derive(Debug)]
 pub struct Limiter {
-    caps: RwLock<Caps>,
+    caps: Caps,
     unauthenticated: AtomicUsize,
     total: AtomicUsize,
 }
@@ -34,22 +34,16 @@ pub struct Limiter {
 impl Limiter {
     pub fn new(caps: &Caps) -> Limiter {
         Limiter {
-            caps: RwLock::new(*caps),
+            caps: *caps,
             unauthenticated: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
         }
     }
 
-    /// Replace admission limits for future connections. Existing slots remain
-    /// valid, so lowering a cap never evicts an active connection.
-    pub fn reload_caps(&self, caps: &Caps) {
-        *self.caps.write().expect("connection limiter caps") = *caps;
-    }
-
     /// Reserve a connection slot, enforcing both caps atomically enough for
     /// the admission decision: a slot is only granted under both limits.
     pub fn admit(self: &Arc<Self>) -> Option<Arc<LimiterSlot>> {
-        let caps = *self.caps.read().expect("connection limiter caps");
+        let caps = self.caps;
         if !try_acquire(&self.total, caps.max_connections as usize) {
             return None;
         }
@@ -112,30 +106,25 @@ pub struct LimiterSlot {
     unauthenticated: AtomicBool,
 }
 
-/// Dynamic cap for host processes. The slot is held by exactly one host
+/// Built-in cap for host processes. The slot is held by exactly one host
 /// bridge, so a connection can open several independent channels without
-/// allowing the aggregate host-process count to exceed the current snapshot.
+/// allowing the aggregate host-process count to exceed the process default.
 #[derive(Debug)]
 pub(crate) struct HostProcessLimiter {
-    cap: RwLock<usize>,
+    cap: usize,
     in_flight: AtomicUsize,
 }
 
 impl HostProcessLimiter {
     pub(crate) fn new(caps: &Caps) -> HostProcessLimiter {
         HostProcessLimiter {
-            cap: RwLock::new(caps.max_host_processes as usize),
+            cap: caps.max_host_processes as usize,
             in_flight: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn reload_caps(&self, caps: &Caps) {
-        *self.cap.write().expect("host process cap") = caps.max_host_processes as usize;
-    }
-
     pub(crate) fn admit(self: &Arc<Self>) -> Option<HostProcessSlot> {
-        let cap = *self.cap.read().expect("host process cap");
-        if !try_acquire(&self.in_flight, cap) {
+        if !try_acquire(&self.in_flight, self.cap) {
             return None;
         }
         Some(HostProcessSlot {
@@ -272,23 +261,21 @@ pub struct SshServer {
     limiter: Arc<Limiter>,
     host_process_limiter: Arc<HostProcessLimiter>,
     host_tasks: Arc<HostTaskRegistry>,
+    caps: Caps,
 }
 
 impl SshServer {
     /// Build the server: the russh transport configuration derives from the
-    /// host key and the configured caps.
-    pub fn new(
-        shared: crate::ssh::Shared,
-        host_key: russh::keys::PrivateKey,
-        app_config: &AppConfig,
-    ) -> SshServer {
-        let caps = app_config.caps();
+    /// host key and the built-in caps.
+    pub fn new(shared: crate::ssh::Shared, host_key: russh::keys::PrivateKey) -> SshServer {
+        let caps = Caps::default();
         SshServer {
             shared: RwLock::new(shared),
             host_key,
-            limiter: Arc::new(Limiter::new(caps)),
-            host_process_limiter: Arc::new(HostProcessLimiter::new(caps)),
+            limiter: Arc::new(Limiter::new(&caps)),
+            host_process_limiter: Arc::new(HostProcessLimiter::new(&caps)),
             host_tasks: Arc::new(HostTaskRegistry::default()),
+            caps,
         }
     }
 
@@ -296,13 +283,6 @@ impl SshServer {
     /// Existing handlers already own a clone of the previous `Shared` value.
     pub(crate) fn reload(&self, shared: crate::ssh::Shared) {
         let mut current = self.shared.write().expect("server shared state");
-        // Keep the shared read lock across the admission decision. The
-        // limiter changes only after this writer lock is acquired, so a new
-        // connection cannot combine an old Shared snapshot with new caps (or
-        // vice versa) while SIGHUP is publishing the replacement.
-        shared.sandbox.reload_caps(*shared.config.caps());
-        self.limiter.reload_caps(shared.config.caps());
-        self.host_process_limiter.reload_caps(shared.config.caps());
         *current = shared;
     }
 
@@ -411,17 +391,15 @@ impl SshServer {
         if *shutdown.borrow() {
             return;
         }
-        let (shared, caps, slot) = {
+        let (shared, slot) = {
             let shared_guard = self.shared.read().expect("server shared state");
-            let caps = *shared_guard.config.caps();
             let Some(slot) = self.limiter.admit() else {
                 tracing::debug!(?peer, "connection cap reached; refusing connection");
                 return; // Dropping the stream is the resource-exhaustion refusal.
             };
-            // The guard is dropped before any await, but it covers the
-            // snapshot and admission decision as one reload boundary.
-            (shared_guard.clone(), caps, slot)
+            (shared_guard.clone(), slot)
         };
+        let caps = self.caps;
         let conn = Arc::new(crate::ssh::ConnState {
             principal: std::sync::Mutex::new(None),
             authenticated: Arc::new(Notify::new()),
@@ -601,32 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn reloaded_connection_caps_constrain_new_work_without_evicting_slots() {
-        let caps = Caps {
-            max_connections: 2,
-            max_unauthenticated_connections: 2,
-            ..Caps::default()
-        };
-        let limiter = limiter(&caps);
-        let first = limiter.admit().expect("first");
-        let second = limiter.admit().expect("second");
-        limiter.reload_caps(&Caps {
-            max_connections: 1,
-            max_unauthenticated_connections: 1,
-            ..Caps::default()
-        });
-
-        assert_eq!(limiter.in_flight(), (2, 2));
-        assert!(limiter.admit().is_none(), "reloaded cap affects new work");
-        drop(first);
-        assert_eq!(limiter.in_flight(), (1, 1));
-        assert!(limiter.admit().is_none(), "remaining slot fills the cap");
-        drop(second);
-        assert!(limiter.admit().is_some(), "released slots are reusable");
-    }
-
-    #[test]
-    fn host_process_cap_is_bounded_and_reload_does_not_evict_existing_slots() {
+    fn host_process_cap_is_bounded_without_evicting_existing_slots() {
         let caps = Caps {
             max_host_processes: 2,
             ..Caps::default()
@@ -635,22 +588,11 @@ mod tests {
         let first = limiter.admit().expect("first host process");
         let second = limiter.admit().expect("second host process");
         assert!(limiter.admit().is_none(), "host cap must be enforced");
-        let reduced = Caps {
-            max_host_processes: 1,
-            ..Caps::default()
-        };
-        limiter.reload_caps(&reduced);
         assert_eq!(limiter.in_flight(), 2);
-        assert!(limiter.admit().is_none(), "reloaded cap affects new work");
         drop(first);
         assert_eq!(limiter.in_flight(), 1);
-        assert!(
-            limiter.admit().is_none(),
-            "existing slot fills the reduced cap"
-        );
-        drop(second);
-        assert_eq!(limiter.in_flight(), 0);
         assert!(limiter.admit().is_some(), "released slot is reusable");
+        drop(second);
     }
 
     #[test]

@@ -16,7 +16,6 @@ use russh::{ChannelId, Pty};
 
 use crate::account::Account;
 use crate::auth::{AuthSnapshot, Principal, Role};
-use crate::config::Config;
 use crate::platform;
 use crate::sandbox::{SandboxId, SandboxManager};
 
@@ -27,7 +26,6 @@ use channel::{ChannelEvent, ChannelOperation, ChannelRegistry};
 #[derive(Debug, Clone)]
 pub(crate) struct Shared {
     pub auth: Arc<AuthSnapshot>,
-    pub config: Arc<Config>,
     pub account: Arc<Account>,
     pub sandbox: Arc<SandboxManager>,
 }
@@ -425,7 +423,7 @@ impl russh::server::Handler for ConnHandler {
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let cap = self.shared.config.caps().max_channels_per_connection as usize;
+        let cap = crate::config::Caps::default().max_channels_per_connection as usize;
         let id = channel.id();
         if !self.conn.registry.try_open(id, cap) {
             let _ = reply

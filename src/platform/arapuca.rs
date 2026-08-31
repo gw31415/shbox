@@ -98,13 +98,19 @@ impl Drop for LinuxScope {
 }
 
 impl ArapucaLaunchPolicy {
-    pub(crate) fn from_config(config: &Config, shell: impl Into<PathBuf>) -> Self {
+    /// Combine the file-backed config with the process-lifetime CLI network
+    /// policy and the built-in limits into one immutable launch snapshot.
+    pub(crate) fn from_config(
+        config: &Config,
+        shell: impl Into<PathBuf>,
+        network: NetworkMode,
+    ) -> Self {
         Self {
             shell: shell.into(),
-            network: config.network(),
+            network,
             read_paths: config.read_paths().to_vec(),
             sandbox_env: config.sandbox_env().clone(),
-            limits: *config.limits(),
+            limits: Limits::default(),
         }
     }
 
@@ -1015,7 +1021,11 @@ mod tests {
     #[test]
     fn profile_maps_the_shbox_policy_without_exposing_arapuca_options() {
         let config = crate::config::defaults();
-        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh");
+        let policy = ArapucaLaunchPolicy::from_config(
+            &config,
+            "/bin/sh",
+            crate::config::NetworkMode::Disabled,
+        );
         let directory = tempfile::tempdir().expect("workspace");
         let profile = policy.profile_for(directory.path());
 
@@ -1032,9 +1042,27 @@ mod tests {
     }
 
     #[test]
+    fn outbound_network_uses_the_baseline_profile() {
+        let config = crate::config::defaults();
+        let policy = ArapucaLaunchPolicy::from_config(
+            &config,
+            "/bin/sh",
+            crate::config::NetworkMode::Outbound,
+        );
+        let directory = tempfile::tempdir().expect("workspace");
+        let profile = policy.profile_for(directory.path());
+
+        assert_eq!(profile.seccomp_profile, ::arapuca::SeccompProfile::Baseline);
+    }
+
+    #[test]
     fn environment_is_workspace_scoped_and_deterministic() {
         let config = crate::config::defaults();
-        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh");
+        let policy = ArapucaLaunchPolicy::from_config(
+            &config,
+            "/bin/sh",
+            crate::config::NetworkMode::Disabled,
+        );
         let directory = tempfile::tempdir().expect("workspace");
         let env = policy.environment_for(directory.path(), None);
         assert_eq!(

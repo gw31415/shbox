@@ -111,6 +111,18 @@ impl TestDaemon {
     }
 
     fn start_with_config(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
+        Self::start_with_options(admin_keys, extra_config, false)
+    }
+
+    fn start_with_host_access(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
+        Self::start_with_options(admin_keys, extra_config, true)
+    }
+
+    fn start_with_options(
+        admin_keys: &[&str],
+        extra_config: &str,
+        all_authorized_keys_admin: bool,
+    ) -> TestDaemon {
         let root = ssh_tempdir();
         let config_dir = root.path().join("config/shbox");
         let data_dir = root.path().join("data/shbox");
@@ -147,7 +159,6 @@ impl TestDaemon {
             .collect();
         let mut config = String::new();
         let port = free_port();
-        config.push_str(&format!("listen = [\"127.0.0.1:{port}\"]\n"));
         config.push_str(&format!(
             "authorized_keys = {:?}\n",
             authorized_keys.display().to_string()
@@ -169,10 +180,17 @@ impl TestDaemon {
         )
         .expect("write ssh_config");
 
-        let child = Command::new(daemon_binary())
+        let mut daemon_command = Command::new(daemon_binary());
+        daemon_command
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_STATE_HOME", root.path().join("state"))
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{port}"));
+        if all_authorized_keys_admin {
+            daemon_command.arg("--authorized-keys-host-access");
+        }
+        let child = daemon_command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -218,22 +236,10 @@ impl TestDaemon {
         std::fs::write(&self.config_path, updated).expect("write config");
     }
 
-    /// Replace the listener address without changing the live socket.
-    fn set_listen(&self, port: u16) {
+    /// Add a retired listener field to exercise fail-closed reload parsing.
+    fn add_legacy_listen_field(&self, port: u16) {
         let current = std::fs::read_to_string(&self.config_path).expect("read config");
-        let replacement = format!("listen = [\"127.0.0.1:{port}\"]\n");
-        let mut updated = String::with_capacity(current.len());
-        let mut replaced = false;
-        for line in current.lines() {
-            if line.starts_with("listen = ") {
-                updated.push_str(&replacement);
-                replaced = true;
-            } else {
-                updated.push_str(line);
-                updated.push('\n');
-            }
-        }
-        assert!(replaced, "fixture config has no listen line");
+        let updated = format!("listen = [\"127.0.0.1:{port}\"]\n{current}");
         std::fs::write(&self.config_path, updated).expect("write config");
     }
 
@@ -765,6 +771,19 @@ fn normal_key_cannot_use_host_selector() {
         result.stderr
     );
     assert!(!result.stdout.contains("nope"));
+}
+
+/// The explicit CLI host-access policy promotes every authorized key,
+/// including a key absent from the configured admin subset, to the host role.
+#[test]
+fn authorized_key_host_access_flag_promotes_normal_key() {
+    let daemon = TestDaemon::start_with_host_access(&[], "");
+    let result = daemon.ssh(&daemon.normal_key, "_", "printf host-access", &["-T"]);
+    assert!(
+        result.ok(),
+        "host access flag did not promote key: {result:?}"
+    );
+    assert_eq!(result.stdout, "host-access");
 }
 
 /// Unknown keys are rejected; `none`/password/keyboard-interactive methods
@@ -1354,12 +1373,12 @@ fn sighup_admin_keys_update_new_connections_and_preserve_existing_role() {
     let _ = std::fs::remove_file(control_path);
 }
 
-/// A restart-only listener change rejects the whole reload, preserving the
-/// prior auth snapshot instead of applying only the other changed fields.
+/// A retired listener field rejects the whole reload, preserving the prior
+/// auth snapshot instead of applying only the other changed fields.
 #[test]
-fn sighup_listener_change_is_rejected_atomically() {
+fn sighup_retired_listener_field_is_rejected_atomically() {
     let daemon = TestDaemon::start(&["admin"]);
-    daemon.set_listen(free_port());
+    daemon.add_legacy_listen_field(free_port());
     daemon.set_admin_keys(&[]);
     daemon.reload();
 

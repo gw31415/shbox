@@ -2,8 +2,9 @@
 //! runtime snapshots.
 //!
 //! The v0.1 schema is exactly the one in `docs/configuration.md`: an optional
-//! `config.toml`, unknown fields rejected, no per-setting environment
-//! variables or CLI overrides, and no silent coercion of invalid values.
+//! `config.toml`, unknown fields rejected, and no silent coercion of invalid
+//! values. Process-lifetime operational settings and resource safety limits
+//! are intentionally outside this file.
 //! Parsing (schema) and validation (semantics that need the filesystem) are
 //! separate steps so that reload can reuse both independently.
 
@@ -12,7 +13,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -27,18 +27,17 @@ pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 
 /// Immutable, fully validated configuration snapshot.
+///
+/// Only file-backed policy lives here. Process-lifetime operational settings
+/// (`listen`, `network`, `log level`, host-access) are CLI options, and
+/// `Caps`/`Limits` are built-in constants.
 #[derive(Debug, Clone)]
 pub struct Config {
-    listen: Vec<SocketAddr>,
     authorized_keys: Option<PathBuf>,
     admin_keys: Vec<KeyFingerprint>,
     sandbox_shell: Option<PathBuf>,
-    network: NetworkMode,
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
-    limits: Limits,
-    caps: Caps,
-    log_level: LogLevel,
     loaded_from_file: bool,
 }
 
@@ -70,11 +69,6 @@ impl Config {
         }
     }
 
-    /// Listen addresses; empty is impossible (defaults are applied at build).
-    pub fn listen(&self) -> &[SocketAddr] {
-        &self.listen
-    }
-
     /// Configured authorized_keys path, when overridden.
     pub fn authorized_keys(&self) -> Option<&Path> {
         self.authorized_keys.as_deref()
@@ -95,10 +89,6 @@ impl Config {
         self.sandbox_shell.as_deref()
     }
 
-    pub fn network(&self) -> NetworkMode {
-        self.network
-    }
-
     /// Additional read-only subtrees for sandbox processes.
     pub fn read_paths(&self) -> &[PathBuf] {
         &self.read_paths
@@ -107,18 +97,6 @@ impl Config {
     /// Extra environment injected into every sandbox process.
     pub fn sandbox_env(&self) -> &BTreeMap<String, String> {
         &self.sandbox_env
-    }
-
-    pub fn limits(&self) -> &Limits {
-        &self.limits
-    }
-
-    pub fn caps(&self) -> &Caps {
-        &self.caps
-    }
-
-    pub fn log_level(&self) -> LogLevel {
-        self.log_level
     }
 
     /// Whether this snapshot came from a config file (drives the reload rule
@@ -178,51 +156,18 @@ fn parse_file(path: &Path) -> Result<RawConfig, Error> {
 
 /// Apply semantic validation that needs the filesystem context.
 pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
-    let listen = validate_listen(raw.listen.as_deref())?;
     let authorized_keys =
         validate_configured_path(raw.authorized_keys.as_deref(), "authorized_keys")?;
     let admin_keys = validate_admin_keys(raw.admin_keys.as_deref())?;
     let sandbox_shell = validate_configured_path(raw.sandbox_shell.as_deref(), "sandbox_shell")?;
-    let network = match raw.network.as_deref() {
-        None => NetworkMode::Disabled,
-        Some("disabled") => NetworkMode::Disabled,
-        Some("outbound") => NetworkMode::Outbound,
-        Some(other) => {
-            return Err(Error::Invalid {
-                field: "network",
-                message: format!("must be \"disabled\" or \"outbound\", got {other:?}"),
-            });
-        }
-    };
     let read_paths = validate_read_paths(raw.read_paths.as_deref(), paths)?;
     let sandbox_env = validate_sandbox_env(raw.sandbox_env.as_ref())?;
-    let limits = Limits::from_raw(raw.limits.as_ref())?;
-    let caps = Caps::from_raw(raw.caps.as_ref())?;
-    let log_level = match raw.log_level.as_deref() {
-        None => LogLevel::Info,
-        Some("error") => LogLevel::Error,
-        Some("warn") => LogLevel::Warn,
-        Some("info") => LogLevel::Info,
-        Some("debug") => LogLevel::Debug,
-        Some("trace") => LogLevel::Trace,
-        Some(other) => {
-            return Err(Error::Invalid {
-                field: "log_level",
-                message: format!("must be error, warn, info, debug, or trace, got {other:?}"),
-            });
-        }
-    };
     Ok(Config {
-        listen,
         authorized_keys,
         admin_keys,
         sandbox_shell,
-        network,
         read_paths,
         sandbox_env,
-        limits,
-        caps,
-        log_level,
         loaded_from_file: false,
     })
 }
@@ -242,31 +187,6 @@ fn default_paths() -> Paths {
         PathBuf::from("/usr/share/empty/data"),
         PathBuf::from("/usr/share/empty/state"),
     )
-}
-
-fn validate_listen(listen: Option<&[String]>) -> Result<Vec<SocketAddr>, Error> {
-    let list = listen.unwrap_or(&["0.0.0.0:22".to_string()]).to_vec();
-    if list.is_empty() {
-        return Err(Error::Invalid {
-            field: "listen",
-            message: "listen must not be empty".into(),
-        });
-    }
-    let mut addrs = Vec::with_capacity(list.len());
-    for raw in &list {
-        let addr: SocketAddr = raw.parse().map_err(|_| Error::Invalid {
-            field: "listen",
-            message: format!("invalid listen address {raw:?}"),
-        })?;
-        if addrs.contains(&addr) {
-            return Err(Error::Invalid {
-                field: "listen",
-                message: format!("duplicate listen address {addr}"),
-            });
-        }
-        addrs.push(addr);
-    }
-    Ok(addrs)
 }
 
 fn validate_configured_path(
@@ -506,15 +426,17 @@ const RESERVED_ENV_PREFIXES: &[&str] = &[
     "SHBOX_", "ARAPUCA_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
 ];
 
-/// Sandbox network policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sandbox network policy. Chosen on the command line at daemon start and
+/// never reloaded; the `ValueEnum` words are the CLI spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, usage_rs::ValueEnum)]
 pub enum NetworkMode {
     Disabled,
     Outbound,
 }
 
-/// Structured log verbosity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Structured log verbosity. Chosen on the command line at daemon start and
+/// never reloaded; the `ValueEnum` words are the CLI spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, usage_rs::ValueEnum)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -556,35 +478,6 @@ fn default_linux_limits() -> Option<LinuxLimits> {
 #[cfg(not(target_os = "linux"))]
 fn default_linux_limits() -> Option<LinuxLimits> {
     None
-}
-
-impl Limits {
-    fn from_raw(raw: Option<&RawLimits>) -> Result<Limits, Error> {
-        let raw = raw.cloned().unwrap_or_default();
-        let limits = Limits {
-            max_memory_mb: raw.max_memory_mb.unwrap_or(0),
-            cpu_timeout_secs: raw.cpu_timeout_secs.unwrap_or(0),
-            max_file_size_mb: raw.max_file_size_mb.unwrap_or(0),
-            max_open_files: raw.max_open_files.unwrap_or(1024),
-            linux: default_linux_limits(),
-        };
-        #[cfg(target_os = "linux")]
-        let limits = Limits {
-            linux: Some(match raw.linux {
-                Some(linux) => LinuxLimits {
-                    max_cpu_pct: linux
-                        .max_cpu_pct
-                        .unwrap_or(limits.linux.unwrap_or_default().max_cpu_pct),
-                    max_pids: linux
-                        .max_pids
-                        .unwrap_or(limits.linux.unwrap_or_default().max_pids),
-                },
-                None => limits.linux.unwrap_or_default(),
-            }),
-            ..limits
-        };
-        Ok(limits)
-    }
 }
 
 /// Linux-only cgroup limits (`[limits.linux]`); `0` means "no limit".
@@ -633,110 +526,17 @@ impl Default for Caps {
     }
 }
 
-impl Caps {
-    fn from_raw(raw: Option<&RawCaps>) -> Result<Caps, Error> {
-        let raw = raw.cloned().unwrap_or_default();
-        let defaults = Caps::default();
-        let caps = Caps {
-            max_unauthenticated_connections: raw
-                .max_unauthenticated_connections
-                .unwrap_or(defaults.max_unauthenticated_connections),
-            max_connections: raw.max_connections.unwrap_or(defaults.max_connections),
-            max_channels_per_connection: raw
-                .max_channels_per_connection
-                .unwrap_or(defaults.max_channels_per_connection),
-            max_sandbox_processes: raw
-                .max_sandbox_processes
-                .unwrap_or(defaults.max_sandbox_processes),
-            max_host_processes: raw
-                .max_host_processes
-                .unwrap_or(defaults.max_host_processes),
-            max_auth_attempts: raw.max_auth_attempts.unwrap_or(defaults.max_auth_attempts),
-            max_sandboxes: raw.max_sandboxes.unwrap_or(defaults.max_sandboxes),
-            max_sandboxes_per_owner: raw
-                .max_sandboxes_per_owner
-                .unwrap_or(defaults.max_sandboxes_per_owner),
-            handshake_timeout_secs: raw
-                .handshake_timeout_secs
-                .unwrap_or(defaults.handshake_timeout_secs),
-        };
-        for (name, value) in [
-            (
-                "max_unauthenticated_connections",
-                caps.max_unauthenticated_connections,
-            ),
-            ("max_connections", caps.max_connections),
-            (
-                "max_channels_per_connection",
-                caps.max_channels_per_connection,
-            ),
-            ("max_sandbox_processes", caps.max_sandbox_processes),
-            ("max_host_processes", caps.max_host_processes),
-            ("max_auth_attempts", caps.max_auth_attempts),
-            ("max_sandboxes", caps.max_sandboxes),
-            ("max_sandboxes_per_owner", caps.max_sandboxes_per_owner),
-            ("handshake_timeout_secs", caps.handshake_timeout_secs),
-        ] {
-            if value == 0 {
-                return Err(Error::Invalid {
-                    field: "caps",
-                    message: format!("caps.{name} must be at least 1"),
-                });
-            }
-        }
-        Ok(caps)
-    }
-}
-
-/// Schema-level view of the TOML document.
+/// Schema-level view of the TOML document. `listen`, `network`, and
+/// `log_level` were removed in favor of CLI options; `deny_unknown_fields`
+/// turns any leftover copy of them into an explicit configuration error.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
-    listen: Option<Vec<String>>,
     authorized_keys: Option<String>,
     admin_keys: Option<Vec<String>>,
     sandbox_shell: Option<String>,
-    network: Option<String>,
     read_paths: Option<Vec<String>>,
-    log_level: Option<String>,
     sandbox_env: Option<BTreeMap<String, String>>,
-    limits: Option<RawLimits>,
-    caps: Option<RawCaps>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawLimits {
-    max_memory_mb: Option<u64>,
-    cpu_timeout_secs: Option<u64>,
-    max_file_size_mb: Option<u64>,
-    max_open_files: Option<u64>,
-    /// Present in the schema on Linux only; a macOS config carrying this
-    /// table is rejected as an unknown field.
-    #[cfg(target_os = "linux")]
-    linux: Option<RawLinuxLimits>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawLinuxLimits {
-    max_cpu_pct: Option<u32>,
-    max_pids: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawCaps {
-    max_unauthenticated_connections: Option<u32>,
-    max_connections: Option<u32>,
-    max_channels_per_connection: Option<u32>,
-    max_sandbox_processes: Option<u32>,
-    max_host_processes: Option<u32>,
-    max_auth_attempts: Option<u32>,
-    max_sandboxes: Option<u32>,
-    max_sandboxes_per_owner: Option<u32>,
-    handshake_timeout_secs: Option<u32>,
 }
 
 /// Configuration errors.
@@ -823,103 +623,99 @@ mod tests {
     fn missing_file_uses_builtin_defaults() {
         let (_home, paths) = test_paths();
         let config = Config::load_snapshot(&paths).expect("defaults");
-        assert_eq!(config.listen(), &[SocketAddr::from(([0, 0, 0, 0], 22))]);
         assert!(config.admin_keys().is_empty());
         assert!(!config.managed_mode());
-        assert_eq!(config.network(), NetworkMode::Disabled);
-        assert_eq!(config.log_level(), LogLevel::Info);
-        assert_eq!(config.caps(), &Caps::default());
-        assert_eq!(config.limits(), &Limits::default());
         assert!(!config.loaded_from_file());
     }
 
     #[test]
+    fn present_empty_file_uses_builtin_policy() {
+        let (_home, paths) = test_paths();
+        std::fs::write(paths.config_file(), "").expect("write empty config");
+        let config = Config::load_snapshot(&paths).expect("empty config");
+        assert!(config.loaded_from_file());
+        assert!(config.admin_keys().is_empty());
+        assert!(!config.managed_mode());
+        assert!(config.read_paths().is_empty());
+        assert!(config.sandbox_env().is_empty());
+    }
+
+    #[test]
     fn defaults_match_documented_values() {
-        let config = defaults();
-        assert_eq!(config.limits().max_open_files, 1024);
+        let limits = Limits::default();
+        assert_eq!(limits.max_open_files, 1024);
         // The Linux cgroup table only exists on Linux targets.
-        assert_eq!(config.limits().linux.is_some(), cfg!(target_os = "linux"));
+        assert_eq!(limits.linux.is_some(), cfg!(target_os = "linux"));
         #[cfg(target_os = "linux")]
         assert_eq!(
-            config.limits().linux,
+            limits.linux,
             Some(LinuxLimits {
                 max_cpu_pct: 0,
                 max_pids: 256
             })
         );
-        assert_eq!(config.caps().max_unauthenticated_connections, 32);
-        assert_eq!(config.caps().max_connections, 128);
-        assert_eq!(config.caps().max_channels_per_connection, 16);
-        assert_eq!(config.caps().max_sandbox_processes, 128);
-        assert_eq!(config.caps().max_host_processes, 16);
-        assert_eq!(config.caps().max_auth_attempts, 6);
-        assert_eq!(config.caps().max_sandboxes, 1024);
-        assert_eq!(config.caps().max_sandboxes_per_owner, 128);
-        assert_eq!(config.caps().handshake_timeout_secs, 30);
+        let caps = Caps::default();
+        assert_eq!(caps.max_unauthenticated_connections, 32);
+        assert_eq!(caps.max_connections, 128);
+        assert_eq!(caps.max_channels_per_connection, 16);
+        assert_eq!(caps.max_sandbox_processes, 128);
+        assert_eq!(caps.max_host_processes, 16);
+        assert_eq!(caps.max_auth_attempts, 6);
+        assert_eq!(caps.max_sandboxes, 1024);
+        assert_eq!(caps.max_sandboxes_per_owner, 128);
+        assert_eq!(caps.handshake_timeout_secs, 30);
     }
 
     #[test]
     fn full_document_parses() {
         let config = build_ok(
             r#"
-            listen = ["127.0.0.1:2222", "[::1]:2222"]
             authorized_keys = "/etc/shbox/authorized_keys"
             admin_keys = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]
             sandbox_shell = "/bin/bash"
-            network = "outbound"
             read_paths = ["/usr/share/terminfo"]
-            log_level = "debug"
 
             [sandbox_env]
             LANG = "C.UTF-8"
             EDITOR_DEFAULT = "vi"
-
-            [limits]
-            max_memory_mb = 512
-            cpu_timeout_secs = 3600
-            max_file_size_mb = 100
-            max_open_files = 256
-
-            [caps]
-            max_connections = 64
             "#,
         );
-        assert_eq!(config.listen().len(), 2);
-        assert_eq!(config.network(), NetworkMode::Outbound);
         assert_eq!(config.admin_keys().len(), 1);
         assert_eq!(config.read_paths().len(), 1);
         assert_eq!(
             config.sandbox_env().get("LANG").map(String::as_str),
             Some("C.UTF-8")
         );
-        assert_eq!(config.limits().max_memory_mb, 512);
-        assert_eq!(config.caps().max_connections, 64);
+    }
+
+    #[test]
+    fn rejects_operational_fields_moved_to_the_cli() {
+        for text in [
+            r#"listen = ["127.0.0.1:2222"]"#,
+            r#"network = "outbound""#,
+            r#"log_level = "debug""#,
+        ] {
+            let message = build_err(text);
+            assert!(message.contains("unknown field"), "{text}: {message}");
+        }
     }
 
     #[test]
     fn rejects_unknown_fields_and_bad_types() {
         let message = build_err("unknown_field = 1");
         assert!(message.contains("unknown field"), "{message}");
-        let message = build_err("listen = 22");
-        assert!(message.contains("invalid type"), "{message}");
-        let message = build_err("caps = { max_connections = -1 }");
-        assert!(!message.is_empty());
-        let message = build_err("limits = { max_memory_mb = 1.5 }");
-        assert!(message.contains("invalid type"), "{message}");
+        for text in [
+            "caps = { max_connections = 1 }",
+            "limits = { max_memory_mb = 1 }",
+        ] {
+            let message = build_err(text);
+            assert!(message.contains("unknown field"), "{text}: {message}");
+        }
     }
 
     #[test]
     fn rejects_malformed_toml() {
         assert!(toml::from_str::<RawConfig>("listen = [").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_duplicate_and_invalid_listen() {
-        assert!(build_err("listen = []").contains("must not be empty"));
-        let message = build_err(r#"listen = ["127.0.0.1:2222", "127.0.0.1:2222"]"#);
-        assert!(message.contains("duplicate"), "{message}");
-        assert!(build_err(r#"listen = ["not an address"]"#).contains("invalid listen address"));
-        assert!(build_err(r#"listen = ["127.0.0.1"]"#).contains("invalid listen address"));
     }
 
     #[test]
@@ -941,16 +737,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_network_and_log_level() {
-        assert!(build_err(r#"network = "tunnel""#).contains("disabled"));
-        assert!(build_err(r#"log_level = "loud""#).contains("trace"));
+    fn value_enum_words_match_the_cli_contract() {
+        // The CLI spellings are part of the contract; keep the enum variants
+        // mapped to the documented words.
+        use usage_rs::spec::ValueEnum;
         assert_eq!(
-            build_ok(r#"network = "disabled""#).network(),
-            NetworkMode::Disabled
+            <NetworkMode as ValueEnum>::CHOICES,
+            &["disabled", "outbound"]
         );
         assert_eq!(
-            build_ok(r#"log_level = "trace""#).log_level(),
-            LogLevel::Trace
+            <LogLevel as ValueEnum>::CHOICES,
+            &["error", "warn", "info", "debug", "trace"]
         );
     }
 
@@ -1046,46 +843,6 @@ mod tests {
             build_ok(&format!("[sandbox_env]\nBIG = \"{ok}\""))
                 .sandbox_env()
                 .contains_key("BIG")
-        );
-    }
-
-    #[test]
-    fn caps_reject_zero_but_accept_positive() {
-        let message = build_err("[caps]\nmax_connections = 0");
-        assert!(message.contains("at least 1"), "{message}");
-        assert!(build_err("[caps]\nhandshake_timeout_secs = 0").contains("at least 1"));
-        assert!(
-            build_ok("[caps]\nmax_connections = 1")
-                .caps()
-                .max_connections
-                == 1
-        );
-    }
-
-    #[test]
-    fn limits_accept_zero_as_unlimited() {
-        let config = build_ok("[limits]\nmax_memory_mb = 0\nmax_open_files = 0\n");
-        assert_eq!(config.limits().max_memory_mb, 0);
-        assert_eq!(config.limits().max_open_files, 0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linux_limits_table_is_rejected_on_macos() {
-        let message = build_err("[limits.linux]\nmax_pids = 128");
-        assert!(message.contains("unknown field"), "{message}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_limits_table_is_accepted_on_linux() {
-        let config = build_ok("[limits.linux]\nmax_cpu_pct = 50\n");
-        assert_eq!(
-            config.limits().linux,
-            Some(LinuxLimits {
-                max_cpu_pct: 50,
-                max_pids: 256
-            })
         );
     }
 

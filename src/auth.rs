@@ -358,6 +358,7 @@ pub enum Role {
 pub struct AuthSnapshot {
     keys: Vec<AuthorizedKey>,
     admin: std::collections::BTreeSet<KeyFingerprint>,
+    all_authorized_keys_admin: bool,
 }
 
 impl AuthSnapshot {
@@ -434,10 +435,13 @@ impl AuthSnapshot {
     }
 
     /// Load and validate the full authentication snapshot: authorized keys
-    /// plus the admin subset from configuration.
+    /// plus the admin subset from configuration. When the CLI host-access
+    /// policy is enabled, every authorized key receives the admin role while
+    /// the configured subset is still validated.
     pub fn load(
         authorized_keys_path: &Path,
         admin_keys: &[KeyFingerprint],
+        all_authorized_keys_admin: bool,
     ) -> Result<AuthSnapshot, Error> {
         validate_authorized_keys_file(authorized_keys_path)?;
         let bytes = read_authorized_keys(authorized_keys_path).map_err(|err| match err {
@@ -466,7 +470,11 @@ impl AuthSnapshot {
             }
             admin.insert(fingerprint.clone());
         }
-        Ok(AuthSnapshot { keys, admin })
+        Ok(AuthSnapshot {
+            keys,
+            admin,
+            all_authorized_keys_admin,
+        })
     }
 
     /// Look up an authenticated key and derive its role.
@@ -479,7 +487,7 @@ impl AuthSnapshot {
             .iter()
             .any(|entry| entry.fingerprint == candidate)
             .then(|| {
-                let role = if self.admin.contains(&candidate) {
+                let role = if self.all_authorized_keys_admin || self.admin.contains(&candidate) {
                     Role::Admin
                 } else {
                     Role::Normal
@@ -498,7 +506,11 @@ impl AuthSnapshot {
     }
 
     pub fn admin_count(&self) -> usize {
-        self.admin.len()
+        if self.all_authorized_keys_admin {
+            self.keys.len()
+        } else {
+            self.admin.len()
+        }
     }
 }
 
@@ -584,16 +596,22 @@ mod tests {
         };
         std::fs::write(&path, format!("{line_a}\n{line_b}\n")).expect("write");
 
-        let snapshot = AuthSnapshot::load(&path, std::slice::from_ref(&fp_a)).expect("load");
+        let snapshot = AuthSnapshot::load(&path, std::slice::from_ref(&fp_a), false).expect("load");
         assert_eq!(snapshot.keys().len(), 2);
         assert_eq!(snapshot.admin_count(), 1);
         assert_eq!(snapshot.authenticate(&key_a).unwrap().role, Role::Admin);
         assert_eq!(snapshot.authenticate(&key_b).unwrap().role, Role::Normal);
 
+        let host_access = AuthSnapshot::load(&path, &[], true).expect("host access load");
+        assert_eq!(host_access.admin_count(), 2);
+        assert_eq!(host_access.authenticate(&key_a).unwrap().role, Role::Admin);
+        assert_eq!(host_access.authenticate(&key_b).unwrap().role, Role::Admin);
+
         // An admin fingerprint absent from authorized_keys is a config error.
         let (line_c, fp_c) = generated_key();
         std::fs::write(home.path().join("c"), &line_c).expect("write c");
-        assert!(AuthSnapshot::load(&path, std::slice::from_ref(&fp_c)).is_err());
+        assert!(AuthSnapshot::load(&path, std::slice::from_ref(&fp_c), false).is_err());
+        assert!(AuthSnapshot::load(&path, std::slice::from_ref(&fp_c), true).is_err());
     }
 
     #[test]
@@ -602,7 +620,7 @@ mod tests {
         let path = home.path().join("authorized_keys");
         let (line_a, fp_a) = generated_key();
         std::fs::write(&path, &line_a).expect("write");
-        let snapshot = AuthSnapshot::load(&path, &[]).expect("load");
+        let snapshot = AuthSnapshot::load(&path, &[], false).expect("load");
         let (foreign_line, _) = generated_key();
         let foreign_key = russh::keys::PublicKey::from_openssh(&foreign_line).expect("parse");
         assert!(snapshot.authenticate(&foreign_key).is_none());

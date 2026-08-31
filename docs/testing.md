@@ -81,10 +81,13 @@ sandbox-exec --version
 - host selector は `_` のみ。通常 key の `_` 認証、admin 以外の host shell/exec、通常 key の全件 list を拒否する。
 - public-key authentication は Ed25519 のみ。none/password/keyboard-interactive と未知 key algorithm を拒否する。
 - authorized_keys の blank/comment は無視し、options、certificate、malformed/unsupported line は設定エラーとする。
-- admin fingerprint は authorized key と一致する必要があり、重複指定は設定エラーとする。admin 配列が空でも起動できるが、その場合は sandbox-only mode とする。
+- admin fingerprint は authorized key と一致する必要があり、重複指定は設定エラーとする。
+  admin 配列が空でも起動できるが、`--authorized-keys-host-access` が無ければ sandbox-only
+  mode とする。flag を指定した場合は全 authorized key の host access を検証する。
 - config file は任意。欠落時は built-in default、存在時は typed TOML の unknown field/型/範囲エラーを拒否する。SIGHUP の失敗は旧設定を保持する。
 - managed env、`ARAPUCA_*`、loader injection、NUL、非 UTF-8、4 KiB 超の environment value を拒否する。client の env request は Sandbox に渡さない。
-- `network = "disabled" | "outbound"` 以外、未対応 OS limit の指定、負数・型範囲外の limit、listen の重複を拒否する。
+- `--network disabled|outbound`、`--log-level error|warn|info|debug|trace` の enum 以外、
+  `--listen` の重複、config file の operational option/resource cap/limit field を拒否する。
 
 ### 4.2 Metadata と lifecycle
 
@@ -286,12 +289,14 @@ admin key で `ssh _@host` の shell、remote exec、PTY、resize、signal を�
 
 ### 8.2 Reload
 
-- SIGHUP で authorized_keys、admin_keys、shell、Sandbox env、network、read paths、limits、caps が atomic に更新される。
+- SIGHUP で authorized_keys、admin_keys、shell、Sandbox env、read paths だけが atomic に更新
+  される。CLI の listener/network/log-level/host-access と built-in limits/caps は変わらない。
 - config 無しの defaults で起動した後に config file を作ると valid SIGHUP で採用される。一度
   file を採用した後に削除すると reload failure になり、旧 snapshot を保持する。
 - 新しい connection/process には新設定、既存 connection には元の role/rights を適用する。
 - 認証ファイル/config が壊れている、または使用中の config が消えた場合は旧設定を保持する。最後の admin を削除する valid reload は適用し、sandbox-only mode に遷移する。
-- listen socket は reload せず、変更には restart を要求する。
+- listen socket は reload せず、CLI の変更には restart を要求する。旧 field を config に追加した
+  reload は unknown field として拒否する。
 - admin を削除しても既存 admin connection は disconnect まで維持し、新規 admin connection は拒否する。
 
 ### 8.3 Hostile input

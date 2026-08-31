@@ -106,7 +106,7 @@ struct Ledger {
 #[derive(Debug)]
 pub(crate) struct SandboxManager {
     storage: Storage,
-    caps: Mutex<Caps>,
+    caps: Caps,
     launcher: Arc<dyn ProcessLauncher>,
     ledger: Mutex<Ledger>,
     runtime_changed: std::sync::Condvar,
@@ -176,7 +176,7 @@ impl SandboxManager {
             Storage::with_faults(paths.sandboxes_root(), faults).map_err(Error::Storage)?;
         let manager = SandboxManager {
             storage,
-            caps: Mutex::new(caps),
+            caps,
             launcher,
             ledger: Mutex::new(Ledger::default()),
             runtime_changed: std::sync::Condvar::new(),
@@ -191,13 +191,6 @@ impl SandboxManager {
     pub(crate) fn reconcile_startup(&self) {
         self.reconcile_deleting();
         self.ready.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Replace the caps used for future claims and launches. Existing
-    /// sandboxes and processes are intentionally not evicted when a reload
-    /// lowers a limit; the new snapshot only constrains new work.
-    pub(crate) fn reload_caps(&self, caps: Caps) {
-        *self.caps.lock().expect("sandbox caps") = caps;
     }
 
     /// Atomically claim an ID for the principal, creating its workspace only
@@ -399,11 +392,7 @@ impl SandboxManager {
         if metadata.state() != State::Active || metadata.owner() != handle.owner() {
             return Err(Error::Unavailable);
         }
-        let max_sandbox_processes = self
-            .caps
-            .lock()
-            .expect("sandbox caps")
-            .max_sandbox_processes as usize;
+        let max_sandbox_processes = self.caps.max_sandbox_processes as usize;
         if ledger.runtime.len() >= max_sandbox_processes {
             return Err(Error::Limit("max_sandbox_processes"));
         }
@@ -845,7 +834,7 @@ impl SandboxManager {
 
     fn reserve_sandbox(&self, owner: &KeyFingerprint) -> Result<(), Error> {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
-        let caps = *self.caps.lock().expect("sandbox caps");
+        let caps = self.caps;
         if ledger
             .records
             .len()
@@ -1571,41 +1560,6 @@ mod tests {
         ));
         first.process.control.terminate();
         manager.clear_runtime(&first.lease);
-        assert_eq!(manager.runtime_count(), 0);
-    }
-
-    #[test]
-    fn reloaded_sandbox_process_cap_only_constrains_new_launches() {
-        let launcher = FakeLauncher::default();
-        let caps = Caps {
-            max_sandbox_processes: 2,
-            ..Caps::default()
-        };
-        let (_root, manager) = manager_with_fake(caps, &launcher);
-        let owner = principal('A', Role::Normal);
-        let id = SandboxId::parse("dev").expect("id");
-        let handle = manager.claim(&owner, &id).expect("claim");
-        let first = manager
-            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
-            .expect("first launch");
-        let second = manager
-            .launch_handle(&handle, platform::LaunchOperation::Shell, None)
-            .expect("second launch");
-
-        manager.reload_caps(Caps {
-            max_sandbox_processes: 1,
-            ..Caps::default()
-        });
-        assert_eq!(manager.runtime_count(), 2);
-        assert!(matches!(
-            manager.launch_handle(&handle, platform::LaunchOperation::Shell, None),
-            Err(Error::Limit("max_sandbox_processes"))
-        ));
-
-        first.process.control.terminate();
-        second.process.control.terminate();
-        manager.clear_runtime(&first.lease);
-        manager.clear_runtime(&second.lease);
         assert_eq!(manager.runtime_count(), 0);
     }
 

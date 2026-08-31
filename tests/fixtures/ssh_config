@@ -4,8 +4,7 @@
 #
 #   1. Start a daemon with an isolated XDG tree and a test listener, e.g.
 #        XDG_CONFIG_HOME=$TMP/config XDG_DATA_HOME=$TMP/data \
-#        XDG_STATE_HOME=$TMP/state shbox
-#      with config.toml pointing listen at a free port.
+#        XDG_STATE_HOME=$TMP/state shbox --listen 127.0.0.1:$PORT
 #   2. Replace the Port below with that port, or pass -p on the command line:
 #
 #   ssh -F tests/fixtures/ssh_config -i $ADMIN_KEY -p $PORT _@127.0.0.1 'printf host-ok'

@@ -29,7 +29,6 @@ use std::os::unix::process::CommandExt;
 
 use crate::auth::KeyFingerprint;
 
-use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, warn};
 
 /// Foreground SSH daemon mapping authenticated keys onto persistent sandbox
@@ -38,10 +37,26 @@ use tracing::{debug, error, info, warn};
 /// The command line has no subcommands: `parse` is the process entry.
 /// `--help`/`--version` print and exit 0, parse failures print to stderr and
 /// exit non-zero. `--completions`/`--man` print their artifact and exit
-/// without touching any daemon input.
+/// without touching any daemon input. The operational options
+/// (`--listen`, `--network`, `--log-level`) are process-lifetime: SIGHUP
+/// never re-reads them, and the file config has no say in them.
 #[derive(usage_rs::Cli)]
 #[usage(bin = "shbox", version, completion)]
 struct Args {
+    /// SSH listener address; repeat the flag for additional listeners.
+    /// Defaults to 0.0.0.0:22.
+    #[usage(long, value_name = "ADDR")]
+    listen: Vec<std::net::SocketAddr>,
+    /// Sandbox network policy for every sandbox process. Defaults to
+    /// disabled.
+    #[usage(long, value_name = "MODE", value_enum)]
+    network: Option<config::NetworkMode>,
+    /// Daemon log verbosity. Defaults to info.
+    #[usage(long, value_name = "LEVEL", value_enum)]
+    log_level: Option<config::LogLevel>,
+    /// Treat every authorized key as an admin key, including host access.
+    #[usage(long)]
+    authorized_keys_host_access: bool,
     /// Print a completion script for SHELL on stdout and exit.
     #[usage(long, value_name = "SHELL", value_enum)]
     completions: Option<CompletionShell>,
@@ -80,6 +95,23 @@ enum OutputAction {
     Man,
 }
 
+/// The listener addresses the daemon binds, with the default applied.
+/// All-or-nothing binding stays the binding-time rule; this only normalizes
+/// the CLI input.
+fn effective_listen(listen: &[std::net::SocketAddr]) -> Result<Vec<std::net::SocketAddr>, String> {
+    if listen.is_empty() {
+        return Ok(vec![std::net::SocketAddr::from(([0, 0, 0, 0], 22))]);
+    }
+    let mut seen = Vec::with_capacity(listen.len());
+    for address in listen {
+        if seen.contains(address) {
+            return Err(format!("duplicate --listen address {address}"));
+        }
+        seen.push(*address);
+    }
+    Ok(seen)
+}
+
 impl Args {
     /// Resolve the requested output action, rejecting conflicting requests.
     fn output_action(&self) -> Result<Option<OutputAction>, String> {
@@ -91,6 +123,16 @@ impl Args {
             }
             (None, false) => Ok(None),
         }
+    }
+
+    /// Sandbox network policy for this daemon run.
+    fn network_mode(&self) -> config::NetworkMode {
+        self.network.unwrap_or(config::NetworkMode::Disabled)
+    }
+
+    /// Daemon log verbosity for this daemon run.
+    fn log_level(&self) -> config::LogLevel {
+        self.log_level.unwrap_or(config::LogLevel::Info)
     }
 }
 
@@ -157,11 +199,18 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    let listen = match effective_listen(&args.listen) {
+        Ok(listen) => listen,
+        Err(message) => {
+            eprintln!("shbox: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(runtime) => runtime.block_on(run()),
+        Ok(runtime) => runtime.block_on(run(&args, listen)),
         Err(err) => Err(fail("building the async runtime", err)),
     };
     match result {
@@ -264,10 +313,12 @@ fn report(error: &BootstrapError) {
 }
 
 /// Resolve and validate every local input, then serve SSH until shutdown.
-async fn run() -> Result<(), BootstrapError> {
-    // Logging starts at info so early failures are visible; the configured
-    // level replaces it as soon as the config snapshot exists.
-    let logging = logging::init(LevelFilter::INFO);
+/// `listen`, `network`, and `log_level` arrive from the CLI and stay
+/// fixed for the process lifetime; the file config only carries file-backed
+/// policy.
+async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), BootstrapError> {
+    let network = args.network_mode();
+    logging::init(logging::level_filter(args.log_level()));
 
     let paths = paths::Paths::resolve().map_err(|err| fail("resolving XDG paths", err))?;
     paths
@@ -277,7 +328,6 @@ async fn run() -> Result<(), BootstrapError> {
         lockfile::Locks::acquire(&paths).map_err(|err| fail("acquiring daemon locks", err))?;
     let app_config =
         config::Config::load_snapshot(&paths).map_err(|err| fail("loading configuration", err))?;
-    logging.set_level(logging::level_filter(app_config.log_level()));
 
     let account =
         account::current_account().map_err(|err| fail("resolving the daemon account", err))?;
@@ -294,12 +344,18 @@ async fn run() -> Result<(), BootstrapError> {
         .map_err(|err| fail("resolving authorized_keys", err))?;
     auth::validate_authorized_keys_file(&authorized_keys)
         .map_err(|err| fail("validating authorized_keys", err))?;
-    let auth_snapshot = auth::AuthSnapshot::load(&authorized_keys, app_config.admin_keys())
-        .map_err(|err| fail("loading the authentication snapshot", err))?;
+    let all_authorized_keys_admin = args.authorized_keys_host_access;
+    let auth_snapshot = auth::AuthSnapshot::load(
+        &authorized_keys,
+        app_config.admin_keys(),
+        all_authorized_keys_admin,
+    )
+    .map_err(|err| fail("loading the authentication snapshot", err))?;
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
+    let launch_policy =
+        platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell, network);
     let (launcher, arapuca_launcher): (
         Arc<dyn platform::ProcessLauncher>,
         Option<Arc<platform::ArapucaLauncher>>,
@@ -317,27 +373,28 @@ async fn run() -> Result<(), BootstrapError> {
             (Arc::new(platform::UnavailableLauncher), None)
         }
     };
+    let managed_mode = all_authorized_keys_admin || app_config.managed_mode();
     let sandbox_manager = Arc::new(
-        if app_config.managed_mode() {
+        if managed_mode {
             sandbox::SandboxManager::open_unreconciled_with_launcher(
                 &paths,
-                *app_config.caps(),
+                config::Caps::default(),
                 launcher,
             )
         } else {
-            sandbox::SandboxManager::open_with_launcher(&paths, *app_config.caps(), launcher)
+            sandbox::SandboxManager::open_with_launcher(&paths, config::Caps::default(), launcher)
         }
         .map_err(|err| fail("reconciling sandbox registry", err))?,
     );
 
     debug!(
-        limits = ?app_config.limits(),
-        caps = ?app_config.caps(),
+        limits = ?config::Limits::default(),
+        caps = ?config::Caps::default(),
         read_paths = app_config.read_paths().len(),
         sandbox_env = app_config.sandbox_env().len(),
-        "enforcing configured limits and caps"
+        "enforcing built-in limits and caps"
     );
-    if app_config.managed_mode() {
+    if managed_mode {
         info!(
             admins = auth_snapshot.admin_count(),
             user = %account.name,
@@ -357,25 +414,20 @@ async fn run() -> Result<(), BootstrapError> {
             "sandbox-only mode: no admin key is configured, the host selector has no recovery route"
         );
     }
-    if app_config.network() == config::NetworkMode::Outbound {
+    if network == config::NetworkMode::Outbound {
         warn!(
-            "network = \"outbound\": sandbox network isolation is reduced; restrict reachability with a host firewall"
+            "--network outbound: sandbox network isolation is reduced; restrict reachability with a host firewall"
         );
     }
 
     let account_name = account.name.clone();
     let shared = ssh::Shared {
         auth: Arc::new(auth_snapshot),
-        config: Arc::new(app_config.clone()),
         account: Arc::new(account.clone()),
         sandbox: Arc::clone(&sandbox_manager),
     };
-    let server = Arc::new(server::SshServer::new(
-        shared,
-        host_key.key().clone(),
-        &app_config,
-    ));
-    let sockets = server::bind_all(app_config.listen())
+    let server = Arc::new(server::SshServer::new(shared, host_key.key().clone()));
+    let sockets = server::bind_all(&listen)
         .await
         .map_err(|err| fail("binding listen addresses", err))?;
     let bound: Vec<_> = sockets
@@ -385,7 +437,7 @@ async fn run() -> Result<(), BootstrapError> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut serve_task = tokio::spawn(server.clone().serve(sockets, shutdown_rx));
-    let mut reconciliation_task = if app_config.managed_mode() {
+    let mut reconciliation_task = if managed_mode {
         let manager = Arc::clone(&sandbox_manager);
         Some(
             std::thread::Builder::new()
@@ -417,7 +469,15 @@ async fn run() -> Result<(), BootstrapError> {
             }
             signal = signals.recv() => match signal {
                 DaemonSignal::Reload => {
-                    match load_reload_snapshot(&paths, &current_config, &account).await {
+                        match load_reload_snapshot(
+                            &paths,
+                            &current_config,
+                            &account,
+                            network,
+                            all_authorized_keys_admin,
+                        )
+                        .await
+                        {
                         Ok(snapshot) => {
                             if let Some(launcher) = arapuca_launcher.as_ref()
                                 && let Err(error) = launcher.reload_policy(snapshot.policy.clone())
@@ -427,12 +487,10 @@ async fn run() -> Result<(), BootstrapError> {
                             }
                             let next_shared = ssh::Shared {
                                 auth: Arc::new(snapshot.auth),
-                                config: Arc::new(snapshot.config.clone()),
                                 account: Arc::new(account.clone()),
                                 sandbox: Arc::clone(&sandbox_manager),
                             };
                             server.reload(next_shared);
-                            logging.set_level(logging::level_filter(snapshot.config.log_level()));
                             current_config = snapshot.config;
                             info!("configuration and authentication snapshot reloaded");
                         }
@@ -509,10 +567,14 @@ impl fmt::Display for ReloadError {
 impl std::error::Error for ReloadError {}
 
 /// Load and validate every reload input before publishing any part of it.
+/// Only file-backed policy participates: the CLI options and the built-in
+/// caps/limits are process-lifetime invariants a reload cannot touch.
 async fn load_reload_snapshot(
     paths: &paths::Paths,
     previous: &config::Config,
     account: &account::Account,
+    network: config::NetworkMode,
+    all_authorized_keys_admin: bool,
 ) -> Result<ReloadSnapshot, ReloadError> {
     let paths = paths.clone();
     let previous = previous.clone();
@@ -525,11 +587,6 @@ async fn load_reload_snapshot(
                 "configuration file disappeared after a file-backed snapshot".into(),
             ));
         }
-        if previous.listen() != config.listen() {
-            return Err(ReloadError(
-                "listen addresses are restart-only and cannot be reloaded".into(),
-            ));
-        }
         let sandbox_shell = account
             .sandbox_shell(&config)
             .map_err(|error| ReloadError(format!("selecting the sandbox shell: {error}")))?;
@@ -539,9 +596,13 @@ async fn load_reload_snapshot(
             .map_err(|error| ReloadError(format!("resolving authorized_keys: {error}")))?;
         auth::validate_authorized_keys_file(&authorized_keys)
             .map_err(|error| ReloadError(format!("validating authorized_keys: {error}")))?;
-        let auth = auth::AuthSnapshot::load(&authorized_keys, config.admin_keys())
-            .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
-        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell);
+        let auth = auth::AuthSnapshot::load(
+            &authorized_keys,
+            config.admin_keys(),
+            all_authorized_keys_admin,
+        )
+        .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
+        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell, network);
         Ok(ReloadSnapshot {
             config,
             auth,
@@ -603,6 +664,33 @@ mod tests {
     fn no_flags_requests_no_output_action() {
         let args = parse(&[]).expect("empty argv parses");
         assert_eq!(args.output_action().expect("no conflict"), None);
+        assert_eq!(args.network_mode(), config::NetworkMode::Disabled);
+        assert_eq!(args.log_level(), config::LogLevel::Info);
+        assert_eq!(
+            effective_listen(&args.listen).expect("default listener"),
+            vec![std::net::SocketAddr::from(([0, 0, 0, 0], 22))]
+        );
+    }
+
+    #[test]
+    fn operational_cli_options_parse_and_reject_duplicate_listeners() {
+        let args = parse(&[
+            "--listen",
+            "127.0.0.1:2222",
+            "--listen",
+            "[::1]:2222",
+            "--network",
+            "outbound",
+            "--log-level",
+            "debug",
+        ])
+        .expect("operational options parse");
+        assert_eq!(args.network_mode(), config::NetworkMode::Outbound);
+        assert_eq!(args.log_level(), config::LogLevel::Debug);
+        assert_eq!(args.listen.len(), 2);
+        let duplicate = parse(&["--listen", "127.0.0.1:2222", "--listen", "127.0.0.1:2222"])
+            .expect("duplicate addresses parse before semantic validation");
+        assert!(effective_listen(&duplicate.listen).is_err());
     }
 
     #[test]

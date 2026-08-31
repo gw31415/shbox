@@ -59,7 +59,8 @@ Arapuca の通常 Process backend は永続的な named sandbox object ではな
 shbox
 ```
 
-CLI parser には `usage-rs` を使用し、v0.1 の表面は次だけとする。
+CLI parser には `usage-rs` を使用し、v0.1 の表面は次の process-lifetime options と output
+actions を持つ。
 
 ```text
 Usage: shbox
@@ -67,10 +68,20 @@ Usage: shbox
 Options:
   -h, --help
   -V, --version
+      --listen <ADDR>
+      --network <MODE>
+      --log-level <LEVEL>
+      --authorized-keys-host-access
+      --completions <SHELL>
+      --man
 ```
 
-subcommand、daemonize、管理 command、`--listen`、`--config`、`--host-key`、
-`--authorized-keys` などの server 設定 option は持たない。sandbox 操作には SSH、
+`--listen` は repeat 可能で、未指定時は `0.0.0.0:22`。`--network` は `disabled`（default）
+または `outbound`、`--log-level` は `error`、`warn`、`info`（default）、`debug`、`trace`。
+`--authorized-keys-host-access` は全 authorized key に host/admin 権限を与える。
+`--completions` と `--man` は daemon を起動せず stdout に出力する。
+subcommand、daemonize、管理 command、`--config`、`--host-key`、`--authorized-keys` などの
+server 設定 option は持たない。sandbox 操作には SSH、
 service lifecycle には systemd/launchd など外部 service manager を使う。
 
 ## 5. SSH から見た利用方法
@@ -154,7 +165,9 @@ delete は対象 ID の lifecycle lock を取得し、次の順序で処理す�
 
 ## 6. Admin と host mode
 
-admin key は設定で複数指定できる。admin key は全 sandbox の list、shell、exec、delete を行え、sandbox 所有者による制限を受けない。
+admin key は設定で複数指定できる。admin key は全 sandbox の list、shell、exec、delete を行え、sandbox 所有者による制限を受けない。`--authorized-keys-host-access` を指定すると、
+`admin_keys` に列挙していない authorized key も同じ Admin role になる。この flag は daemon の
+process lifetime 中固定であり、config file や reload から変更できない。
 
 username `_` は admin 専用の host selector である。
 
@@ -170,7 +183,9 @@ host mode は SFTP subsystem、port forwarding、agent forwarding、X11 forwardi
 
 admin key が `_` 以外の有効な SandboxId を指定した場合は、その sandbox の admin として扱う。存在しない ID を admin が最初に作成した場合、その admin key の fingerprint を owner として metadata に記録する。
 
-admin を一つも設定しない構成も有効であり、sandbox-only mode になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。admin key の設定変更は [configuration.md](./configuration.md) の reload 規則に従う。
+admin を一つも設定しない構成も有効であり、host-access flag も無ければ sandbox-only mode
+になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。admin key の設定
+変更は [configuration.md](./configuration.md) の reload 規則に従う。
 
 ## 7. 所有権と可視性
 
@@ -193,7 +208,7 @@ admin を一つも設定しない構成も有効であり、sandbox-only mode �
 
 ## 9. Network と環境
 
-sandbox の network policy はグローバル設定で次の二つだけである。
+sandbox の network policy は daemon 起動時の `--network` で選ぶ次の二つだけである。
 
 - `disabled`（デフォルト）：外部 network を許可しない
 - `outbound`：初期 v0.1 から利用できる unrestricted TCP/UDP/DNS network capability。主用途は outbound 通信であり、宛先 allowlist は提供しない
@@ -201,8 +216,9 @@ sandbox の network policy はグローバル設定で次の二つだけであ�
 `outbound` で shbox 自身が port mapping や SSH forwarding を作ることはないが、全 OS で
 socket を egress-only に制約する security boundary は約束しない。process が bind/listen
 できるかは Arapuca/OS と host firewall に依存する。operator は外部からの到達を host
-firewall で遮断する。これは shbox の意味論であり、Arapuca の raw profile option を設定
-ファイルに露出しない。host mode は sandbox network policy の対象外である。
+firewall で遮断する。これは shbox の意味論であり、Arapuca の raw profile option や network
+mode を設定ファイルに露出しない。host mode は sandbox network policy の対象外である。
+SIGHUP で network mode は変わらない。
 
 workspace は sandbox process の HOME と cwd になる。追加の sandbox environment は config からのみ注入し、loader injection、`ARAPUCA_*`、その他の管理用変数は受け付けない。詳細は [configuration.md](./configuration.md) を参照する。
 
