@@ -305,16 +305,26 @@ pub(crate) async fn terminate_host_process(
 ) {
     process.client_eof();
     process.signal_group(libc::SIGTERM);
-    let graceful = matches!(
-        tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await,
-        Ok(Ok(_))
-    );
+    let mut waiter_done = false;
+    let graceful = match tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await {
+        Ok(Ok(_)) => {
+            waiter_done = true;
+            true
+        }
+        Ok(Err(_)) => {
+            waiter_done = true;
+            false
+        }
+        Err(_) => false,
+    };
     if !graceful {
         process.signal_group(libc::SIGKILL);
-        if !matches!(
-            tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await,
-            Ok(Ok(_))
-        ) {
+        if !waiter_done
+            && !matches!(
+                tokio::time::timeout(TEARDOWN_GRACE, waiter.wait()).await,
+                Ok(Ok(_))
+            )
+        {
             waiter.abort();
         }
     }
@@ -495,18 +505,35 @@ pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
         // force the process group and join every pump before returning.
         process.client_eof();
         process.signal_group(libc::SIGTERM);
-        let graceful = matches!(
-            tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task).await,
-            Ok(Ok(()))
-        );
+        // A completed JoinHandle must not be polled again. `timeout` polls
+        // the handle itself, so remember whether it consumed the join result
+        // and only await the handle directly when both timeouts elapsed.
+        let mut waiter_done = false;
+        let graceful = match tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task).await {
+            Ok(Ok(())) => {
+                waiter_done = true;
+                true
+            }
+            Ok(Err(_)) => {
+                waiter_done = true;
+                false
+            }
+            Err(_) => false,
+        };
         if !graceful {
             process.signal_group(libc::SIGKILL);
-            let _ = tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task).await;
+            if !waiter_done
+                && tokio::time::timeout(TEARDOWN_GRACE, &mut waiter_task)
+                    .await
+                    .is_ok()
+            {
+                waiter_done = true;
+            }
         }
-        if !waiter_task.is_finished() {
+        if !waiter_done {
             waiter_task.abort();
+            let _ = waiter_task.await;
         }
-        let _ = waiter_task.await;
         for pump in pumps {
             pump.abort();
             let _ = pump.await;

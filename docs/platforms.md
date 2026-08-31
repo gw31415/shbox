@@ -141,8 +141,9 @@ shbox の host key は OpenSSH daemon の host key を流用せず、XDG state �
 既存 sshd から同じ host/port 22 を切り替えると、client からは host key 変更として見える。
 operator は切替前に新 fingerprint を安全な別経路で確認し、known_hosts を意図的に更新する。
 
-SSH だけが復旧経路の VPS では、authorized key、admin fingerprint、service account の XDG
-directory と config を先に準備し、`ssh _@host` が利用できることを別 port または既存 session
+SSH だけが復旧経路の VPS では、daemon account の `~/.ssh/authorized_keys` に host access 用の
+key を、service account の XDG config root に `allowed_keys` と config を先に準備し、
+`ssh _@host` が利用できることを別 port または既存 session
 から確認してから port 22 を切り替える。admin 無しの sandbox-only mode を唯一の復旧経路に
 しない。shbox は既存 sshd の停止、known_hosts 更新、firewall 変更を自動実行しない。
 

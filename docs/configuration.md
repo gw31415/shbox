@@ -32,7 +32,7 @@ read_paths = []
 # LANG = "C.UTF-8"
 ```
 
-listener、network、log level、host-access policy は daemon の CLI で指定する。
+listener、network、log level は daemon の CLI で指定する。
 例えば次のように起動する。
 
 ```console
