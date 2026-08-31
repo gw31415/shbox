@@ -69,15 +69,17 @@ Options:
   -h, --help
   -V, --version
       --listen <ADDR>
-      --network <MODE>
       --log-level <LEVEL>
       --completions <SHELL>
       --man
 ```
 
-`--listen` は repeat 可能で、未指定時は `0.0.0.0:22`。`--network` は `disabled`（default）
-または `outbound`、`--log-level` は `error`、`warn`、`info`（default）、`debug`、`trace`。
-`--completions` と `--man` は daemon を起動せず stdout に出力する。
+CLI flag はトップレベルの config 項目に対応する上書き層である。`--listen` は repeat 可能で、
+指定時は config file の `listen` を完全に置き換え、未指定時は config 値（無ければ
+`0.0.0.0:22`）。`--log-level` は `error`、`warn`、`info`（default）、`debug`、`trace` で、
+指定時は config file の `log_level` を置き換える。`[sandbox]` 以下の項目、特に
+`network` に対応する flag は存在しない。`--completions` と `--man` は daemon を起動せず
+stdout に出力する。
 subcommand、daemonize、管理 command、`--config`、`--host-key`、`--authorized-keys` などの
 server 設定 option は持たない。sandbox 操作には SSH、
 service lifecycle には systemd/launchd など外部 service manager を使う。
@@ -98,7 +100,7 @@ ssh dev@shbox.example.com
 
 有効な公開鍵で認証し、username が有効な SandboxId なら、sandbox を atomic に get-or-create して shell channel を開始する。SSH client が username を省略した場合は client が選んだデフォルト username が送信される。匿名 username は存在しない。
 
-通常の sandbox shell のデフォルトは daemon を実行する OS ユーザーの login shell である。passwd entry が空の場合だけ `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または実行できない場合は起動・reload を失敗させる。interactive shell は login mode で起動する。`sandbox_shell` が設定されている場合はその絶対 path を使用する。
+通常の sandbox shell のデフォルトは daemon を実行する OS ユーザーの login shell である。passwd entry が空の場合だけ `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または実行できない場合は起動・reload を失敗させる。interactive shell は login mode で起動する。設定の `[sandbox] shell` が指定されている場合はその絶対 path を使用する。
 
 ### 5.2 Remote command
 
@@ -112,7 +114,7 @@ ssh dev@shbox.example.com 'cargo test'
 
 remote command は標準 SSH の exec request として一つの command string で受け取る。sandbox shell と同じ shell を command interpreter として `-c` で起動する。通常の remote command は login shell としてではなく `shell -c` として実行されるが、`/bin/sh` を常に強制する仕様ではない。PTY が要求されれば PTY 上でも exec できる。
 
-client の環境変数を sandbox に自動転送しない。sandbox 用の環境変数は設定ファイルの `sandbox_env` だけで定義する。
+client の環境変数を sandbox に自動転送しない。sandbox 用の環境変数は設定ファイルの `[sandbox.env]` だけで定義する。
 
 ### 5.3 List
 
@@ -204,7 +206,7 @@ host authorized_keys に Admin key を一つも登録しない構成も有効で
 
 ## 9. Network と環境
 
-sandbox の network policy は daemon 起動時の `--network` で選ぶ次の二つだけである。
+sandbox の network policy は設定ファイルの `[sandbox] network` で選ぶ次の二つだけである。
 
 - `disabled`（デフォルト）：外部 network を許可しない
 - `outbound`：初期 v0.1 から利用できる unrestricted TCP/UDP/DNS network capability。主用途は outbound 通信であり、宛先 allowlist は提供しない
@@ -212,9 +214,11 @@ sandbox の network policy は daemon 起動時の `--network` で選ぶ次の�
 `outbound` で shbox 自身が port mapping や SSH forwarding を作ることはないが、全 OS で
 socket を egress-only に制約する security boundary は約束しない。process が bind/listen
 できるかは Arapuca/OS と host firewall に依存する。operator は外部からの到達を host
-firewall で遮断する。これは shbox の意味論であり、Arapuca の raw profile option や network
-mode を設定ファイルに露出しない。host mode は sandbox network policy の対象外である。
-SIGHUP で network mode は変わらない。
+firewall で遮断する。これは shbox の意味論であり、Arapuca の raw profile option は
+設定ファイルに露出しない（`[sandbox] network` という public 選択だけが設定可能である）。
+host mode は sandbox network policy の対象外である。
+network mode は process-lifetime であり、SIGHUP で変わらない。config file 上で変えた
+SIGHUP は reload 全体を拒否され、適用には restart が必要である。
 
 workspace は sandbox process の HOME と cwd になる。追加の sandbox environment は config からのみ注入し、loader injection、`ARAPUCA_*`、その他の管理用変数は受け付けない。詳細は [configuration.md](./configuration.md) を参照する。
 

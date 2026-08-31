@@ -173,7 +173,8 @@ mod tests {
         }
 
         let (_home, paths) = temp_paths();
-        let raw: config::RawConfig = toml::from_str("sandbox_shell = \"/bin/sh\"").expect("toml");
+        let raw: config::RawConfig =
+            toml::from_str("[sandbox]\nshell = \"/bin/sh\"").expect("toml");
         let config = config::build(raw, &paths).expect("config");
         assert_eq!(
             account.sandbox_shell(&config).expect("configured shell"),

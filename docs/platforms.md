@@ -54,15 +54,16 @@ arapuca = { git = "https://github.com/LeGambiArt/arapuca", rev = "c94802c4d8b6b8
 
 この revision の package version は `0.2.7` のままだが、`v0.2.7` tag の正式リリースではない。PR #82 由来の macOS PTY `file-ioctl` と `/var` ancestor 修正を含む未リリースの累積 tip である。仕様、Cargo.lock、リリースノートには package version と full revision の両方を記録する。正式版へ移行する場合も、差分確認と全統合試験を先に行う。
 
-shbox の設定 file は追加 read-only path、workspace 環境変数などの file-backed policy だけを
-公開する。network は CLI の `--network` で選び、resource limits/caps は組み込み値である。
+shbox の設定 file は追加 read-only path、workspace 環境変数、`[sandbox] network` などの
+file-backed policy とトップレベルの operational 設定（`listen`、`log_level`）を公開する。
+resource limits/caps は組み込み値である。
 `Isolation`、`seccomp_profile`、`cgroup_policy`、`allow_exec`、`use_netns`、`task_id` などの
 Arapuca option を TOML の直接の露出名にはしない。内部 adapter が固定した安全な mapping を使う。
 
 ### 2.1 Profile の mapping
 
 - shell/exec は shell を起動するため、内部 profile は実行を許可する。ただし追加 write path は作らず、実行可能な read-only system path と workspace だけを明示する。
-- `read_paths` は管理者が設定した絶対 path と、shell/loader/TLS に必要な curated system path に限定する。
+- `[sandbox] read_paths` は管理者が設定した絶対 path と、shell/loader/TLS に必要な curated system path に限定する。
 - workspace は `read/write`、他の Sandbox directory、shbox の metadata、cgroup filesystem は渡さない。
 - client の SSH environment request は受け付けず、Sandbox 側の環境は shbox が構成する。`HOME` と `PWD` は workspace、`SHELL` は選択 shell、`TMPDIR` は launch ごとの private temporary directory にする。Arapuca の現行実装に依存するため、最終値は各正式 platform の統合試験で確認する。
 - daemon の UID/GID の切り替えは行わない。host mode も同じ daemon service account で動き、別 identity は sudo、service manager、OS 側の配備責務とする。
@@ -105,7 +106,7 @@ workspace 以外の追加 write path は作らない。
 
 ## 3. Network policy
 
-ネットワーク設定は daemon 起動時の `--network` で選び、全 Sandbox 共通で次の二つだけとする。
+ネットワーク設定は設定ファイルの `[sandbox] network` で選び、全 Sandbox 共通で次の二つだけとする。
 
 | shbox 設定 | 内部の意味 | 契約 |
 |---|---|---|
@@ -115,7 +116,8 @@ workspace 以外の追加 write path は作らない。
 inbound listener、port forwarding、per-Sandbox allowlist、proxy endpoint の設定は v0.1 で提供しない。`outbound` は初期版から実装し、ユーザーが利用する唯一の許可ネットワーク形態とする。ここでも Arapuca の raw network option や syscall profile 名は公開しない。
 
 `outbound` の内部 profile は `disabled` より syscall/network isolation が弱い。選択時は
-startup の host log に warning を残す。shbox は inbound port mapping を作らないが、
+startup の host log に warning を残す。network mode は process-lifetime であり、config file
+上で変えた SIGHUP は reload 全体を拒否する。shbox は inbound port mapping を作らないが、
 Baseline と host network namespace の組合せは全 OS で bind/listen を禁止する egress-only
 security boundary ではない。外部からの到達は host firewall で制御し、正式 platform ごとに
 実際の socket behavior を記録する。
@@ -171,7 +173,7 @@ Wants=network-online.target
 Type=simple
 User=shbox
 Group=shbox
-ExecStart=/usr/local/bin/shbox --listen 0.0.0.0:22 --network disabled --log-level info
+ExecStart=/usr/local/bin/shbox --listen 0.0.0.0:22 --log-level info
 Restart=on-failure
 Delegate=cpu cpuset memory pids
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -210,8 +212,6 @@ macOS の launchd 配備例は次のように、persistent path を持つ専用 
     <string>/usr/local/bin/shbox</string>
     <string>--listen</string>
     <string>0.0.0.0:22</string>
-    <string>--network</string>
-    <string>disabled</string>
     <string>--log-level</string>
     <string>info</string>
   </array>

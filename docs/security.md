@@ -245,7 +245,7 @@ Arapuca を使い、test adapter は故障・競合を決定的に注入でき�
 
 Arapuca 固有の profile、`task_id`、cgroup path、wrapper、network syscall flag
 などは shbox の設定項目として直接公開しない。利用者が設定できるのは shbox の
-domain semantics（CLI network、read-only path、shell、sandbox environment）だけで、
+domain semantics（`[sandbox] network`、read-only path、shell、sandbox environment）だけで、
 Arapuca への mapping は adapter の内部実装とする。
 
 ### 5.2 identity、environment、path
@@ -267,8 +267,8 @@ Arapuca への mapping は adapter の内部実装とする。
 
 ### 5.3 network
 
-network policy は daemon 起動時の `--network` で選ぶ、全 sandbox 共通の `disabled` または
-`outbound` だけである。
+network policy は設定ファイルの `[sandbox] network` で選ぶ、全 sandbox 共通の `disabled` または
+`outbound` だけである。この項目に対応する CLI flag は存在しない。
 per-sandbox、per-owner、inbound listener の設定はない。
 
 - `disabled` は strict な network denial を使用する。
@@ -381,8 +381,9 @@ stdout/stderr は変換・記録せず、process の出力をそのまま転送�
 ### 8.2 log
 
 `tracing` の structured compact text を stderr に出力し、UTC RFC3339 の timestamp
-を付ける。file log、rotation、`RUST_LOG` は v0.1 にない。`--log-level` は
-`error`、`warn`、`info`、`debug`、`trace` から設定し、既定は `info`。process-lifetime
+を付ける。file log、rotation、`RUST_LOG` は v0.1 にない。`log_level` は
+`error`、`warn`、`info`、`debug`、`trace` から設定し、既定は `info`。CLI
+`--log-level` を指定すると config 値を置き換える。process-lifetime
 の値であり、SIGHUP では reload しない。
 
 必要な監査情報として、connection ID、channel ID、remote IP、key fingerprint、
@@ -404,10 +405,11 @@ invariant violation は位置と backtrace を log して daemon を abort す�
 ## 9. reload と shutdown
 
 SIGHUP は config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy を
-全体検証したうえで atomic に反映する。`--listen`、`--network`、`--log-level`、
+全体検証したうえで atomic に反映する。`listen`、`log_level`、`[sandbox] network`、
 組み込み resource caps/limits、host key、data root の
 変更は process-lifetime または restart-only とし、SIGHUP で既存 listener や safety policy
-を切り替えない。reload failure は古い設定を保持する。
+を切り替えない。これらの値を変えた config による reload は auth 変更を含めて全体が
+拒否され、reload failure は古い設定を保持する。
 
 最後の admin key を reload で削除すると、新規 connection は sandbox-only mode になり、
 新しい admin/host access はできなくなる。既存の admin connection は connection

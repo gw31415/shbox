@@ -313,3 +313,10 @@ deferred gateとして残す。support matrixは固定OS/architectureと同一co
   提供しない。
 - 2026-08-31: retired interfaceはsilent ignoreせずfail closedにする。誤った移行状態で意図しない
   authorityを付与しないためである。
+- 2026-09-01: config schemaを再編し、トップ直下に `listen` と `log_level`、`[sandbox]` テーブルに
+  `shell`（旧 `sandbox_shell`）、`network`（旧 CLI `--network`）、`read_paths`、`[sandbox.env]`
+  （旧 `[sandbox_env]`）を置く。これにより本計画の「configの責務を `sandbox_shell`、`read_paths`、
+  `sandbox_env` のみにする」（### 2）と「`--listen`、`--network`、`--log-level` がprocess-lifetimeで
+  CLI専用である契約は変更対象外」（scope節）は本変更に置き換えられた。CLI flagはトップレベルconfig
+  項目に対応する上書き層のみ（`--listen`、`--log-level`）とし、`[sandbox]` 以下には対応flagを
+  作らない。process-lifetime契約自体は維持し、SIGHUPでこれらの値が変わったreloadは全体を拒否する。

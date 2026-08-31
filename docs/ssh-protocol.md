@@ -238,7 +238,7 @@ v0.1 では list/delete の追加オプションや独自 parser を定義しな
 
 ### 4.1 shell の選択
 
-`sandbox_shell` が設定されていればその absolute executable path を使う。未設定
+設定の `[sandbox] shell` が指定されていればその absolute executable path を使う。未設定
 なら daemon OS user の passwd entry にある login shell を使い、entry が空の場合だけ
 `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または
 実行できない場合は startup/reload error とする。host mode でも同じ daemon account の

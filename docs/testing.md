@@ -85,8 +85,10 @@ sandbox-exec --version
 - 各 source の未作成・空を許しつつ、合成結果が空の場合は起動・reload を拒否する。
 - config file は任意。欠落時は built-in default、存在時は typed TOML の unknown field/型/範囲エラーを拒否する。SIGHUP の失敗は旧設定を保持する。
 - managed env、`ARAPUCA_*`、loader injection、NUL、非 UTF-8、4 KiB 超の environment value を拒否する。client の env request は Sandbox に渡さない。
-- `--network disabled|outbound`、`--log-level error|warn|info|debug|trace` の enum 以外、
-  `--listen` の重複、config file の operational option/resource cap/limit field を拒否する。
+- `log_level = "error|warn|info|debug|trace"` と `[sandbox] network = "disabled|outbound"` の
+  enum 以外を拒否する。`--listen` の重複、`listen = []`、無効な socket address も拒否する。
+  旧綴り（トップレベルの `sandbox_shell`、`read_paths`、`[sandbox_env]`、`network`）と
+  resource cap/limit field は unknown field として拒否する。
 
 ### 4.2 Metadata と lifecycle
 
@@ -289,13 +291,15 @@ admin key で `ssh _@host` の shell、remote exec、PTY、resize、signal を�
 ### 8.2 Reload
 
 - SIGHUP で config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy だけが atomic に更新
-  される。CLI の listener/network/log-level と built-in limits/caps は変わらない。
+  される。`listen`、`log_level`、`[sandbox] network` と built-in limits/caps は process-lifetime
+  で変わらない。
 - config 無しの defaults で起動した後に config file を作ると valid SIGHUP で採用される。一度
   file を採用した後に削除すると reload failure になり、旧 snapshot を保持する。
 - 新しい connection/process には新設定、既存 connection には元の role/rights を適用する。
 - 認証ファイル/config が壊れている、または使用中の config が消えた場合は旧設定を保持する。最後の admin を削除する valid reload は適用し、sandbox-only mode に遷移する。
-- listen socket は reload せず、CLI の変更には restart を要求する。旧 field を config に追加した
-  reload は unknown field として拒否する。
+- listen socket は reload せず、`listen` / `log_level` / `[sandbox] network` の値を変えた
+  config による reload は auth 変更を含めて全体が拒否され、旧 snapshot が維持される。適用には
+  restart を要求する。
 - admin を削除しても既存 admin connection は disconnect まで維持し、新規 admin connection は拒否する。
 
 ### 8.3 Hostile input
