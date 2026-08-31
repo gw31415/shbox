@@ -261,7 +261,6 @@ fn read_key_source(path: &Path, source_name: &'static str) -> Result<Option<Vec<
         .open(path)
     {
         Ok(f) => f,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(Error::Io {
                 path: path.to_path_buf(),

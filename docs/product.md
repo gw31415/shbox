@@ -179,8 +179,8 @@ host mode は SFTP subsystem、port forwarding、agent forwarding、X11 forwardi
 
 admin key が `_` 以外の有効な SandboxId を指定した場合は、その sandbox の admin として扱う。存在しない ID を admin が最初に作成した場合、その admin key の fingerprint を owner として metadata に記録する。
 
-admin を一つも設定しない構成も有効であり、host-access flag も無ければ sandbox-only mode
-になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。admin key の設定
+host authorized_keys に Admin key を一つも登録しない構成も有効であり、sandbox-only mode
+になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。host key の設定
 変更は [configuration.md](./configuration.md) の reload 規則に従う。
 
 ## 7. 所有権と可視性

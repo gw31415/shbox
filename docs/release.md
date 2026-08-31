@@ -126,7 +126,7 @@ Linux の最小 unit は [`deploy/systemd/shbox.service`](../deploy/systemd/shbo
 - `Delegate=cpu cpuset memory pids` を指定します。service cgroup に無関係な process を置かず、Arapuca がその下に private child を作れることを実機で確認します。
 - port 22 を使う場合だけ `CAP_NET_BIND_SERVICE` を ambient/bounding set に渡します。別 port と operator-managed forwarding を使う場合は不要です。
 - `KillMode=control-group` と停止 timeout を指定し、daemon の process descendants を unit の lifecycle に残しません。
-- `XDG_CONFIG_HOME=/etc`、`XDG_DATA_HOME=/var/lib`、`XDG_STATE_HOME=/var/lib/shbox-state` は xdg の `shbox` prefix を含むため、実際の application roots は `/etc/shbox`、`/var/lib/shbox`、`/var/lib/shbox-state/shbox` です。三つの親 directory と config/authorized key は事前に専用 account 所有、非 writable な mode にします。
+- `XDG_CONFIG_HOME=/etc`、`XDG_DATA_HOME=/var/lib`、`XDG_STATE_HOME=/var/lib/shbox-state` は xdg の `shbox` prefix を含むため、実際の application roots は `/etc/shbox`、`/var/lib/shbox`、`/var/lib/shbox-state/shbox` です。三つの親 directory、config、daemon account の `~/.ssh/authorized_keys`、および `allowed_keys` は事前に専用 account 所有、非 writable な mode にします。
 
 macOS の launchd 例は [`deploy/launchd/com.example.shbox.plist`](../deploy/launchd/com.example.shbox.plist) です。`UserName=shbox` と dedicated home/XDG roots を固定し、launchd が収集する stderr/stdout path も account-owned path にしています。この plist は account、directory、owner、mode の provisioning や installer/start/stop command を含みません。
 

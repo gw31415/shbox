@@ -28,7 +28,7 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 /// Immutable, fully validated configuration snapshot.
 ///
 /// Only file-backed policy lives here. Process-lifetime operational settings
-/// (`listen`, `network`, `log level`, host-access) are CLI options, and
+/// (`listen`, `network`, and `log level`) are CLI options, and
 /// `Caps`/`Limits` are built-in constants.
 #[derive(Debug, Clone)]
 pub struct Config {

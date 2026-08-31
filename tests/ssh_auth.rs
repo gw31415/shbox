@@ -18,6 +18,7 @@ use tempfile::TempDir;
 /// One test daemon: process handle plus the paths and keys it was given.
 struct TestDaemon {
     child: std::process::Child,
+    stderr_reader: Option<std::thread::JoinHandle<String>>,
     port: u16,
     _root: TempDir,
     admin_key: KeyPair,
@@ -38,6 +39,7 @@ impl Drop for TestDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = self.read_stderr();
     }
 }
 
@@ -189,14 +191,23 @@ impl TestDaemon {
             .env("XDG_STATE_HOME", root.path().join("state"))
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"));
-        let child = daemon_command
+        let mut child = daemon_command
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("daemon starts");
+        let mut daemon_stderr = child.stderr.take().expect("daemon stderr pipe");
+        let stderr_reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            daemon_stderr
+                .read_to_string(&mut output)
+                .expect("read daemon stderr");
+            output
+        });
 
         let daemon = TestDaemon {
             child,
+            stderr_reader: Some(stderr_reader),
             port,
             _root: root,
             admin_key,
@@ -210,6 +221,13 @@ impl TestDaemon {
         daemon
     }
 
+    fn read_stderr(&mut self) -> String {
+        let Some(stderr_reader) = self.stderr_reader.take() else {
+            return String::new();
+        };
+        stderr_reader.join().expect("stderr reader thread")
+    }
+
     fn sandbox_workspace(&self, id: &str) -> PathBuf {
         self._root
             .path()
@@ -219,23 +237,11 @@ impl TestDaemon {
     }
 
     fn set_host_keys(&self, content: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&self.host_authorized_keys, content).expect("write host keys");
-        std::fs::set_permissions(
-            &self.host_authorized_keys,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("chmod host keys");
+        write_key_source(&self.host_authorized_keys, content, "host keys");
     }
 
     fn set_allowed_keys(&self, content: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&self.sandbox_allowed_keys, content).expect("write allowed keys");
-        std::fs::set_permissions(
-            &self.sandbox_allowed_keys,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("chmod allowed keys");
+        write_key_source(&self.sandbox_allowed_keys, content, "allowed keys");
     }
 
     fn set_admin_keys(&self, admin_keys: &[&str]) {
@@ -464,6 +470,13 @@ impl TestDaemon {
             .output()
             .expect("ssh runs")
     }
+}
+
+fn write_key_source(path: &Path, content: &str, label: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, content).expect("write key source");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|_| panic!("chmod {label}"));
 }
 
 #[derive(Debug)]
@@ -1449,7 +1462,12 @@ fn daemon_shuts_down_on_sigterm() {
     assert!(result.ok(), "{result:?}");
     daemon.send_signal(libc::SIGTERM);
     let status = daemon.child.wait().expect("wait");
+    let daemon_stderr = daemon.read_stderr();
     assert!(status.success(), "graceful exit expected, got {status}");
+    assert!(
+        !daemon_stderr.contains("JoinHandle polled after completion"),
+        "daemon polled a completed Tokio task during shutdown:\n{daemon_stderr}"
+    );
 }
 
 /// Shutdown closes an active host channel and eventually kills a process that
@@ -1499,9 +1517,14 @@ fn daemon_shutdown_cleans_up_an_active_host_process() {
 
     daemon.send_signal(libc::SIGTERM);
     let daemon_status = daemon.child.wait().expect("daemon wait");
+    let daemon_stderr = daemon.read_stderr();
     assert!(
         daemon_status.success(),
         "graceful exit expected: {daemon_status}"
+    );
+    assert!(
+        !daemon_stderr.contains("JoinHandle polled after completion"),
+        "daemon polled a completed Tokio task during shutdown:\n{daemon_stderr}"
     );
     let client_status = client.join().expect("ssh client join");
     assert!(

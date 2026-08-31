@@ -129,7 +129,7 @@ sandbox-exec --version
 次の純粋な domain function に対して property test を書く。
 
 - Sandbox ID validation、task ID suffix の 128-byte 上限、random suffix の再試行。
-- TOML の unknown field、limit、environment、path、admin fingerprint の validation。
+- TOML の unknown field、limit、environment、path、public-key fingerprint、role の validation。
 - metadata encode/decode、version rejection、owner fingerprint の round-trip。
 - connection role、selector、channel state の遷移と、PTY/list/delete の組合せ。
 - list の sorted unique snapshot と owner/admin filter。

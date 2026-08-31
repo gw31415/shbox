@@ -193,21 +193,21 @@ src/
 
 startup は概ね次の順序で行う。
 
-1. CLI を parse し、listener、network、log level、host-access policy を固定する。
+1. CLI を parse し、listener、network、log level を固定する。
 2. XDG path を解決し、data の `registry.lock`、state の `lock` の順に non-blocking で取得する。
    どちらか一方でも失敗したら、取得済み lock を解放して起動を失敗させる。
 3. optional config を読み、file-backed policy を検証する。
-4. authorized keys を読み、admin fingerprint との整合を検証する。
+4. host authorized_keys と sandbox allowed_keys を読み、合成 authentication snapshot を検証する。
 5. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
 6. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
-7. managed mode（admin key または host-access flag）なら listener を全 address へ bind し、
-   `_` host route だけを ready にする。
+7. 初期 authentication snapshot に Admin key があれば managed mode として扱い、listener を
+   全 address へ bind して `_` host route を有効にする。
 8. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
-9. sandbox operation を ready にし、sandbox-only mode ならここで listener を bind する。
+9. sandbox operation を ready にする。sandbox-only mode では `_` host route だけを無効にする。
 
-config file は存在しなくてもよい。authorized keys は存在し、少なくとも一つの valid
-Ed25519 key を含まなければならない。config に admin key が一つ以上ある、または
-host-access flag が有効な状態を **managed mode**、それ以外を **sandbox-only mode** と呼ぶ。
+config file と各 key source は存在しなくてもよいが、合成 snapshot には少なくとも一つの
+valid Ed25519 key が必要である。host authorized_keys 由来の Admin key が一つ以上ある状態を
+**managed mode**、それ以外を **sandbox-only mode** と呼ぶ。
 
 - managed mode は、repair のため registry reconciliation 中でも listener と `_` の
   host shell/exec を利用可能にする。この期間の sandbox 操作は一律 unavailable とする。
@@ -344,7 +344,7 @@ process list や directory 名だけを正本にしてはならない。
 
 ## 11. Reload and shutdown
 
-`SIGHUP` は config と authorized/admin key set を完全に読み直し、すべて検証できた場合だけ
+`SIGHUP` は config、host/allowed key source、sandbox policy を完全に読み直し、すべて検証できた場合だけ
 immutable snapshot を atomic に交換する。失敗時は旧 snapshot を保持する。以前存在した
 config file が消えた場合も reload failure とし、暗黙に defaults へ戻さない。
 
@@ -354,7 +354,7 @@ reload の適用範囲は次のとおりである。
 - 既存 connection: 認証時の principal/role を切断まで保持
 - 新しい process: 新しい shell/env/read path snapshot と、固定 CLI network/built-in limits
 - 実行中 process: 変更しない
-- CLI の log level、host-access、network、listener と built-in capacity/limits: 固定
+- CLI の log level、network、listener と built-in capacity/limits: 固定
 - host key、storage root、Arapuca backend: 固定、reload しない
 
 reload により最後の admin を削除して sandbox-only mode へ移行できる。既存 admin connection
