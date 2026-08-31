@@ -6,6 +6,9 @@
 //! run the public-key SSH server with the admin-only `_` host route. Adapter
 //! initialization remains fail-closed for sandbox launches so host recovery
 //! and metadata management do not depend on a working sandbox runtime.
+//! The config file is read once at startup; the key sources are instead
+//! re-validated at authentication time, and SIGHUP only forces that
+//! revalidation.
 
 mod account;
 mod auth;
@@ -39,7 +42,8 @@ use tracing::{debug, error, info, warn};
 /// the top-level config fields: `--listen` and `--log-level` override the
 /// file's `listen` and `log_level` when given, and there is deliberately no
 /// flag for anything under `[sandbox]` (`network` included). Every setting
-/// resolved this way is process-lifetime: SIGHUP never re-reads it.
+/// resolved this way is process-lifetime: the daemon never re-reads it, and
+/// SIGHUP only forces a revalidation of the key files.
 #[derive(usage_rs::Cli)]
 #[usage(bin = "shbox", version, completion)]
 struct Args {
@@ -311,7 +315,9 @@ fn report(error: &BootstrapError) {
 /// Resolve and validate every local input, then serve SSH until shutdown.
 /// The config file carries every setting, including the top-level operational
 /// ones; the CLI flags layer on top of `listen` and `log_level` only. All of
-/// them stay fixed for the process lifetime.
+/// them stay fixed for the process lifetime: applying a config change means
+/// restarting the daemon. The key sources are the exception — they are
+/// re-validated on every authentication request and on SIGHUP.
 async fn run(args: &Args) -> Result<(), BootstrapError> {
     let paths = paths::Paths::resolve().map_err(|err| fail("resolving XDG paths", err))?;
     paths
@@ -349,30 +355,25 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
 
     let host_path = auth::resolve_authorized_keys_path()
         .map_err(|err| fail("resolving authorized_keys", err))?;
-    let auth_snapshot = auth::AuthSnapshot::load(&host_path, paths.allowed_keys_file())
+    let auth_store = auth::KeyStore::load(&host_path, paths.allowed_keys_file())
         .map_err(|err| fail("loading the authentication snapshot", err))?;
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
     let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
-    let (launcher, arapuca_launcher): (
-        Arc<dyn platform::ProcessLauncher>,
-        Option<Arc<platform::ArapucaLauncher>>,
-    ) = match platform::ArapucaLauncher::new(launch_policy) {
+    let launcher: Arc<dyn platform::ProcessLauncher> = match platform::ArapucaLauncher::new(
+        launch_policy,
+    ) {
         Ok(launcher) => {
             info!("sandbox process adapter initialized");
-            let launcher = Arc::new(launcher);
-            (
-                Arc::clone(&launcher) as Arc<dyn platform::ProcessLauncher>,
-                Some(launcher),
-            )
+            Arc::new(launcher)
         }
         Err(error) => {
             warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
-            (Arc::new(platform::UnavailableLauncher), None)
+            Arc::new(platform::UnavailableLauncher)
         }
     };
-    let managed_mode = auth_snapshot.admin_count() > 0;
+    let managed_mode = auth_store.admin_count() > 0;
     let sandbox_manager = Arc::new(
         if managed_mode {
             sandbox::SandboxManager::open_unreconciled_with_launcher(
@@ -395,7 +396,7 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
     );
     if managed_mode {
         info!(
-            admins = auth_snapshot.admin_count(),
+            admins = auth_store.admin_count(),
             user = %account.name,
             "managed mode: host selector \"_\" is available to admin keys"
         );
@@ -411,8 +412,9 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
     }
 
     let account_name = account.name.clone();
+    let auth_store = Arc::new(auth_store);
     let shared = ssh::Shared {
-        auth: Arc::new(auth_snapshot),
+        auth: Arc::clone(&auth_store),
         account: Arc::new(account.clone()),
         sandbox: Arc::clone(&sandbox_manager),
     };
@@ -445,7 +447,6 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
         "shbox ready"
     );
 
-    let mut current_config = app_config;
     let mut signals = SignalReceiver::new();
     loop {
         tokio::select! {
@@ -458,28 +459,9 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
                 return Ok(());
             }
             signal = signals.recv() => match signal {
-                DaemonSignal::Reload => {
-                        match load_reload_snapshot(&paths, &current_config, &account).await {
-                        Ok(snapshot) => {
-                            if let Some(launcher) = arapuca_launcher.as_ref()
-                                && let Err(error) = launcher.reload_policy(snapshot.policy.clone())
-                            {
-                                warn!(error = %error, "SIGHUP reload rejected by sandbox adapter");
-                                continue;
-                            }
-                            let next_shared = ssh::Shared {
-                                auth: Arc::new(snapshot.auth),
-                                account: Arc::new(account.clone()),
-                                sandbox: Arc::clone(&sandbox_manager),
-                            };
-                            server.reload(next_shared);
-                            current_config = snapshot.config;
-                            info!("configuration and authentication snapshot reloaded");
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "SIGHUP reload rejected; keeping the previous snapshot");
-                        }
-                    }
+                DaemonSignal::ReloadKeys => {
+                    auth_store.invalidate();
+                    info!("SIGHUP: key sources will be revalidated at the next authentication request");
                 }
                 DaemonSignal::Shutdown => {
                     info!("shutdown signal received: draining runtime processes");
@@ -531,82 +513,8 @@ async fn join_reconciliation(task: std::thread::JoinHandle<()>) -> Result<(), Bo
         })
 }
 
-struct ReloadSnapshot {
-    config: config::Config,
-    auth: auth::AuthSnapshot,
-    policy: platform::ArapucaLaunchPolicy,
-}
-
-#[derive(Debug)]
-struct ReloadError(String);
-
-impl fmt::Display for ReloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ReloadError {}
-
-/// Load and validate every reload input before publishing any part of it.
-/// The top-level operational settings (`listen`, `log_level`) and the
-/// `[sandbox] network` mode are process-lifetime: a config file that changes
-/// any of them is rejected whole, keeping the previous snapshot, because only
-/// a restart can rebind the listener, re-resolve the verbosity, or re-select
-/// the sandbox network policy. The built-in caps/limits are equally
-/// process-lifetime invariants.
-async fn load_reload_snapshot(
-    paths: &paths::Paths,
-    previous: &config::Config,
-    account: &account::Account,
-) -> Result<ReloadSnapshot, ReloadError> {
-    let paths = paths.clone();
-    let previous = previous.clone();
-    let account = account.clone();
-    tokio::task::spawn_blocking(move || {
-        let config = config::Config::load_snapshot(&paths)
-            .map_err(|error| ReloadError(format!("loading configuration: {error}")))?;
-        if previous.loaded_from_file() && !config.loaded_from_file() {
-            return Err(ReloadError(
-                "configuration file disappeared after a file-backed snapshot".into(),
-            ));
-        }
-        let lifetime_changed: Vec<&str> = [
-            (previous.listen() != config.listen()).then_some("listen"),
-            (previous.log_level() != config.log_level()).then_some("log_level"),
-            (previous.network() != config.network()).then_some("sandbox.network"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !lifetime_changed.is_empty() {
-            return Err(ReloadError(format!(
-                "process-lifetime settings changed in the config file ({}); restart the daemon to apply them",
-                lifetime_changed.join(", ")
-            )));
-        }
-        let sandbox_shell = account
-            .sandbox_shell(&config)
-            .map_err(|error| ReloadError(format!("selecting the sandbox shell: {error}")))?;
-        account::validate_executable(&sandbox_shell)
-            .map_err(|error| ReloadError(format!("validating the sandbox shell: {error}")))?;
-        let host_path = auth::resolve_authorized_keys_path()
-            .map_err(|error| ReloadError(format!("resolving authorized_keys: {error}")))?;
-        let auth = auth::AuthSnapshot::load(&host_path, paths.allowed_keys_file())
-            .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
-        let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell);
-        Ok(ReloadSnapshot {
-            config,
-            auth,
-            policy,
-        })
-    })
-    .await
-    .map_err(|error| ReloadError(format!("reload task failed: {error}")))?
-}
-
 enum DaemonSignal {
-    Reload,
+    ReloadKeys,
     Shutdown,
 }
 
@@ -630,7 +538,7 @@ impl SignalReceiver {
         tokio::select! {
             _ = self.interrupt.recv() => DaemonSignal::Shutdown,
             _ = self.terminate.recv() => DaemonSignal::Shutdown,
-            _ = self.hangup.recv() => DaemonSignal::Reload,
+            _ = self.hangup.recv() => DaemonSignal::ReloadKeys,
         }
     }
 

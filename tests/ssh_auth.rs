@@ -32,7 +32,6 @@ struct TestDaemon {
 struct KeyPair {
     private: PathBuf,
     public: PathBuf,
-    fingerprint: String,
 }
 
 impl Drop for TestDaemon {
@@ -59,22 +58,7 @@ fn generated_key(dir: &Path, name: &str) -> KeyPair {
         .status()
         .expect("ssh-keygen runs");
     assert!(status.success(), "ssh-keygen failed");
-    let output = Command::new("ssh-keygen")
-        .args(["-lf", public.to_str().expect("utf8 path")])
-        .output()
-        .expect("ssh-keygen -lf runs");
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    // `3072 SHA256:... name (ED25519)` - the digest is the second field.
-    let fingerprint = text
-        .split_whitespace()
-        .nth(1)
-        .expect("fingerprint")
-        .to_string();
-    KeyPair {
-        private,
-        public,
-        fingerprint,
-    }
+    KeyPair { private, public }
 }
 
 fn free_port() -> u16 {
@@ -228,6 +212,14 @@ impl TestDaemon {
         stderr_reader.join().expect("stderr reader thread")
     }
 
+    /// Stop the daemon cleanly and return everything it wrote to stderr.
+    /// The stderr pipe is read to EOF, so this only completes after exit.
+    fn stop_and_collect_stderr(&mut self) -> String {
+        self.send_signal(libc::SIGTERM);
+        self.child.wait().expect("wait for daemon exit");
+        self.read_stderr()
+    }
+
     fn sandbox_workspace(&self, id: &str) -> PathBuf {
         self._root
             .path()
@@ -244,18 +236,6 @@ impl TestDaemon {
         write_key_source(&self.sandbox_allowed_keys, content, "allowed keys");
     }
 
-    fn set_admin_keys(&self, admin_keys: &[&str]) {
-        if admin_keys.contains(&"admin")
-            || admin_keys.contains(&self.admin_key.fingerprint.as_str())
-        {
-            self.set_host_keys(
-                &std::fs::read_to_string(&self.admin_key.public).expect("admin pub"),
-            );
-        } else {
-            self.set_host_keys("");
-        }
-    }
-
     /// Replace the whole config file content with a complete new document.
     fn set_config(&self, content: &str) {
         std::fs::write(&self.config_path, content).expect("write config");
@@ -270,8 +250,10 @@ impl TestDaemon {
         assert_eq!(result, 0, "sending signal {signal} to daemon pid {pid}");
     }
 
-    /// Ask this daemon to reload its configuration from the fixture path.
-    fn reload(&self) {
+    /// Send SIGHUP: the daemon invalidates its cached key-file identities so
+    /// the next authentication request re-validates both key sources. The
+    /// config file is never re-read; applying a config change needs a restart.
+    fn sighup(&self) {
         self.send_signal(libc::SIGHUP);
     }
 
@@ -806,7 +788,6 @@ fn key_present_in_both_files_receives_admin_role() {
     let admin_pub = std::fs::read_to_string(&daemon.admin_key.public).expect("admin pub");
     let normal_pub = std::fs::read_to_string(&daemon.normal_key.public).expect("normal pub");
     daemon.set_allowed_keys(&format!("{normal_pub}\n{admin_pub}\n"));
-    daemon.reload();
 
     let result = retry_until("overlap admin key access", || {
         let result = daemon.ssh(&daemon.admin_key, "_", "printf host-access", &["-T"]);
@@ -1326,57 +1307,84 @@ fn env_requests_are_rejected_and_connections_stay_usable() {
     let _ = std::fs::remove_file(control_path);
 }
 
-/// A malformed SIGHUP snapshot is rejected without changing the current
-/// authentication snapshot used by subsequent connections.
+/// A key added to a key file is accepted by the very next authentication
+/// request, with no signal of any kind.
 #[test]
-fn invalid_sighup_reload_keeps_previous_auth_snapshot() {
+fn key_file_change_applies_on_the_next_auth_without_a_signal() {
     let daemon = TestDaemon::start(&["admin"]);
-    std::fs::write(&daemon.config_path, "admin_keys = [\n").expect("write invalid config");
-    daemon.reload();
+    let extra_home = ssh_tempdir();
+    let added = generated_key(extra_home.path(), "added");
 
-    let result = retry_until("admin access after invalid SIGHUP", || {
-        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-snapshot", &["-T"]);
-        (result.ok() && result.stdout == "old-snapshot").then_some(result)
+    // Before the file change the minted key is unknown.
+    let before = daemon.ssh(&added, "dev", "printf added", &["-T"]);
+    assert!(!before.ok(), "unknown key must be refused: {before:?}");
+
+    // Append it to allowed_keys. No signal is sent from here on.
+    let normal_pub = std::fs::read_to_string(&daemon.normal_key.public).expect("normal pub");
+    let added_pub = std::fs::read_to_string(&added.public).expect("added pub");
+    daemon.set_allowed_keys(&format!("{normal_pub}\n{added_pub}\n"));
+
+    let after = retry_until("added key accepted without a signal", || {
+        let result = daemon.ssh(&added, "dev", "printf added", &["-T"]);
+        (result.ok() && result.stdout == "added").then_some(result)
     });
-    assert_eq!(result.stdout, "old-snapshot");
+    assert_eq!(after.stdout, "added");
+
+    // The same applies to the host source: writing the added key into
+    // authorized_keys promotes it to Admin on the next request, no signal.
+    daemon.set_host_keys(&format!("{added_pub}\n"));
+    let promoted = retry_until("added key promoted to admin without a signal", || {
+        let result = daemon.ssh(&added, "_", "printf promoted", &["-T"]);
+        (result.ok() && result.stdout == "promoted").then_some(result)
+    });
+    assert_eq!(promoted.stdout, "promoted");
+
+    // Replacing the host file also revokes the previous admin key on the
+    // next request, with no signal.
+    let admin = daemon.ssh(&daemon.admin_key, "_", "printf host-ok", &["-T"]);
+    assert!(
+        !admin.ok(),
+        "replacing the host file must revoke the previous admin key: {admin:?}"
+    );
 }
 
-/// SIGHUP changes roles only for new connections: removing the last admin,
-/// retaining an already authenticated admin connection, and restoring the
-/// key all use the real OpenSSH client path.
+/// A key removed from its file is refused by the next authentication request
+/// while an already authenticated connection keeps its fixed principal.
 #[test]
-fn sighup_admin_keys_update_new_connections_and_preserve_existing_role() {
+fn removed_key_is_rejected_on_the_next_auth() {
     let daemon = TestDaemon::start(&["admin"]);
-    let control_path = std::env::temp_dir().join(format!("shbox-hup-{}", std::process::id()));
-    let _ = std::fs::remove_file(&control_path);
+    let first = daemon.ssh(&daemon.normal_key, "dev", "printf before", &["-T"]);
+    assert!(first.ok(), "normal key broken before removal: {first:?}");
 
-    let first = daemon.ssh_with_control(
+    let control_path = std::env::temp_dir().join(format!("shbox-keyrm-{}", std::process::id()));
+    let _ = std::fs::remove_file(&control_path);
+    let master = daemon.ssh_with_control(
         &daemon.admin_key,
         "_",
         "printf existing-before",
         &control_path,
         "yes",
     );
-    assert!(first.status.success(), "control master failed: {first:?}");
-    assert_eq!(first.stdout, b"existing-before");
+    assert!(master.status.success(), "control master failed: {master:?}");
+    assert_eq!(master.stdout, b"existing-before");
     let _ = retry_until("ControlMaster readiness", || {
         let check = daemon.control_operation(&daemon.admin_key, "_", &control_path, "check");
         check.status.success().then_some(check)
     });
 
-    daemon.set_admin_keys(&[]);
-    daemon.reload();
-
-    let denied = retry_until("new admin connection after admin removal", || {
-        let result = daemon.ssh(&daemon.admin_key, "_", "printf should-not-run", &["-T"]);
+    // Empty allowed_keys removes the normal key; no signal is sent.
+    daemon.set_allowed_keys("");
+    let denied = retry_until("normal key denied after file removal", || {
+        let result = daemon.ssh(&daemon.normal_key, "dev", "printf should-not-run", &["-T"]);
         (result.status == 255 && result.stderr.contains("Permission denied")).then_some(result)
     });
     assert!(
         !denied.ok(),
-        "new connection must lose admin role: {denied:?}"
+        "removed key must lose access on the next auth: {denied:?}"
     );
 
-    let existing = retry_until("existing admin connection after admin removal", || {
+    // The existing admin connection keeps the principal it authenticated with.
+    let existing = retry_until("existing admin connection after key removal", || {
         let check = daemon.control_operation(&daemon.admin_key, "_", &control_path, "check");
         if !check.status.success() {
             return None;
@@ -1391,81 +1399,146 @@ fn sighup_admin_keys_update_new_connections_and_preserve_existing_role() {
         (result.status.success() && result.stdout == b"existing-after").then_some(result)
     });
     assert_eq!(existing.stdout, b"existing-after");
+    let _ = daemon.control_operation(&daemon.admin_key, "_", &control_path, "exit");
+    let _ = std::fs::remove_file(control_path);
 
-    daemon.set_admin_keys(&[daemon.admin_key.fingerprint.as_str()]);
-    daemon.reload();
+    // Writing the key back applies again on the next attempt.
+    let normal_pub = std::fs::read_to_string(&daemon.normal_key.public).expect("normal pub");
+    daemon.set_allowed_keys(&format!("{normal_pub}\n"));
+    let restored = retry_until("normal key restored after rewrite", || {
+        let result = daemon.ssh(&daemon.normal_key, "dev", "printf restored", &["-T"]);
+        (result.ok() && result.stdout == "restored").then_some(result)
+    });
+    assert_eq!(restored.stdout, "restored");
+}
 
-    let restored = retry_until("new admin connection after admin restore", || {
+/// A malformed key file is parsed once, rejected, and logged; the previous
+/// snapshot keeps serving until the file is fixed, and fixing it applies on
+/// the next attempt.
+#[test]
+fn malformed_key_file_keeps_previous_snapshot_and_recovers() {
+    let mut daemon = TestDaemon::start(&["admin"]);
+    daemon.set_allowed_keys("not-a-valid-ssh-ed25519-key\n");
+
+    // The rejected refresh keeps the previous snapshot live.
+    let stale = daemon.ssh(&daemon.normal_key, "dev", "printf old-auth", &["-T"]);
+    assert!(stale.ok(), "previous snapshot was dropped: {stale:?}");
+    // A stable broken file costs one rejected parse, not one per request.
+    let again = daemon.ssh(&daemon.normal_key, "dev", "printf old-auth", &["-T"]);
+    assert!(again.ok(), "retry storm rejected valid auth: {again:?}");
+
+    let normal_pub = std::fs::read_to_string(&daemon.normal_key.public).expect("normal pub");
+    daemon.set_allowed_keys(&format!("{normal_pub}\n"));
+    let recovered = retry_until("malformed allowed_keys recovered", || {
+        let result = daemon.ssh(&daemon.normal_key, "dev", "printf new-auth", &["-T"]);
+        (result.ok() && result.stdout == "new-auth").then_some(result)
+    });
+    assert_eq!(recovered.stdout, "new-auth");
+
+    // Across the whole run the broken state was parsed and logged once.
+    let stderr = daemon.stop_and_collect_stderr();
+    assert!(
+        stderr.contains("key source refresh rejected"),
+        "rejected refresh must be logged: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("key source refresh rejected").count(),
+        1,
+        "a stable broken file must be parsed once: {stderr}"
+    );
+}
+
+/// SIGHUP forces a revalidation even when both stat identities are unchanged:
+/// an ancestor-directory permission drift, invisible to the per-request
+/// identity check, is caught by the forced re-read and logged while the
+/// previous snapshot keeps serving.
+#[test]
+fn sighup_forces_revalidation_of_unchanged_identities() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut daemon = TestDaemon::start(&["admin"]);
+    let ssh_dir = daemon
+        .host_authorized_keys
+        .parent()
+        .expect("ssh dir")
+        .to_path_buf();
+
+    // Make the ancestor unsafe without touching either key file.
+    std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o770))
+        .expect("chmod ssh dir");
+    let stale = daemon.ssh(&daemon.admin_key, "_", "printf previous-snapshot", &["-T"]);
+    assert!(
+        stale.ok(),
+        "unchanged identities must keep serving: {stale:?}"
+    );
+
+    daemon.sighup();
+    // The forced revalidation rejects the unsafe ancestor and keeps the
+    // previous snapshot serving.
+    let after = daemon.ssh(&daemon.admin_key, "_", "printf forced", &["-T"]);
+    assert!(after.ok(), "rejected refresh must keep serving: {after:?}");
+
+    // Restoring the mode applies on the next forced revalidation.
+    std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore ssh dir");
+    daemon.sighup();
+    let restored = retry_until("clean revalidation after mode restore", || {
         let result = daemon.ssh(&daemon.admin_key, "_", "printf restored", &["-T"]);
         (result.ok() && result.stdout == "restored").then_some(result)
     });
     assert_eq!(restored.stdout, "restored");
 
-    let _ = daemon.control_operation(&daemon.admin_key, "_", &control_path, "exit");
-    let _ = std::fs::remove_file(control_path);
+    // The forced re-read is observable in the log: it rejected the unsafe
+    // ancestor before the mode was restored.
+    let stderr = daemon.stop_and_collect_stderr();
+    assert!(
+        stderr.contains("parent is group or world writable"),
+        "forced revalidation must report the unsafe ancestor: {stderr}"
+    );
 }
 
-/// Changing a process-lifetime field (`listen`, `log_level`,
-/// `[sandbox] network`) in the config file rejects the whole reload,
-/// preserving the prior snapshot instead of applying only the other changed
-/// fields. Each document is a complete, individually valid config, so the
-/// rejection is exactly the startup-only-field rule.
+/// The config file is restart-only: neither SIGHUP nor an authentication
+/// request re-reads it, so edits — invalid or valid — stay inert until a
+/// restart.
 #[test]
-fn sighup_startup_only_field_change_is_rejected_atomically() {
-    let daemon = TestDaemon::start(&["admin"]);
-    let changes = [
-        (
-            "listen",
-            format!("listen = [\"127.0.0.1:{}\"]\n", free_port()),
-        ),
-        ("log_level", "log_level = \"debug\"\n".to_string()),
-        ("network", "[sandbox]\nnetwork = \"outbound\"\n".to_string()),
-    ];
-    for (name, config) in changes {
-        daemon.set_config(&config);
-        daemon.set_admin_keys(&[]);
-        daemon.reload();
+fn config_toml_edit_is_ignored_until_restart() {
+    let mut daemon = TestDaemon::start(&["admin"]);
+    // A broken config file is never re-read: SIGHUP and the next auth both
+    // keep working, and nothing reports a reload failure.
+    daemon.set_config("admin_keys = [\n");
+    daemon.sighup();
+    let result = daemon.ssh(&daemon.admin_key, "_", "printf alive", &["-T"]);
+    assert!(
+        result.ok(),
+        "auth broke after invalid config edit: {result:?}"
+    );
 
-        let result = retry_until(&format!("admin access after {name} change reload"), || {
-            let result = daemon.ssh(&daemon.admin_key, "_", "printf old-snapshot", &["-T"]);
-            (result.ok() && result.stdout == "old-snapshot").then_some(result)
-        });
-        assert_eq!(
-            result.stdout, "old-snapshot",
-            "{name} change must not reload"
-        );
-    }
-}
+    // A valid but different document is equally inert: its sandbox network
+    // mode and env never reach a launched process without a restart.
+    daemon.set_config(
+        "[sandbox]\nnetwork = \"outbound\"\n\n[sandbox.env]\nSHBOX_CONFIG_EDIT = \"applied\"\n",
+    );
+    daemon.sighup();
+    let env_probe = daemon.ssh(
+        &daemon.normal_key,
+        "dev",
+        "printf env=${SHBOX_CONFIG_EDIT-unset}",
+        &["-T"],
+    );
+    assert!(env_probe.ok(), "sandbox launch broke: {env_probe:?}");
+    assert_eq!(
+        env_probe.stdout, "env=unset",
+        "a config edit must not apply without a restart"
+    );
 
-/// Emptying both key files on reload causes an empty union error, keeping the
-/// previous valid auth snapshot.
-#[test]
-fn sighup_empty_union_rejected_atomically() {
-    let daemon = TestDaemon::start(&["admin"]);
-    daemon.set_host_keys("");
-    daemon.set_allowed_keys("");
-    daemon.reload();
-
-    let result = retry_until("admin access after empty union reload", || {
-        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-auth", &["-T"]);
-        (result.ok() && result.stdout == "old-auth").then_some(result)
-    });
-    assert_eq!(result.stdout, "old-auth");
-}
-
-/// A malformed allowed_keys file rejects the whole reload atomically,
-/// preserving the previous auth snapshot.
-#[test]
-fn sighup_malformed_allowed_keys_rejected_atomically() {
-    let daemon = TestDaemon::start(&["admin"]);
-    daemon.set_allowed_keys("not-a-valid-ssh-ed25519-key\n");
-    daemon.reload();
-
-    let result = retry_until("admin access after malformed allowed_keys reload", || {
-        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-auth", &["-T"]);
-        (result.ok() && result.stdout == "old-auth").then_some(result)
-    });
-    assert_eq!(result.stdout, "old-auth");
+    let stderr = daemon.stop_and_collect_stderr();
+    assert!(
+        !stderr.contains("reloaded"),
+        "nothing may log a reload: {stderr}"
+    );
+    assert!(
+        !stderr.contains("sandbox.network"),
+        "no reload may re-evaluate the network mode: {stderr}"
+    );
 }
 
 /// The daemon exits cleanly on SIGTERM.

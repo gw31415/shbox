@@ -100,7 +100,7 @@ ssh dev@shbox.example.com
 
 有効な公開鍵で認証し、username が有効な SandboxId なら、sandbox を atomic に get-or-create して shell channel を開始する。SSH client が username を省略した場合は client が選んだデフォルト username が送信される。匿名 username は存在しない。
 
-通常の sandbox shell のデフォルトは daemon を実行する OS ユーザーの login shell である。passwd entry が空の場合だけ `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または実行できない場合は起動・reload を失敗させる。interactive shell は login mode で起動する。設定の `[sandbox] shell` が指定されている場合はその絶対 path を使用する。
+通常の sandbox shell のデフォルトは daemon を実行する OS ユーザーの login shell である。passwd entry が空の場合だけ `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または実行できない場合は起動を失敗させる。interactive shell は login mode で起動する。設定の `[sandbox] shell` が指定されている場合はその絶対 path を使用する。
 
 ### 5.2 Remote command
 
@@ -182,8 +182,8 @@ host mode は SFTP subsystem、port forwarding、agent forwarding、X11 forwardi
 admin key が `_` 以外の有効な SandboxId を指定した場合は、その sandbox の admin として扱う。存在しない ID を admin が最初に作成した場合、その admin key の fingerprint を owner として metadata に記録する。
 
 host authorized_keys に Admin key を一つも登録しない構成も有効であり、sandbox-only mode
-になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。host key の設定
-変更は [configuration.md](./configuration.md) の reload 規則に従う。
+になる。この場合 `_` は利用できず、全件管理と host bypass は存在しない。鍵 file の変更は
+[configuration.md](./configuration.md) の鍵更新規則に従い、次の認証要求から適用される。
 
 ## 7. 所有権と可視性
 
@@ -217,8 +217,8 @@ socket を egress-only に制約する security boundary は約束しない。pr
 firewall で遮断する。これは shbox の意味論であり、Arapuca の raw profile option は
 設定ファイルに露出しない（`[sandbox] network` という public 選択だけが設定可能である）。
 host mode は sandbox network policy の対象外である。
-network mode は process-lifetime であり、SIGHUP で変わらない。config file 上で変えた
-SIGHUP は reload 全体を拒否され、適用には restart が必要である。
+network mode は process-lifetime であり、再読込は行われない。config file 上で変えた
+場合は daemon の restart が必要である。
 
 workspace は sandbox process の HOME と cwd になる。追加の sandbox environment は config からのみ注入し、loader injection、`ARAPUCA_*`、その他の管理用変数は受け付けない。詳細は [configuration.md](./configuration.md) を参照する。
 
@@ -251,7 +251,7 @@ v0.1 の外部契約はリリースごとに固定する。0.x の minor release
 
 ## 12. 関連文書
 
-- [configuration.md](./configuration.md): TOML、既定値、reload、固定パス
+- [configuration.md](./configuration.md): TOML、既定値、鍵更新、固定パス
 - [security.md](./security.md): 脅威境界、認証、ownership、host bypass
 - [architecture.md](./architecture.md): module、state、storage、lifecycle
 - [ssh-protocol.md](./ssh-protocol.md): russh channel、PTY、stream、終了規則

@@ -15,17 +15,19 @@ use russh::server::{Auth, Session};
 use russh::{ChannelId, Pty};
 
 use crate::account::Account;
-use crate::auth::{AuthSnapshot, Principal, Role};
+use crate::auth::{Principal, Role};
 use crate::platform;
 use crate::sandbox::{SandboxId, SandboxManager};
 
 use channel::{ChannelEvent, ChannelOperation, ChannelRegistry};
 
-/// Immutable state shared by all connections, captured per connection so a
-/// later reload can only affect new connections.
+/// State shared by all connections, captured per connection at accept time.
+/// Everything in it is fixed for the process lifetime except the accepted-key
+/// set: [`crate::auth::KeyStore`] re-validates the key sources internally at
+/// authentication-request time.
 #[derive(Debug, Clone)]
 pub(crate) struct Shared {
-    pub auth: Arc<AuthSnapshot>,
+    pub auth: Arc<crate::auth::KeyStore>,
     pub account: Arc<Account>,
     pub sandbox: Arc<SandboxManager>,
 }
@@ -395,9 +397,13 @@ impl russh::server::Handler for ConnHandler {
         user: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        // Role assignment happens only here, after russh verified the
-        // signature; offered-key probes never touch this state.
-        let Some(principal) = self.shared.auth.authenticate(public_key) else {
+        // Key sources are re-validated here, before the role lookup, so a file
+        // edit is visible to the very next authentication attempt with no
+        // signal. A rejected refresh keeps serving the previous snapshot.
+        // Role assignment happens only after russh verified the signature;
+        // offered-key probes never touch this state.
+        let snapshot = self.shared.auth.snapshot_for_auth().await;
+        let Some(principal) = snapshot.authenticate(public_key) else {
             return Ok(Auth::reject());
         };
         if user == "_" && principal.role != Role::Admin {

@@ -198,7 +198,8 @@ startup は概ね次の順序で行う。
    どちらか一方でも失敗したら、取得済み lock を解放して起動を失敗させる。
 3. optional config を読み、file-backed policy とトップレベルの operational 設定を検証する。
 4. `listen` と `log_level` を config 値と CLI 層から確定し、logging を初期化する。
-5. host authorized_keys と sandbox allowed_keys を読み、合成 authentication snapshot を検証する。
+5. host authorized_keys と sandbox allowed_keys を読み、検証済み鍵集合を保持する鍵ストア
+   （`KeyStore`）を構築する。以降は認証要求ごとに鍵 file の状態を比較し、変化時だけ全検証する。
 6. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
 7. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
 8. 初期 authentication snapshot に Admin key があれば managed mode として扱い、listener を
@@ -215,8 +216,8 @@ valid Ed25519 key が必要である。host authorized_keys 由来の Admin key 
 - sandbox-only mode は reconciliation 完了後に listener を公開する。
 - backend initialization に失敗しても daemon 自体は起動できる。host mode と、
   reconciliation 後の認可済み metadata list/delete は利用できるが、sandbox launch は
-  fail closed する。backend は SIGHUP や接続ごとに再構築せず、process 起動の復旧には
-  daemon restart が必要である。
+  fail closed する。backend は起動時に一度だけ構築し、接続ごとに再構築せず、process 起動の
+  復旧には daemon restart が必要である。
 - 複数 listen address の bind は all-or-nothing である。一つでも失敗すれば起動しない。
 
 同じ data root または同じ state root を使う二つ目の daemon は、別 listener でも lock
@@ -343,24 +344,28 @@ process list や directory 名だけを正本にしてはならない。
 同時 create/delete を全体 lock で停止しない。各 ID の atomic metadata publish と状態を
 使って一貫した各 entry を読み、集合全体について linearizable snapshot は約束しない。
 
-## 11. Reload and shutdown
+## 11. 鍵の更新と shutdown
 
-`SIGHUP` は config、host/allowed key source、sandbox policy を完全に読み直し、すべて検証できた場合だけ
-immutable snapshot を atomic に交換する。失敗時は旧 snapshot を保持する。以前存在した
-config file が消えた場合も reload failure とし、暗黙に defaults へ戻さない。
+config file、sandbox policy、組み込み caps/limits は process-lifetime であり、再読込は
+一切行わない。適用には daemon の restart が必要である。再読込の対象は鍵 file だけである。
+`KeyStore` は公開鍵認証要求のたびに両鍵 file の identity（device/inode/ctime/size、欠落を含む）
+を比較し、変化があれば `SIGHUP` なしで両 source を読み直して全検証し、成功した場合だけ
+immutable snapshot を atomic に交換する。失敗時は旧 snapshot を保持し、観測した identity を
+採用して次の変化まで再 parse しない。`SIGHUP` は identity が不変でも次の認証要求で強制
+再検証を行う手動 trigger であり、config は読み直さない。
 
-reload の適用範囲は次のとおりである。
+鍵更新の適用範囲は次のとおりである。
 
-- 新しい connection: 新しい auth/admin snapshot
+- 新しい認証要求: 現時点の auth/admin snapshot
 - 既存 connection: 認証時の principal/role を切断まで保持
-- 新しい process: 新しい shell/env/read path snapshot と、不変の `[sandbox] network`/built-in limits
 - 実行中 process: 変更しない
 - `listen`、`log_level`、`[sandbox] network` と built-in capacity/limits: 固定。config file
-  でこれらを変えた SIGHUP は reload 全体を拒否する
-- host key、storage root、Arapuca backend: 固定、reload しない
+  を書き換えても稼働中の daemon には適用されない
+- host key、storage root、Arapuca backend: 固定、更新しない
 
-reload により最後の admin を削除して sandbox-only mode へ移行できる。既存 admin connection
-の host 権限は切断まで残る。
+最後の admin を鍵 file から削除すると、新しい host route 認証だけが拒否される。起動時に
+決めた managed/sandbox-only mode、listener、reconciliation 動作は変わらない。既存 admin
+connection の host 権限は切断まで残る。
 
 `SIGINT`/`SIGTERM` の最初の受信で新規 connection/request を停止し、全 runtime process を
 並列に終了し、最大 5 秒で強制終了して listener と lock を閉じる。二回目の signal は即時

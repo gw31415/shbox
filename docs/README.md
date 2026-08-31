@@ -9,7 +9,7 @@
 2. [Security model](security.md) — 認証、所有権、admin/host access、信頼境界
 3. [SSH protocol](ssh-protocol.md) — request、channel、PTY、stream、終了規則
 4. [Architecture and lifecycle](architecture.md) — module 境界、永続状態、並行処理、復旧
-5. [Configuration](configuration.md) — TOML schema、既定値、validation、reload
+5. [Configuration](configuration.md) — TOML schema、既定値、validation、鍵の更新
 6. [Platforms](platforms.md) — Arapuca Adapter、OS 差、配備条件、正式対応範囲
 7. [Testing and release gates](testing.md) — acceptance test と正式対応の証明条件
 

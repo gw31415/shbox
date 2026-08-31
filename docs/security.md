@@ -100,19 +100,21 @@ ssh-ed25519 <base64-public-key> [comment]
   正常であり、Admin が優先される。
 - 1 行は最大 8 KiB、ファイル全体は最大 1 MiB とする。
 - 各 source は個別には未作成または空を許すが、二つを合成した結果に有効な鍵が
-  一つもない場合は起動・reload 全体を拒否する。
+  一つもない場合は起動、および鍵 file 変更後の最初の認証要求を拒否する。
 
 存在する鍵ファイルと親ディレクトリ、設定ファイル、XDG state/data の
 管理ディレクトリは daemon user が所有し、group/world writable であってはならない。
 上位 ancestor にも write permission 検査を適用し、最終 path は `O_NOFOLLOW` で開く。
-権限不備は起動・reload の失敗とする。秘密鍵を authorized_keys / allowed_keys に置かず、host
+権限不備は起動と鍵再検証の失敗とする。秘密鍵を authorized_keys / allowed_keys に置かず、host
 private key は XDG state 配下の mode `0600` のファイルに保存する。
 
 ### 2.3 認証 snapshot
 
 起動時に host 認可鍵と sandbox 許可鍵を読み込み、immutable な snapshot を構築する。
-`SIGHUP` では新しい内容を全体検証し、成功した場合だけ一括で置き換える。失敗した場合は
-直前の認証設定を保持し、既存接続も新規接続も中断しない。
+以降は公開鍵認証要求ごとに鍵 file の状態（device/inode/ctime/size、欠落を含む）を比較し、
+変化を検出したときだけ起動時と同一の全検証を行う。検証に失敗した場合は直前の認証設定を
+保持し、既存接続も新規接続も中断しない。`SIGHUP` は file の状態が変わらなくても次の
+認証要求で強制的に再検証を行う手動 trigger である。
 
 認証成功時に connection へ、少なくとも次を保存する。
 
@@ -120,9 +122,9 @@ private key は XDG state 配下の mode `0600` のファイルに保存する�
 - Normal / Admin の role。
 - 認証時 username と selector context。
 
-この snapshot は接続が閉じるまで変わらない。reload で key を削除しても既存
+この snapshot は接続が閉じるまで変わらない。鍵 file から key を削除しても既存
 connection は切断されず、既存 connection が開く新しい channel も同じ role を
-使う。新規 connection は新しい auth snapshot で認証する。
+使う。新しい認証要求は現時点の auth snapshot で認証する。
 
 ## 3. role、selector、所有権
 
@@ -283,7 +285,7 @@ operator は機密情報を workspace、環境、read-only path に置かない�
 ### 5.4 resource cap
 
 既定の同時実行上限は次のとおりである。これらは daemon 全体または sandbox 全体の
-built-in safety policy であり、config file や reload から変更できない。
+built-in safety policy であり、config file から変更できない。
 
 | 対象 | 既定値 |
 |---|---:|
@@ -384,7 +386,7 @@ stdout/stderr は変換・記録せず、process の出力をそのまま転送�
 を付ける。file log、rotation、`RUST_LOG` は v0.1 にない。`log_level` は
 `error`、`warn`、`info`、`debug`、`trace` から設定し、既定は `info`。CLI
 `--log-level` を指定すると config 値を置き換える。process-lifetime
-の値であり、SIGHUP では reload しない。
+の値であり、再読込は行われない。
 
 必要な監査情報として、connection ID、channel ID、remote IP、key fingerprint、
 role、selector/ID、operation、result、duration、exit status を記録してよい。
@@ -402,17 +404,18 @@ invariant violation は位置と backtrace を log して daemon を abort す�
 切断、EOF、invalid ID、通常の Arapuca/IO failure は operational/remote error と
 して処理し、remote input だけで daemon 全体を panic させない。
 
-## 9. reload と shutdown
+## 9. 鍵の更新と shutdown
 
-SIGHUP は config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy を
-全体検証したうえで atomic に反映する。`listen`、`log_level`、`[sandbox] network`、
-組み込み resource caps/limits、host key、data root の
-変更は process-lifetime または restart-only とし、SIGHUP で既存 listener や safety policy
-を切り替えない。これらの値を変えた config による reload は auth 変更を含めて全体が
-拒否され、reload failure は古い設定を保持する。
+host 認可鍵と sandbox 許可鍵は、公開鍵認証要求ごとの file 状態比較を通じて自動的に
+再検証され、全検証に成功した場合だけ atomic に反映する。`SIGHUP` は次の認証要求での
+強制再検証 trigger である。`listen`、`log_level`、`[sandbox] network`、
+組み込み resource caps/limits、host key、data root、config file 全体は
+process-lifetime または restart-only とし、稼働中の listener や safety policy
+を切り替えない。config file は起動時に一度だけ読まれ、再読込は行われない。
+鍵再検証の失敗は直前の認証設定を保持する。
 
-最後の admin key を reload で削除すると、新規 connection は sandbox-only mode になり、
-新しい admin/host access はできなくなる。既存の admin connection は connection
+最後の admin key を鍵 file から削除すると、新しい host route 認証は拒否されるが、
+daemon が起動時に決めた動作 mode は変わらない。既存の admin connection は connection
 snapshot の規則に従い、disconnect まで権利を保持する。
 
 SIGINT/SIGTERM では新しい認証・channel・process を受け付けず、既存の process/PTY
@@ -428,7 +431,7 @@ metadata は削除しない。二度目の signal は即時 force stop とする
 - owner/admin/非 owner の shell、exec、list、delete の認可 matrix。
 - `_` の host access、通常 key の拒否、admin の `_` delete 拒否。
 - host 認可鍵 / sandbox 許可鍵の malformed/options/certificate/unsupported key、サイズ、
-  permission、二 source 合成、atomic SIGHUP reload。
+  permission、二 source 合成、鍵 file 変更の次の認証要求への反映と失敗時の維持。
 - key 削除後の既存 connection snapshot と、新規 connection の拒否。
 - 同時 claim、delete 中の新規 request、corrupt metadata、symlink traversal、
   restart 後の owner persistence。

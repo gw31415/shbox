@@ -6,8 +6,8 @@
 //! authentication succeeds; authenticated connections have no idle timeout.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use russh::server::{self, Config};
@@ -256,7 +256,7 @@ impl Drop for LimiterSlot {
 
 /// The running SSH server.
 pub struct SshServer {
-    shared: RwLock<crate::ssh::Shared>,
+    shared: crate::ssh::Shared,
     host_key: russh::keys::PrivateKey,
     limiter: Arc<Limiter>,
     host_process_limiter: Arc<HostProcessLimiter>,
@@ -266,24 +266,19 @@ pub struct SshServer {
 
 impl SshServer {
     /// Build the server: the russh transport configuration derives from the
-    /// host key and the built-in caps.
+    /// host key and the built-in caps. The shared state is fixed for the
+    /// process lifetime; the accepted-key set updates itself inside
+    /// [`crate::auth::KeyStore`] at authentication time.
     pub fn new(shared: crate::ssh::Shared, host_key: russh::keys::PrivateKey) -> SshServer {
         let caps = Caps::default();
         SshServer {
-            shared: RwLock::new(shared),
+            shared,
             host_key,
             limiter: Arc::new(Limiter::new(&caps)),
             host_process_limiter: Arc::new(HostProcessLimiter::new(&caps)),
             host_tasks: Arc::new(HostTaskRegistry::default()),
             caps,
         }
-    }
-
-    /// Publish an all-or-nothing runtime snapshot for future connections.
-    /// Existing handlers already own a clone of the previous `Shared` value.
-    pub(crate) fn reload(&self, shared: crate::ssh::Shared) {
-        let mut current = self.shared.write().expect("server shared state");
-        *current = shared;
     }
 
     /// Force-kill host process groups when a second shutdown signal bypasses
@@ -361,12 +356,7 @@ impl SshServer {
                     // Stop sandbox processes before waiting for connection
                     // tasks. Their channel bridges may otherwise be waiting
                     // on a child that no longer has a client transport.
-                    let manager = self
-                        .shared
-                        .read()
-                        .expect("server shared state")
-                        .sandbox
-                        .clone();
+                    let manager = Arc::clone(&self.shared.sandbox);
                     let _ = tokio::task::spawn_blocking(move || manager.shutdown_runtime()).await;
                     while listener_tasks.join_next().await.is_some() {}
                     break;
@@ -391,13 +381,10 @@ impl SshServer {
         if *shutdown.borrow() {
             return;
         }
-        let (shared, slot) = {
-            let shared_guard = self.shared.read().expect("server shared state");
-            let Some(slot) = self.limiter.admit() else {
-                tracing::debug!(?peer, "connection cap reached; refusing connection");
-                return; // Dropping the stream is the resource-exhaustion refusal.
-            };
-            (shared_guard.clone(), slot)
+        let shared = self.shared.clone();
+        let Some(slot) = self.limiter.admit() else {
+            tracing::debug!(?peer, "connection cap reached; refusing connection");
+            return; // Dropping the stream is the resource-exhaustion refusal.
         };
         let caps = self.caps;
         let conn = Arc::new(crate::ssh::ConnState {

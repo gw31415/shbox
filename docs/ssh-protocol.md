@@ -30,9 +30,9 @@ keyboard-interactive や Ed25519 以外は reject する。authentication timeou
 30 秒、最大 authentication attempts は 6 回である。認証済み connection に
 idle timeout は設定しないが、全接続数と channel 数の cap は継続して適用する。
 
-`SIGHUP` で認証設定が reload されても、既存 connection の role は変わらない。
-key が削除された既存 admin connection も disconnect まで admin として動く。新規
-connection は reload 後の key 一覧で認証する。
+鍵 source が更新されても、既存 connection の role は変わらない。
+key が削除された既存 admin connection も disconnect まで admin として動く。新しい
+認証要求はその時点の key 一覧で認証する。
 
 ### 1.2 channel-scoped state
 
@@ -241,7 +241,7 @@ v0.1 では list/delete の追加オプションや独自 parser を定義しな
 設定の `[sandbox] shell` が指定されていればその absolute executable path を使う。未設定
 なら daemon OS user の passwd entry にある login shell を使い、entry が空の場合だけ
 `/bin/sh` を fallback とする。選ばれた非空 path が存在しない、通常 file でない、または
-実行できない場合は startup/reload error とする。host mode でも同じ daemon account の
+実行できない場合は startup error とする。host mode でも同じ daemon account の
 login shell と home cwd を使う。`/bin/sh` は常に強制する値ではない。
 
 ### 4.2 interactive shell

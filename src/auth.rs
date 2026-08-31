@@ -16,6 +16,10 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::paths::{self};
 
@@ -364,9 +368,11 @@ pub enum Role {
     Admin,
 }
 
-/// The validated authentication snapshot: accepted Ed25519 keys mapped to their
-/// roles. Connections capture their own clone, so a later reload can only
-/// affect new connections.
+/// The validated authentication snapshot: accepted Ed25519 keys mapped to
+/// their roles. Snapshots are immutable; the live accepted-key set lives in
+/// [`KeyStore`], which swaps one in only after both key sources re-validate in
+/// full. A connection keeps the `Principal` it authenticated with, so a later
+/// refresh never changes an existing connection's role.
 #[derive(Debug, Clone, Default)]
 pub struct AuthSnapshot {
     keys: Vec<AuthorizedKey>,
@@ -528,6 +534,209 @@ impl AuthSnapshot {
 /// Maximum size of a single authorized_keys line.
 pub const MAX_AUTHORIZED_KEYS_LINE_BYTES: usize = 8 * 1024;
 
+/// The observable state of one key source path, taken with
+/// `fs::symlink_metadata` so the identity describes the directory entry
+/// itself, never a symlink target.
+///
+/// A missing path is a first-class identity: both key sources may legitimately
+/// be absent. `ctime` rather than `mtime` is part of the identity because a
+/// permission-only change (exactly what [`validate_key_source_file`] exists to
+/// reject) moves `ctime` while leaving `mtime` untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIdentity {
+    /// The path does not exist. Any stat failure folds into this variant on
+    /// purpose: it still counts as a change against a cached inode, and the
+    /// authoritative reason surfaces from the following full validation.
+    Absent,
+    /// A statable directory entry: device, inode, status-change time, size.
+    Inode {
+        dev: u64,
+        ino: u64,
+        ctime_ns: i64,
+        size: u64,
+    },
+}
+
+/// What one request-time refresh check did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// Identities matched and no revalidation was forced: the live snapshot
+    /// was returned untouched.
+    Unchanged,
+    /// Both key sources were re-read, fully re-validated, and published.
+    Reloaded,
+}
+
+#[derive(Debug)]
+struct StoreState {
+    snapshot: Arc<AuthSnapshot>,
+    /// `[0]` is the host `authorized_keys` identity, `[1]` the sandbox
+    /// `allowed_keys` identity.
+    identities: [FileIdentity; 2],
+}
+
+/// The single live key store: the accepted-key snapshot plus the on-disk
+/// identities it was built from.
+///
+/// Every authentication request stats both key sources (two syscalls) and
+/// re-runs the full [`AuthSnapshot::load`] validation pipeline only when an
+/// identity changed or [`KeyStore::invalidate`] was called. A failed refresh
+/// never publishes: the previous snapshot keeps serving and the *observed*
+/// identities are adopted, so a broken file costs at most one rejected parse
+/// per on-disk change rather than one per request.
+///
+/// Locking: one [`std::sync::RwLock`], acquired only on blocking threads and
+/// never held across an `.await`. Holding it across the re-read is what makes
+/// concurrent refreshes single-flight. The store owns both paths so a future
+/// subsystem that manages keys can serialize the current list and write it
+/// back through this same validation path.
+#[derive(Debug)]
+pub struct KeyStore {
+    host_path: PathBuf,
+    allowed_path: PathBuf,
+    state: RwLock<StoreState>,
+    /// Set by [`KeyStore::invalidate`]; consumed under the write guard so a
+    /// forced re-read happens exactly once.
+    revalidate: AtomicBool,
+    /// `AuthSnapshot::load` attempts (initial load included), for tests.
+    #[cfg(test)]
+    loads: AtomicU64,
+}
+
+impl KeyStore {
+    /// Build the store from the current contents of both key sources. This is
+    /// the boot path and stays fail-closed: an unsafe file, malformed line, or
+    /// empty union is an error, never a fallback.
+    pub fn load(host_path: &Path, allowed_path: &Path) -> Result<KeyStore, Error> {
+        let snapshot = AuthSnapshot::load(host_path, allowed_path)?;
+        Ok(KeyStore {
+            host_path: host_path.to_path_buf(),
+            allowed_path: allowed_path.to_path_buf(),
+            state: RwLock::new(StoreState {
+                snapshot: Arc::new(snapshot),
+                identities: [observe_identity(host_path), observe_identity(allowed_path)],
+            }),
+            revalidate: AtomicBool::new(false),
+            #[cfg(test)]
+            loads: AtomicU64::new(1),
+        })
+    }
+
+    /// The live snapshot without touching the filesystem.
+    pub fn snapshot(&self) -> Arc<AuthSnapshot> {
+        self.state.read().expect("key store state").snapshot.clone()
+    }
+
+    /// Admin keys in the live snapshot. Consumed once at boot to select
+    /// managed mode; later refreshes do not re-decide it.
+    pub fn admin_count(&self) -> usize {
+        self.state
+            .read()
+            .expect("key store state")
+            .snapshot
+            .admin_count()
+    }
+
+    /// Force the next request-time check to re-read and re-validate both key
+    /// sources even when their identities look unchanged (the SIGHUP path).
+    /// Performs no I/O itself.
+    pub fn invalidate(&self) {
+        self.revalidate.store(true, Ordering::Release);
+    }
+
+    /// Stat both key sources and, when either changed or the store was
+    /// invalidated, re-run the full [`AuthSnapshot::load`] pipeline and
+    /// publish the result.
+    ///
+    /// Blocking (file I/O); call it from `spawn_blocking`. On failure the live
+    /// snapshot is untouched and the observed identities are adopted, so the
+    /// next request does not re-parse until the on-disk state changes again.
+    pub fn refresh_if_changed(&self) -> Result<RefreshOutcome, Error> {
+        let mut state = self.state.write().expect("key store state");
+        // Observe under the write guard: concurrent refreshes serialize here,
+        // so the first publisher satisfies every other waiter's comparison.
+        let observed = [
+            observe_identity(&self.host_path),
+            observe_identity(&self.allowed_path),
+        ];
+        let forced = self.revalidate.swap(false, Ordering::AcqRel);
+        if !forced && state.identities == observed {
+            return Ok(RefreshOutcome::Unchanged);
+        }
+        #[cfg(test)]
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        match AuthSnapshot::load(&self.host_path, &self.allowed_path) {
+            Ok(snapshot) => {
+                state.identities = observed;
+                state.snapshot = Arc::new(snapshot);
+                Ok(RefreshOutcome::Reloaded)
+            }
+            // Keep the previous snapshot, but adopt the identities just
+            // observed so a stable bad state does not re-parse per request.
+            Err(error) => {
+                state.identities = observed;
+                Err(error)
+            }
+        }
+    }
+
+    /// The snapshot to consult for one authentication request: refresh first,
+    /// then return whatever is live. Never fails — a rejected refresh keeps
+    /// serving the previous snapshot and logs the reason. Every lock is taken
+    /// on a blocking thread.
+    pub async fn snapshot_for_auth(self: &Arc<Self>) -> Arc<AuthSnapshot> {
+        let store = Arc::clone(self);
+        let result = tokio::task::spawn_blocking(move || {
+            let outcome = store.refresh_if_changed();
+            (store.snapshot(), outcome)
+        })
+        .await;
+        match result {
+            Ok((snapshot, Ok(RefreshOutcome::Reloaded))) => {
+                tracing::info!("key sources changed: authentication snapshot refreshed");
+                snapshot
+            }
+            Ok((snapshot, Ok(RefreshOutcome::Unchanged))) => snapshot,
+            Ok((snapshot, Err(error))) => {
+                tracing::warn!(
+                    error = %error,
+                    "key source refresh rejected; keeping the previous authentication snapshot"
+                );
+                snapshot
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "key refresh task failed; keeping the previous authentication snapshot"
+                );
+                self.snapshot()
+            }
+        }
+    }
+
+    /// Accepted-key validation attempts so far (initial load included).
+    #[cfg(test)]
+    pub fn load_count(&self) -> u64 {
+        self.loads.load(Ordering::Relaxed)
+    }
+}
+
+/// Observe one key source's identity. Any stat failure folds into
+/// [`FileIdentity::Absent`] on purpose: it still counts as a change against a
+/// cached inode, and the authoritative reason surfaces from the following
+/// [`AuthSnapshot::load`], which re-stats and re-opens with `O_NOFOLLOW`.
+fn observe_identity(path: &Path) -> FileIdentity {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => FileIdentity::Inode {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime_ns: metadata.ctime_nsec(),
+            size: metadata.len(),
+        },
+        Err(_) => FileIdentity::Absent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +763,12 @@ mod tests {
         let public = key.public_key().clone();
         let line = public.to_openssh().expect("encode");
         (line, KeyFingerprint::from_ssh_key(&public))
+    }
+
+    /// Assert a refresh succeeded with the expected outcome. `auth::Error`
+    /// carries an `io::Error`, so the result cannot be compared as a whole.
+    fn expect_outcome(result: Result<RefreshOutcome, Error>, expected: RefreshOutcome) {
+        assert_eq!(result.expect("refresh must succeed"), expected);
     }
 
     #[test]
@@ -905,5 +1120,272 @@ mod tests {
             let default = resolve_authorized_keys_path().expect("default");
             assert!(default.ends_with(".ssh/authorized_keys"));
         }
+    }
+
+    // ---- KeyStore: request-time refresh over stat identities ----
+
+    #[test]
+    fn identity_distinguishes_absent_present_and_rewrites() {
+        let home = auth_tempdir();
+        let path = home.path().join("authorized_keys");
+        assert_eq!(observe_identity(&path), FileIdentity::Absent);
+        let (line, _) = generated_key();
+        fs::write(&path, format!("{line}\n")).expect("write");
+        let present = observe_identity(&path);
+        assert!(matches!(present, FileIdentity::Inode { .. }));
+        // A permission-only change moves ctime but not mtime; the identity
+        // must still change so the next request re-runs the safety checks.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_ne!(observe_identity(&path), present);
+        fs::remove_file(&path).expect("remove");
+        assert_eq!(observe_identity(&path), FileIdentity::Absent);
+    }
+
+    #[test]
+    fn store_load_is_fail_closed_on_malformed_source() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        // Malformed source.
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        assert!(KeyStore::load(&host_path, &allowed_path).is_err());
+        // Unsafe permissions.
+        fs::write(&allowed_path, format!("{line_a}\n")).expect("write allowed");
+        fs::set_permissions(&allowed_path, fs::Permissions::from_mode(0o664)).expect("chmod");
+        assert!(KeyStore::load(&host_path, &allowed_path).is_err());
+        // Empty union (both sources absent).
+        fs::set_permissions(&allowed_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        fs::remove_file(&allowed_path).expect("remove allowed");
+        fs::remove_file(&host_path).expect("remove host");
+        assert!(matches!(
+            KeyStore::load(&host_path, &allowed_path),
+            Err(Error::EmptyAuthSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn store_refresh_rejects_and_keeps_previous_snapshot() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, fp_a) = generated_key();
+        let (line_b, _) = generated_key();
+        let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
+        let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        assert_eq!(
+            store
+                .snapshot()
+                .authenticate(&key_a)
+                .expect("auth a")
+                .fingerprint,
+            fp_a
+        );
+
+        // A malformed allowed_keys must not publish anything.
+        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        assert!(store.refresh_if_changed().is_err());
+        assert!(store.snapshot().authenticate(&key_a).is_some());
+        assert!(store.snapshot().authenticate(&key_b).is_none());
+
+        // Fixing the file publishes on the next check.
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        assert!(store.snapshot().authenticate(&key_b).is_some());
+    }
+
+    #[test]
+    fn store_rejects_empty_union_and_keeps_previous() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        // Truncating both sources empties the union; the refresh is rejected
+        // and the previous snapshot keeps serving.
+        fs::write(&host_path, "").expect("empty host");
+        fs::write(&allowed_path, "").expect("empty allowed");
+        assert!(matches!(
+            store.refresh_if_changed(),
+            Err(Error::EmptyAuthSnapshot { .. })
+        ));
+        assert!(store.snapshot().authenticate(&key_a).is_some());
+    }
+
+    #[test]
+    fn store_caches_the_failed_identity_until_the_file_changes() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        // A stable broken file is parsed exactly once, not once per request.
+        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        assert!(store.refresh_if_changed().is_err());
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
+        assert_eq!(store.load_count(), 2);
+        // The next on-disk change retries the parse and applies it.
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        assert!(store.snapshot().authenticate(&key_b).is_some());
+        assert_eq!(store.load_count(), 3);
+    }
+
+    #[test]
+    fn store_caches_identities_for_both_sources_on_failure() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        let (line_c, _) = generated_key();
+        let key_c = russh::keys::PublicKey::from_openssh(&line_c).expect("parse c");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        // A valid host change plus a malformed allowed change rejects whole,
+        // matching the old all-or-nothing reload semantics.
+        fs::write(&host_path, format!("{line_c}\n")).expect("change host");
+        fs::write(&allowed_path, b"garbage\n").expect("break allowed");
+        assert!(store.refresh_if_changed().is_err());
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
+        // Fixing the malformed source publishes both changes at once.
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        assert!(store.snapshot().authenticate(&key_c).is_some());
+    }
+
+    #[test]
+    fn store_invalidate_forces_one_revalidation() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
+        store.invalidate();
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
+        assert_eq!(store.load_count(), 2);
+    }
+
+    #[test]
+    fn store_deleted_file_is_a_change_and_may_be_rejected() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
+        let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        // Deleting the allowed source leaves a valid host-only snapshot.
+        fs::remove_file(&allowed_path).expect("remove allowed");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        assert!(store.snapshot().authenticate(&key_a).is_some());
+        assert!(store.snapshot().authenticate(&key_b).is_none());
+        // Deleting the last source empties the union and is rejected, so the
+        // previous snapshot keeps serving.
+        fs::remove_file(&host_path).expect("remove host");
+        assert!(store.refresh_if_changed().is_err());
+        assert!(store.snapshot().authenticate(&key_a).is_some());
+    }
+
+    #[test]
+    fn store_created_host_file_promotes_a_key_to_admin() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
+        // Boot with the host source absent: the key starts as Normal.
+        fs::write(&allowed_path, format!("{line_a}\n")).expect("write allowed");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        assert_eq!(
+            store.snapshot().authenticate(&key_a).expect("auth").role,
+            Role::Normal
+        );
+        // The host file appears later; the next check grants Admin.
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
+        assert_eq!(
+            store.snapshot().authenticate(&key_a).expect("auth").role,
+            Role::Admin
+        );
+    }
+
+    #[test]
+    fn store_reports_unsafe_ancestor_on_forced_refresh() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        let store = KeyStore::load(&host_path, &allowed_path).expect("load");
+        // An ancestor mode change is invisible to a file-only stat identity:
+        // the ordinary check stays Unchanged (the documented limitation), and
+        // SIGHUP-style invalidation is what surfaces it.
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o770)).expect("chmod dir");
+        expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
+        store.invalidate();
+        let error = store.refresh_if_changed().expect_err("unsafe ancestor");
+        assert!(
+            error
+                .to_string()
+                .contains("parent is group or world writable")
+        );
+        assert!(store.snapshot().authenticate(&key_a).is_some());
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("restore dir");
+    }
+
+    #[test]
+    fn store_concurrent_refresh_is_single_flight() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        store.invalidate();
+        let waiters = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(waiters));
+        let handles: Vec<_> = (0..waiters)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.refresh_if_changed()
+                })
+            })
+            .collect();
+        let mut reloaded = 0;
+        let mut unchanged = 0;
+        for handle in handles {
+            match handle.join().expect("join") {
+                Ok(RefreshOutcome::Reloaded) => reloaded += 1,
+                Ok(RefreshOutcome::Unchanged) => unchanged += 1,
+                Err(error) => panic!("unexpected refresh failure: {error}"),
+            }
+        }
+        assert_eq!(reloaded, 1);
+        assert_eq!(unchanged, waiters - 1);
+        assert_eq!(store.load_count(), 2);
     }
 }

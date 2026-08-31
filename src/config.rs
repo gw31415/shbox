@@ -8,7 +8,8 @@
 //! top-level fields and never mirror anything under `[sandbox]`. Resource
 //! safety limits stay built-in constants, outside this file.
 //! Parsing (schema) and validation (semantics that need the filesystem) are
-//! separate steps so that reload can reuse both independently.
+//! separate steps; the snapshot they produce is process-lifetime — the daemon
+//! never re-reads the config file, so applying a change means restarting.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,10 +33,11 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 
 /// Immutable, fully validated configuration snapshot.
 ///
-/// The top-level operational settings (`listen`, `log_level`) and the
-/// `[sandbox] network` mode are process-lifetime: they are read once at
-/// startup, the CLI flags layer on top of the first two, and a SIGHUP reload
-/// that changes any of them is rejected whole. `Caps`/`Limits` are built-in
+/// Every setting here — the top-level operational ones (`listen`,
+/// `log_level`), the `[sandbox] network` mode included — is process-lifetime:
+/// it is read exactly once at startup, the CLI flags layer on top of the
+/// first two, and nothing re-reads the file afterwards. Applying a config
+/// change means restarting the daemon. `Caps`/`Limits` are built-in
 /// constants.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -45,7 +47,6 @@ pub struct Config {
     sandbox_shell: Option<PathBuf>,
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
-    loaded_from_file: bool,
 }
 
 impl Config {
@@ -67,11 +68,7 @@ impl Config {
             }
         };
         match raw {
-            Some(raw) => {
-                let mut config = build(raw, paths)?;
-                config.loaded_from_file = true;
-                Ok(config)
-            }
+            Some(raw) => build(raw, paths),
             None => build(RawConfig::default(), paths),
         }
     }
@@ -104,14 +101,6 @@ impl Config {
     /// Extra environment injected into every sandbox process.
     pub fn sandbox_env(&self) -> &BTreeMap<String, String> {
         &self.sandbox_env
-    }
-
-    /// Whether this snapshot came from a config file (drives the reload rule
-    /// that a vanished file is a reload failure, not a fallback to defaults).
-    /// Consumed by the Milestone 7 reload implementation.
-    #[allow(dead_code)]
-    pub fn loaded_from_file(&self) -> bool {
-        self.loaded_from_file
     }
 }
 
@@ -176,7 +165,6 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
         sandbox_shell,
         read_paths,
         sandbox_env,
-        loaded_from_file: false,
     })
 }
 
@@ -239,14 +227,14 @@ fn validate_network(raw: Option<&str>) -> Result<NetworkMode, Error> {
 }
 
 /// The built-in defaults, as they would be parsed from an empty config.
-/// Test-only until reload reuses it in Milestone 7.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn defaults() -> Config {
     build(RawConfig::default(), &default_paths()).expect("built-in defaults are valid")
 }
 
 /// Paths value used only to validate the built-in defaults, which reference
 /// no filesystem paths.
+#[cfg(test)]
 fn default_paths() -> Paths {
     Paths::from_roots(
         PathBuf::from("/usr/share/empty/config"),
@@ -728,7 +716,6 @@ mod tests {
         assert_eq!(config.network(), NetworkMode::Disabled);
         assert!(config.read_paths().is_empty());
         assert!(config.sandbox_env().is_empty());
-        assert!(!config.loaded_from_file());
     }
 
     #[test]
@@ -736,7 +723,6 @@ mod tests {
         let (_home, paths) = test_paths();
         std::fs::write(paths.config_file(), "").expect("write empty config");
         let config = Config::load_snapshot(&paths).expect("empty config");
-        assert!(config.loaded_from_file());
         assert!(config.read_paths().is_empty());
         assert!(config.sandbox_env().is_empty());
     }

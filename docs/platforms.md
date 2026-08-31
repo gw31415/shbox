@@ -34,7 +34,7 @@ SandboxManager ── private ProcessLauncher seam
 
 `ProcessLauncher` は private なテスト seam とし、本番実装だけが Arapuca を呼ぶ。テストでは fault injection と barrier を持つ fake launcher を使う。公開設定や公開 plugin として backend を差し替える機構は作らない。
 
-Arapuca backend は起動時に一度だけ初期化し、同じ daemon 内で共有する。初期化に失敗した場合、Arapuca を必要とする sandbox shell/exec/PTY は利用不可のままにし、SIGHUP で再構築しない。metadata の reconciliation 完了後は認可済み list/delete を利用できる。process 起動の復旧には daemon の再起動を要する。SIGHUP は shbox の設定・認証・新規 process への適用だけを更新する。
+Arapuca backend は起動時に一度だけ初期化し、同じ daemon 内で共有する。初期化に失敗した場合、Arapuca を必要とする sandbox shell/exec/PTY は利用不可のままにし、以降は再構築しない。metadata の reconciliation 完了後は認可済み list/delete を利用できる。process 起動の復旧には daemon の再起動を要する。SIGHUP は鍵 source の再検証だけを強制し、config と sandbox policy は再読込しない。
 
 各 process に渡す内部 `task_id` は、外部 Sandbox ID と同一視しない。形式は次のとおりとする。
 
@@ -116,8 +116,8 @@ workspace 以外の追加 write path は作らない。
 inbound listener、port forwarding、per-Sandbox allowlist、proxy endpoint の設定は v0.1 で提供しない。`outbound` は初期版から実装し、ユーザーが利用する唯一の許可ネットワーク形態とする。ここでも Arapuca の raw network option や syscall profile 名は公開しない。
 
 `outbound` の内部 profile は `disabled` より syscall/network isolation が弱い。選択時は
-startup の host log に warning を残す。network mode は process-lifetime であり、config file
-上で変えた SIGHUP は reload 全体を拒否する。shbox は inbound port mapping を作らないが、
+startup の host log に warning を残す。network mode は process-lifetime であり、再読込は
+行われない。shbox は inbound port mapping を作らないが、
 Baseline と host network namespace の組合せは全 OS で bind/listen を禁止する egress-only
 security boundary ではない。外部からの到達は host firewall で制御し、正式 platform ごとに
 実際の socket behavior を記録する。

@@ -17,7 +17,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, Limits, NetworkMode};
@@ -203,7 +203,7 @@ impl ArapucaLaunchPolicy {
 /// A process-lifetime Arapuca adapter.
 pub(crate) struct ArapucaLauncher {
     backend: Box<dyn ::arapuca::platform::Sandbox>,
-    policy: RwLock<ArapucaLaunchPolicy>,
+    policy: ArapucaLaunchPolicy,
     active_tasks: Arc<Mutex<HashSet<String>>>,
     #[cfg(target_os = "linux")]
     // The leading underscore documents that this is an owned lifetime guard:
@@ -227,6 +227,8 @@ impl fmt::Debug for ArapucaLauncher {
 impl ArapucaLauncher {
     /// Construct the one shared backend after checking prerequisites that
     /// otherwise could mutate a shared cgroup during Arapuca initialization.
+    /// The launch policy is fixed at construction: it is a process-lifetime
+    /// snapshot of the boot-time config, cloned per launch.
     pub(crate) fn new(policy: ArapucaLaunchPolicy) -> Result<Self, LaunchError> {
         #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
         {
@@ -266,24 +268,11 @@ impl ArapucaLauncher {
         linux_scope.retain_tasks(Arc::clone(&active_tasks));
         Ok(Self {
             backend,
-            policy: RwLock::new(policy),
+            policy,
             active_tasks,
             #[cfg(target_os = "linux")]
             _linux_scope: linux_scope,
         })
-    }
-
-    /// Atomically replace the policy used by future launches. Existing
-    /// Arapuca processes retain the profile and environment with which they
-    /// were started; a launch clones one complete policy snapshot before it
-    /// creates any descriptors or asks the backend to fork.
-    pub(crate) fn reload_policy(&self, policy: ArapucaLaunchPolicy) -> Result<(), LaunchError> {
-        *self
-            .policy
-            .write()
-            .map_err(|_| LaunchError::new("sandbox process adapter policy is unavailable"))? =
-            policy;
-        Ok(())
     }
 
     fn acquire_task(&self, sandbox_id: &SandboxId) -> Result<TaskLease, LaunchError> {
@@ -401,11 +390,7 @@ impl ProcessLauncher for ArapucaLauncher {
         let _launch_guard = crate::platform::process_spawn_lock()
             .lock()
             .map_err(|_| LaunchError::new("sandbox process adapter is unavailable"))?;
-        let policy = self
-            .policy
-            .read()
-            .map_err(|_| LaunchError::new("sandbox process adapter policy is unavailable"))?
-            .clone();
+        let policy = self.policy.clone();
         let task = self.acquire_task(&request.sandbox_id)?;
         let workspace = fs::canonicalize(&request.workspace)
             .map_err(|_| LaunchError::new("sandbox workspace is unavailable"))?;

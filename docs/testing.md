@@ -82,8 +82,11 @@ sandbox-exec --version
 - public-key authentication は Ed25519 のみ。none/password/keyboard-interactive と未知 key algorithm を拒否する。
 - host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）の blank/comment は無視し、options、certificate、malformed/unsupported line、同一 source 内の重複 key は設定エラーとする。
 - host 認可鍵の key は Admin、sandbox 許可鍵のみの key は Normal、両方にある key は Admin とする。
-- 各 source の未作成・空を許しつつ、合成結果が空の場合は起動・reload を拒否する。
-- config file は任意。欠落時は built-in default、存在時は typed TOML の unknown field/型/範囲エラーを拒否する。SIGHUP の失敗は旧設定を保持する。
+- 各 source の未作成・空を許しつつ、合成結果が空の場合は起動と鍵 file 変更後の最初の認証要求を拒否する。
+- 鍵 file の変更は signal なしで次の認証要求に反映される。再検証の失敗は直前の鍵集合を保持し、
+  壊れたまま安定している間は認証要求ごとの再 parse を行わない。SIGHUP は file 状態が不変でも
+  強制再検証を行う。
+- config file は任意。欠落時は built-in default、存在時は typed TOML の unknown field/型/範囲エラーを拒否する。起動後の再読込は行われず、適用には restart を要する。
 - managed env、`ARAPUCA_*`、loader injection、NUL、非 UTF-8、4 KiB 超の environment value を拒否する。client の env request は Sandbox に渡さない。
 - `log_level = "error|warn|info|debug|trace"` と `[sandbox] network = "disabled|outbound"` の
   enum 以外を拒否する。`--listen` の重複、`listen = []`、無効な socket address も拒否する。
@@ -146,7 +149,7 @@ private `ProcessLauncher` seam に barrier、遅延、指定エラーを持つ f
 - sandbox count が上限に達していても既存 Active sandbox の shell/exec は再利用でき、新しい
   ID だけが拒否される。失敗した create reservation は上限を消費し続けない。
 - 異なる ID は並列に進み、同じ ID だけが直列化される。
-- create と delete、attach と delete、SIGHUP と新規 launch の race。
+- create と delete、attach と delete、鍵 file 更新と新規 launch の race。
 - `Launching` marker の publish 直後、OS spawn 中、spawn 成功直後の各 barrier で delete を開始し、
   cancel または即時回収によって process と reservation が一つも残らないこと。
 - process spawn 後の metadata failure、workspace failure、PTY/ioctl failure、stdout/stderr channel close。
@@ -279,7 +282,7 @@ admin key で `ssh _@host` の shell、remote exec、PTY、resize、signal を�
 - memory/RSS monitor、rlimit、process group cleanup を測定し、Linux cgroup quota/PID limit と同一視しない。
 - delete、disconnect、shutdown、daemon crash 後に descendants が残らない hard contract を検証する。失敗した OS version は正式対応から外す。
 
-## 8. Crash、reload、hostile suite
+## 8. Crash、鍵更新、hostile suite
 
 ### 8.1 Crash と restart
 
@@ -288,19 +291,22 @@ admin key で `ssh _@host` の shell、remote exec、PTY、resize、signal を�
 - 起動時の metadata 未 publish の partial create、`Deleting`、corrupt metadata、missing workspace、symlink entry を list/delete が安全に扱う。
 - graceful SIGINT/SIGTERM は新規接続を止め、最大 5 秒で全 runtime process を cleanup し、workspace を削除しない。二回目の signal は即時停止する。
 
-### 8.2 Reload
+### 8.2 鍵の更新
 
-- SIGHUP で config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy だけが atomic に更新
-  される。`listen`、`log_level`、`[sandbox] network` と built-in limits/caps は process-lifetime
-  で変わらない。
-- config 無しの defaults で起動した後に config file を作ると valid SIGHUP で採用される。一度
-  file を採用した後に削除すると reload failure になり、旧 snapshot を保持する。
-- 新しい connection/process には新設定、既存 connection には元の role/rights を適用する。
-- 認証ファイル/config が壊れている、または使用中の config が消えた場合は旧設定を保持する。最後の admin を削除する valid reload は適用し、sandbox-only mode に遷移する。
-- listen socket は reload せず、`listen` / `log_level` / `[sandbox] network` の値を変えた
-  config による reload は auth 変更を含めて全体が拒否され、旧 snapshot が維持される。適用には
-  restart を要求する。
-- admin を削除しても既存 admin connection は disconnect まで維持し、新規 admin connection は拒否する。
+- 鍵 file（host 認可鍵 / sandbox 許可鍵）の変更は signal なしで次の認証要求に反映される。
+  `listen`、`log_level`、`[sandbox] network` と built-in limits/caps、config file 全体は
+  process-lifetime で変わらない。
+- 追加された key は次の認証要求から受諾され、削除された key は次の認証要求から拒否される。
+  既存 connection は元の role/rights を維持する。
+- 鍵 file が壊れている、または合成結果が空になる場合は直前の鍵集合を保持し、安定した
+  壊れた状態では認証要求ごとの再 parse を行わない。修正後の file は次の認証要求から採用される。
+- SIGHUP は鍵 file の状態が不変でも次の認証要求での強制再検証を行う。祖先 directory の
+  permission 変化は file 単位の identity では検出できないため、強制再検証で検出して
+  host log に記録する。
+- config file は起動後は読み直されない。起動後に config file を書き換えても SIGHUP や
+  認証要求で適用されず、適用には restart を要求する。
+- admin を削除しても既存 admin connection は disconnect まで維持し、新しい host route
+  認証だけを拒否する。daemon の動作 mode は起動時に決めたままである。
 
 ### 8.3 Hostile input
 
@@ -341,7 +347,7 @@ Arapuca が取得できない、cgroup delegation がない、macOS runner versi
 [ ] list/delete/partial create/Active/Deleting/再起動の lifecycle が通る
 [ ] disabled/outbound network の両方が通る
 [ ] disconnect/delete/shutdown/crash の descendant cleanup が通る
-[ ] reload、config/auth failure、hostile input が server panic なしで通る
+[ ] 鍵更新、auth failure、hostile input が server panic なしで通る
 [ ] bounded buffer/backpressure と全 cap が通る
 [ ] 未検証の OS/architecture/version を正式対応表に含めていない
 ```

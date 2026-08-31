@@ -1,7 +1,7 @@
 //! Structured logging: `tracing` compact text on stderr with UTC RFC 3339
 //! timestamps. The level is fixed once at startup, from the config file's
-//! `log_level` with the `--log-level` flag layered on top; SIGHUP cannot
-//! change it.
+//! `log_level` with the `--log-level` flag layered on top; nothing reloads
+//! it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

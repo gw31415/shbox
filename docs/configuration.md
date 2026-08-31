@@ -1,20 +1,21 @@
 # shbox 設定仕様
 
-この文書は shbox v0.1 の TOML 設定と、設定に由来するファイル配置・reload の正本である。外部から見える動作は [product.md](./product.md)、SSH request の詳細は [ssh-protocol.md](./ssh-protocol.md)、OS ごとの適用条件は [platforms.md](./platforms.md) を参照する。
+この文書は shbox v0.1 の TOML 設定と、設定に由来するファイル配置・鍵更新の正本である。外部から見える動作は [product.md](./product.md)、SSH request の詳細は [ssh-protocol.md](./ssh-protocol.md)、OS ごとの適用条件は [platforms.md](./platforms.md) を参照する。
 
 ## 1. 基本方針
 
-設定ファイルは任意である。設定ファイルが存在しない場合は、target OS に応じた built-in default で起動する。設定ファイルを使う場合は、`serde` と `toml` による typed parse を行い、未知の field、重複 key、不正な型、不正な値は起動または reload の失敗とする。値を黙って丸めたり、未知の設定を無視したりしない。
+設定ファイルは任意である。設定ファイルが存在しない場合は、target OS に応じた built-in default で起動する。設定ファイルを使う場合は、`serde` と `toml` による typed parse を行い、未知の field、重複 key、不正な型、不正な値は起動の失敗とする。値を黙って丸めたり、未知の設定を無視したりしない。
 
 すべての設定は config file に書ける。トップ直下の `listen` と `log_level` には、同じ項目に
 対応する CLI flag（`--listen`、`--log-level`）が上から重なり、指定時は config 値を置き換える。
 CLI はこのトップレベル項目にだけ存在し、`[sandbox]` 以下の項目に対応する flag は意図的に
 作らない。`--network` は存在せず、network policy は `[sandbox] network` だけである。
-これらの operational 設定は process-lifetime であり、SIGHUP でも変わらない。
+これらの operational 設定は process-lifetime であり、config file は daemon 起動時に一度だけ
+読まれる。起動後に config file を書き換えても適用されず、適用には daemon の restart が必要である。
 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`、必要な場合の `XDG_RUNTIME_DIR` は、
 `xdg` crate の標準的な path 解決だけに使う。shbox の機能設定に `SHBOX_*` や `RUST_LOG` を使わない。
 
-設定ファイルの最大サイズは 1 MiB である。初回起動時に読み込めない、parse できない、validation に失敗する設定は、古い設定へ fallback せず明示的に失敗する。SIGHUP 時は後述の atomic reload 規則を適用する。
+設定ファイルの最大サイズは 1 MiB である。起動時に読み込めない、parse できない、validation に失敗する設定は、古い設定へ fallback せず明示的に失敗する。config file の再読込は行わない。SIGHUP は鍵 file の再検証だけを強制する（§6）。
 
 ## 2. 完全な v0.1 TOML schema
 
@@ -74,8 +75,8 @@ SSH listener の bind address 配列で、default は `["0.0.0.0:22"]`。文字�
 `2222` などへの自動 fallback はない。IPv6 wildcard は `listen = ["[::]:22"]` または
 `--listen '[::]:22'` のように明示する。空配列、重複、無効な socket address は拒否する。
 
-listener は process-lifetime の設定であり、SIGHUP では再 bind しない。config file 上で
-`listen` を変えた SIGHUP は reload 全体を拒否する。変更には daemon の restart が必要である。
+listener は process-lifetime の設定であり、起動後には再 bind しない。config file 上で
+`listen` を変えても稼働中の daemon には無効である。変更には daemon の restart が必要である。
 
 ### 3.2 鍵ファイルと権限（host 認可鍵・sandbox 許可鍵）
 
@@ -97,16 +98,16 @@ ssh-ed25519 <base64-public-key> [comment]
 
 空行と `#` で始まるコメントは無視する。options、証明書、別 algorithm、壊れた base64、同一 source 内の重複 key、未知の line format は source 全体の error とする。1 行の上限は 8 KiB、ファイル全体の上限は 1 MiB。
 
-各 source は個別には未作成、空、blank/comment のみを許す。ただし二つを合成した結果に有効な鍵が一つもない場合、起動や reload は拒否される。
+各 source は個別には未作成、空、blank/comment のみを許す。ただし二つを合成した結果に有効な鍵が一つもない場合、起動、および鍵 file 変更後の最初の認証要求は拒否され、直前の認証設定が維持される。
 
 存在する key file は daemon user 所有の regular file で、symlink ではなく、group/world writable であってはならない。直近 parent も daemon user 所有の directory で、symlink および group/world writable を拒否する。上位 ancestor にも write permission 検査を適用し、最終 path は `O_NOFOLLOW` で開く。
 
-admin key は全 sandbox を可視・操作でき、`_` host selector による host shell/exec/PTY/resize/signal を利用できる。`_` を通常 key で使うことはできない。SIGHUP で host file から鍵を削除して admin なしの sandbox-only mode に遷移することも可能である。既存 admin connection の権利は切断まで変わらない。
+admin key は全 sandbox を可視・操作でき、`_` host selector による host shell/exec/PTY/resize/signal を利用できる。`_` を通常 key で使うことはできない。host file から最後の admin key を削除した場合、次の認証要求から新しい host route 認証だけが拒否され、稼働中の daemon が起動時に決めた managed/sandbox-only mode、listener、reconciliation 動作は変わらない。既存 admin connection の権利は切断まで変わらない。
 ### 3.4 `[sandbox] shell`
 
-省略時は daemon OS user の passwd entry の login shell を使い、その entry が空の場合だけ `/bin/sh` を fallback とする。passwd entry または設定で選ばれた非空 path が存在しない、通常 file でない、実行できない場合は startup/reload error とする。指定値は絶対 path の executable 一つだけであり、shell command、argv、shell fragment は指定しない。
+省略時は daemon OS user の passwd entry の login shell を使い、その entry が空の場合だけ `/bin/sh` を fallback とする。passwd entry または設定で選ばれた非空 path が存在しない、通常 file でない、実行できない場合は startup error とする。指定値は絶対 path の executable 一つだけであり、shell command、argv、shell fragment は指定しない。
 
-interactive shell はこの shell を login mode で起動する。remote `exec` は同じ shell を `-c <command>` で起動するため、remote command の既定を常に `/bin/sh` にするわけではない。host mode には `host_shell` 設定を設けず、daemon OS user の login shell を使う。host mode でも passwd entry が空の場合だけ `/bin/sh` を fallback とし、非空の path が無効なら startup/reload error とする。
+interactive shell はこの shell を login mode で起動する。remote `exec` は同じ shell を `-c <command>` で起動するため、remote command の既定を常に `/bin/sh` にするわけではない。host mode には `host_shell` 設定を設けず、daemon OS user の login shell を使う。host mode でも passwd entry が空の場合だけ `/bin/sh` を fallback とし、非空の path が無効なら startup error とする。
 
 ### 3.5 `[sandbox] network`
 
@@ -123,13 +124,13 @@ host firewall の責務である。per-sandbox policy、per-host allowlist は�
 
 `outbound` を選ぶと syscall/network isolation が `disabled` より弱くなるため、startup に
 一度、明示的な warning を host log に記録する。network mode は process-lifetime であり、
-config file 上で変えた SIGHUP は reload 全体を拒否する。変更には daemon の restart が必要である。
+再読込は行われない。変更には daemon の restart が必要である。
 
 ### 3.6 `[sandbox] read_paths`
 
 sandbox process が追加で read-only で参照できる絶対 path の配列である。default は空配列だが、実装は OS と Arapuca の実行に必要な system/runtime/TLS path を内部の curated set として追加する。文字列配列項目共通の規則に従い、単一 string も受け付ける。利用者が指定した path は write permission を付与しない。
 
-各 path は startup/reload 時に存在を確認し、canonical absolute path に解決する。`~`、environment variable、relative path、NUL、重複、存在しない path は拒否する。shbox の state/data/private root、他 sandbox の workspace、管理用 lock/host-key path を追加 read path にすることも拒否する。通常の OS DAC が先に適用され、read path の指定によって権限が昇格することはない。
+各 path は startup 時に存在を確認し、canonical absolute path に解決する。`~`、environment variable、relative path、NUL、重複、存在しない path は拒否する。shbox の state/data/private root、他 sandbox の workspace、管理用 lock/host-key path を追加 read path にすることも拒否する。通常の OS DAC が先に適用され、read path の指定によって権限が昇格することはない。
 
 ### 3.7 `[sandbox.env]`
 
@@ -204,7 +205,7 @@ macOS では Linux-only の cgroup quota/pid semantics は存在せず、platfor
 ### 3.10 組み込み concurrency caps
 
 接続や shbox 管理対象の同時実行数を制限する。0 は無制限ではなく、field ごとに 0 を
-禁止する。次の組み込み値を持ち、設定ファイルや reload から変更できない。
+禁止する。次の組み込み値を持ち、設定ファイルからも変更できない。
 
 | field | default | 対象 |
 | --- | ---: | --- |
@@ -228,7 +229,7 @@ rate limit、deny list、接続元制限は host firewall または上流 networ
 `error`、`warn`、`info`、`debug`、`trace` のいずれか。default は `info`。CLI `--log-level`
 を指定すると config 値を置き換える。ログは `tracing` の構造化 compact text として
 UTC RFC3339 timestamp 付きで daemon の stderr に出す。log level は process-lifetime で、
-SIGHUP では変わらない。config file 上で変えた SIGHUP は reload 全体を拒否する。
+再読込は行われない。変更には daemon の restart が必要である。
 log file、rotation、client が指定する log level、`RUST_LOG` は v0.1 にない。
 
 connection/channel ID、remote address、key fingerprint、role、selector/ID、operation、result、duration、exit status は安全に sanitize して記録できる。command text、terminal I/O、stdin、stdout、stderr、秘密、Arapuca raw audit は記録しない。
@@ -262,7 +263,7 @@ daemon は data 側の registry lock と state 側の daemon lock をこの順�
 2. XDG path を解決し、data の registry lock と state の daemon lock を取得する
 3. config（または built-in default）を parse/validate する
 4. `listen` と `log_level` を config 値と CLI 層から確定し、logging を初期化する
-5. host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）から auth snapshot を構築する
+5. host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）から鍵ストア（`KeyStore`）を構築する。以降、認証要求ごとに両 source の状態を比較し、変化を検出したときだけ全体を再検証する（§6）
 6. host key を初期化する
 7. Arapuca backend を一度だけ生成する
 8. managed mode（初期 Admin 数 > 0）なら listener を bind し、`_` だけを ready にする
@@ -274,41 +275,59 @@ Admin key が一つ以上ある managed mode では、host selector `_` を reco
 sandbox-only mode は有効な構成だが、port 22 の listener に admin recovery route が無い
 ことを startup log で warning として一度通知する。
 
-Arapuca backend の初期化や sandbox capability の検証に失敗しても daemon は起動できる。managed mode では SSH/host route を利用でき、sandbox-only mode でも reconciliation の完了後は listener を公開する。Linux で外部 `arapuca` wrapper または delegated cgroup が利用できない場合、または対応外 platform の場合、Arapuca が必要な sandbox shell/exec/PTY は fail closed とし、ホスト上で直接 command を実行する fallback はない。macOS arm64 では、別途 `arapuca` を PATH にインストールしていなくても、shbox 自身が rlimit wrapper として動作する。metadata に基づく認可済み `list`/`delete` は reconciliation 後に利用できる。backend は SIGHUP で再構築せず、sandbox process の復旧には daemon restart が必要である。
+Arapuca backend の初期化や sandbox capability の検証に失敗しても daemon は起動できる。managed mode では SSH/host route を利用でき、sandbox-only mode でも reconciliation の完了後は listener を公開する。Linux で外部 `arapuca` wrapper または delegated cgroup が利用できない場合、または対応外 platform の場合、Arapuca が必要な sandbox shell/exec/PTY は fail closed とし、ホスト上で直接 command を実行する fallback はない。macOS arm64 では、別途 `arapuca` を PATH にインストールしていなくても、shbox 自身が rlimit wrapper として動作する。metadata に基づく認可済み `list`/`delete` は reconciliation 後に利用できる。backend は起動時に一度だけ構築し、以降は再構築せず、sandbox process の復旧には daemon restart が必要である。
 
-## 6. Reload
+## 6. 鍵の更新と SIGHUP
 
-SIGHUP は、ファイルを新しい typed config として全体 parse/validate し、成功した場合だけ一つの
-immutable snapshot として置き換える。parse、permission、path、key、platform capability の
-いずれかに失敗した場合は、旧 snapshot、既存 connection、既存 process を維持する。
+設定は process-lifetime であり、config file・sandbox policy・組み込み caps/limits の再読込は
+一切行わない。これらを変えた場合は daemon を restart する。再読込の対象は鍵 file だけである。
 
-reload は次の 4 項目を一つの reload 単位として読み、すべて成功した場合だけ atomic に publish する。
+### 6.1 リクエスト時の自動再検証
 
-1. `$XDG_CONFIG_HOME/shbox/config.toml`
-2. daemon account の `~/.ssh/authorized_keys`
-3. `$XDG_CONFIG_HOME/shbox/allowed_keys`
-4. config から導出する sandbox shell/read path/environment policy
+鍵 file（`~/.ssh/authorized_keys` と `$XDG_CONFIG_HOME/shbox/allowed_keys`）は、見かけ上は
+認証要求のたびにチェックされる。実際の実装は次のとおりである。
 
-どれか一つでも missing policy 違反、permission 違反、parse error、空の合成 key set になれば、config・auth・sandbox policy のどの部分も publish しない。
+1. 公開鍵認証要求のたびに、両鍵 file の状態を file 単位の identity（device、inode、ctime、
+   size。path が存在しない場合は「欠落」も一つの状態）として比較する。これは 2 回の stat
+   のみを要し、parse は行わない。
+2. identity が起動時または前回検証時と一致すれば、直前の認証設定をそのまま使う。
+3. 一方でも変化があれば、両 source を読み直し、起動時と同一の全検証（file safety、
+   permission、厳格な Ed25519 parse、合成 role 付与）を通した場合だけ一つの immutable
+   snapshot として置き換える。
 
-変更後の値は、新しい connection と新しく作る process/sandbox operation に適用する。既存 connection
-の認証済み role/ownership rights、既存 process、既存 PTY は切断・再起動しない。既存 admin
-connection は、reload で最後の admin key が削除されても切断まで admin のままである。
+ctime を identity に含めるため、鍵 file 自体の permission のみの変化（content が同じでも
+group/world writable への変更など）も次の認証要求で検出される。ただし identity は鍵 file
+自体の状態だけを見るため、**祖先 directory の permission 変化は検出できない**。その検出は
+SIGHUP による強制再検証（§6.2）で行う。等しい mtime での content 差し替えのような細工は、
+userspace から ctime を巻き戻せないため identity 変化として検出される。
 
-`listen`、`log_level`、`[sandbox] network`、組み込み caps/limits、host key path、
-XDG root、固定 selector `_`、metadata version は process の lifetime 中固定である。
-SIGHUP で読んだ config がこれらの値を前 snapshot から変えていた場合、auth や sandbox
-policy の変更を含めて reload 全体が拒否され、旧 snapshot が維持される。listener は
-再 bind されない。これらの変更を適用するには daemon を restart する。
+### 6.2 失敗時と SIGHUP
 
-通常起動時に config file が無くても default で動作する。起動後に config file を新しく作成して
-SIGHUP した場合は、それを検証して採用できる。config が引き続き無ければ built-in default を
-維持する。一度 file から config を採用した daemon で、その file が SIGHUP 時に消えた場合は
-default へ戻らず reload を失敗させ、旧 config を保持する。
+再検証が permission 違反、parse error、空の合成 key set のいずれかで失敗した場合は、何も
+publish せず直前の認証設定を維持する。既存 connection、既存 process は影響を受けない。失敗時
+にも観測した identity を採用するため、壊れたまま安定した状態では認証要求ごとの再 parse は
+発生せず、次に鍵 file が変わったとき、または SIGHUP が送られたときに再試行される。失敗は
+host log に warn として記録される。SSH client へは通常の認証結果だけを返す。
+
+`SIGHUP` は鍵 file の手動再検証 trigger である。daemon は鍵 file の identity を無効化し、
+次の認証要求で identity が変化していなくても両 source を強制的に読み直して全検証する。
+SIGHUP 自体は I/O を行わず、config file も読み直さない。
+
+### 6.3 適用範囲
+
+- 変更後の鍵集合は、次の認証要求から適用される。既存 connection の認証済み
+  role/ownership rights、既存 process、既存 PTY は切断・再起動しない。既存 admin
+  connection は、最後の admin key が削除されても切断まで admin のままである。
+- host file から最後の admin key を削除しても、起動時に決めた managed/sandbox-only mode、
+  listener、reconciliation 動作は変わらない。拒否されるのは新しい host route 認証だけである。
+- `listen`、`log_level`、`[sandbox] network`、組み込み caps/limits、host key path、
+  XDG root、固定 selector `_`、metadata version、sandbox policy は process の lifetime 中
+  固定であり、鍵 file の変更や SIGHUP では変わらない。
 
 ## 7. Validation と失敗時の観測
 
-設定エラーは daemon の起動失敗または SIGHUP の reload failure として operator の stderr/log に出す。内部 path、fingerprint、error chain は host log に限り、SSH client へは一般化した安定 error だけを返す。command output と terminal I/O は汚染しない。
+設定エラーは daemon の起動失敗として、鍵再検証の失敗は host log の warn として operator の
+stderr/log に出す。内部 path、fingerprint、error chain は host log に限り、SSH client へは一般化した安定 error だけを返す。command output と terminal I/O は汚染しない。
 
 config、authorized_keys、host key、XDG directory の作成・permission・disk full・bind failure、Arapuca capability 不足は operational failure であり panic させない。remote の不正 username、unknown subsystem、unsupported request、disconnect も daemon 全体を panic させない。内部 invariant の破壊だけは location/backtrace をログし daemon を abort する。
 
@@ -351,9 +370,8 @@ config、authorized_keys、host key、XDG directory の作成・permission・dis
 3. `listen` と `log_level` はトップレベルに書ける。service args で `--listen` /
    `--log-level` を渡し続けることもでき、その場合は config 値を置き換える。両方に書いた
    場合は CLI が勝つ。
-4. `listen`、`log_level`、`[sandbox] network` は process-lifetime である。SIGHUP の
-   reload でこれらを変更すると reload 全体が拒否され、旧設定が維持される。変更の適用には
-   daemon の restart を行う。
+4. `listen`、`log_level`、`[sandbox] network` は process-lifetime である。起動後に
+   config file を書き換えても適用されない。変更の適用には daemon の restart を行う。
 
 ## 9. 関連文書
 
@@ -362,4 +380,4 @@ config、authorized_keys、host key、XDG directory の作成・permission・dis
 - [architecture.md](./architecture.md): config snapshot と module 境界
 - [ssh-protocol.md](./ssh-protocol.md): request/channel semantics
 - [platforms.md](./platforms.md): Linux cgroup、macOS capability、Arapuca revision
-- [testing.md](./testing.md): configuration、reload、permission の acceptance test
+- [testing.md](./testing.md): configuration、鍵更新、permission の acceptance test
