@@ -64,7 +64,7 @@ state = "active"
 
 `state` の wire value は `active` または `deleting` だけである。概念上はそれぞれ
 **Active**、**Deleting** と呼ぶ。未知 field、未知 version、ID と directory 名の不一致、
-不正 fingerprint、不正 state は corruption である。自動 migration は行わない。
+不正 fingerprint、不正 state は corruption である。
 
 owner は sandbox を最初に作成した正確な public key fingerprint であり、admin key も
 例外ではない。v0.1 は共有 owner、譲渡、owner rotation を持たない。

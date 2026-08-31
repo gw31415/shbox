@@ -345,35 +345,7 @@ config、authorized_keys、host key、XDG directory の作成・permission・dis
 
 上限を超えた入力は切り詰めず拒否する。bounded buffer と SSH window backpressure を使い、client の送信失敗や channel close では対応する process を回収する。
 
-
-## 8. 移行ガイド（Migration Guide）
-
-### 8.1 旧 auth 設定からの移行
-
-旧設定（`admin_keys`、TOML の `authorized_keys`、CLI `--authorized-keys-host-access`）から移行する場合は次を実施する。
-
-1. 旧 `admin_keys` に列挙していた host-capable key を daemon account の `~/.ssh/authorized_keys` へ移す。
-2. 旧 authorized key のうち sandbox-only にしたい key を `$XDG_CONFIG_HOME/shbox/allowed_keys` へ移す。
-3. `config.toml` から `authorized_keys` と `admin_keys` を削除する。
-4. service args / CLI から `--authorized-keys-host-access` を削除する。
-5. owner / mode（鍵ファイル `0600`、ディレクトリ `0700`）を検証してから daemon を restart する。旧 config を残したままでは意図的に起動失敗する。
-
-### 8.2 `[sandbox]` テーブルと config への operational 設定統一への移行
-
-旧綴りと CLI flag は unknown field / unknown flag として拒否される。次を実施する。
-
-1. service args / CLI から `--network disabled|outbound` を削除し、`config.toml` の
-   `[sandbox] network = "..."` に置き換える。`network` に対応する CLI flag は存在しない。
-2. `config.toml` のトップレベル `sandbox_shell = "..."` を `[sandbox] shell = "..."` へ、
-   トップレベル `read_paths = [...]` を `[sandbox] read_paths = [...]` へ、
-   `[sandbox_env]` を `[sandbox.env]` へ移す。
-3. `listen` と `log_level` はトップレベルに書ける。service args で `--listen` /
-   `--log-level` を渡し続けることもでき、その場合は config 値を置き換える。両方に書いた
-   場合は CLI が勝つ。
-4. `listen`、`log_level`、`[sandbox] network` は process-lifetime である。起動後に
-   config file を書き換えても適用されない。変更の適用には daemon の restart を行う。
-
-## 9. 関連文書
+## 8. 関連文書
 
 - [product.md](./product.md): 外部 API、ownership、host mode、compatibility
 - [security.md](./security.md): 脅威境界、key role、filesystem safety

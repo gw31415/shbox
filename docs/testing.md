@@ -95,7 +95,7 @@ sandbox-exec --version
 
 ### 4.2 Metadata と lifecycle
 
-- metadata version は v1 のみ。未知 version は list/delete の対象から隠し、自動 migration や自動修復をしない。
+- metadata version は v1 のみ。未知 version は list/delete の対象から隠し、自動修復をしない。
 - metadata state は `Active` または `Deleting`。作成中の claim は内部 state として管理し、metadata は atomic temp write、file fsync、rename、parent fsync の順で公開する。
 - owner は public key の SHA-256 fingerprint 一個。最初の atomic claimant が所有し、競合した claimant は存在を開示しない generic error を受ける。
 - `Active` だけを list の snapshot に含め、owner は自分のもの、admin は全件を bytewise ASCII 昇順で取得する。create/delete の途中結果を list に混ぜない。

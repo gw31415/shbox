@@ -247,7 +247,7 @@ c94802c4d8b6b880334c0d643b16b7326ec7f039
 
 これは v0.2.7 tag `8c61b0d` の後に macOS PTY の `file-ioctl` と `/var` traversal を修正した未リリースの累積 revision である。依存更新はこの revision の差分確認と、対応する Linux/macOS の全統合試験を通過した場合だけ行う。package version `0.2.7` だけをもって正式 upstream release や互換保証とは扱わない。
 
-v0.1 の外部契約はリリースごとに固定する。0.x の minor release は、変更点を明記したうえで破壊的変更を許容する。metadata は version `1` のみを認識し、未知 version は list/delete/create の対象にせず block する。自動 migration は行わない。
+v0.1 の外部契約はリリースごとに固定する。0.x の minor release は、変更点を明記したうえで破壊的変更を許容する。metadata は version `1` のみを認識し、未知 version は list/delete/create の対象にせず block する。
 
 ## 12. 関連文書
 

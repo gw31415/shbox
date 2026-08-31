@@ -191,7 +191,7 @@ $XDG_DATA_HOME/shbox/sandboxes/<SandboxId>/
 
 管理用ファイル名は `metadata.toml` に固定し、sandbox 間で共有しない。metadata は
 version `1`、owner fingerprint、`Active` または `Deleting` state のみを持つ。
-未知 version は list や操作で使用せず、migration も自動実行しない。
+未知 version は list や操作の対象にしない。
 
 filesystem の管理 root、sandbox directory、metadata は daemon user 所有とし、
 原則 mode `0700` / `0600` にする。状態変更は一時ファイルへの write、file fsync、
