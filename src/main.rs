@@ -27,8 +27,6 @@ use std::sync::Arc;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::os::unix::process::CommandExt;
 
-use crate::auth::KeyFingerprint;
-
 use tracing::{debug, error, info, warn};
 
 /// Foreground SSH daemon mapping authenticated keys onto persistent sandbox
@@ -54,9 +52,6 @@ struct Args {
     /// Daemon log verbosity. Defaults to info.
     #[usage(long, value_name = "LEVEL", value_enum)]
     log_level: Option<config::LogLevel>,
-    /// Treat every authorized key as an admin key, including host access.
-    #[usage(long)]
-    authorized_keys_host_access: bool,
     /// Print a completion script for SHELL on stdout and exit.
     #[usage(long, value_name = "SHELL", value_enum)]
     completions: Option<CompletionShell>,
@@ -340,17 +335,10 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
     account::validate_executable(&host_shell)
         .map_err(|err| fail("validating the host shell", err))?;
 
-    let authorized_keys = auth::resolve_authorized_keys_path(app_config.authorized_keys())
+    let host_path = auth::resolve_authorized_keys_path()
         .map_err(|err| fail("resolving authorized_keys", err))?;
-    auth::validate_authorized_keys_file(&authorized_keys)
-        .map_err(|err| fail("validating authorized_keys", err))?;
-    let all_authorized_keys_admin = args.authorized_keys_host_access;
-    let auth_snapshot = auth::AuthSnapshot::load(
-        &authorized_keys,
-        app_config.admin_keys(),
-        all_authorized_keys_admin,
-    )
-    .map_err(|err| fail("loading the authentication snapshot", err))?;
+    let auth_snapshot = auth::AuthSnapshot::load(&host_path, paths.allowed_keys_file())
+        .map_err(|err| fail("loading the authentication snapshot", err))?;
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
@@ -373,7 +361,7 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
             (Arc::new(platform::UnavailableLauncher), None)
         }
     };
-    let managed_mode = all_authorized_keys_admin || app_config.managed_mode();
+    let managed_mode = auth_snapshot.admin_count() > 0;
     let sandbox_manager = Arc::new(
         if managed_mode {
             sandbox::SandboxManager::open_unreconciled_with_launcher(
@@ -399,15 +387,6 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
             admins = auth_snapshot.admin_count(),
             user = %account.name,
             "managed mode: host selector \"_\" is available to admin keys"
-        );
-        debug!(
-            admins = %app_config
-                .admin_keys()
-                .iter()
-                .map(KeyFingerprint::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-            "admin fingerprints"
         );
     } else {
         warn!(
@@ -474,7 +453,6 @@ async fn run(args: &Args, listen: Vec<std::net::SocketAddr>) -> Result<(), Boots
                             &current_config,
                             &account,
                             network,
-                            all_authorized_keys_admin,
                         )
                         .await
                         {
@@ -574,7 +552,6 @@ async fn load_reload_snapshot(
     previous: &config::Config,
     account: &account::Account,
     network: config::NetworkMode,
-    all_authorized_keys_admin: bool,
 ) -> Result<ReloadSnapshot, ReloadError> {
     let paths = paths.clone();
     let previous = previous.clone();
@@ -592,16 +569,10 @@ async fn load_reload_snapshot(
             .map_err(|error| ReloadError(format!("selecting the sandbox shell: {error}")))?;
         account::validate_executable(&sandbox_shell)
             .map_err(|error| ReloadError(format!("validating the sandbox shell: {error}")))?;
-        let authorized_keys = auth::resolve_authorized_keys_path(config.authorized_keys())
+        let host_path = auth::resolve_authorized_keys_path()
             .map_err(|error| ReloadError(format!("resolving authorized_keys: {error}")))?;
-        auth::validate_authorized_keys_file(&authorized_keys)
-            .map_err(|error| ReloadError(format!("validating authorized_keys: {error}")))?;
-        let auth = auth::AuthSnapshot::load(
-            &authorized_keys,
-            config.admin_keys(),
-            all_authorized_keys_admin,
-        )
-        .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
+        let auth = auth::AuthSnapshot::load(&host_path, paths.allowed_keys_file())
+            .map_err(|error| ReloadError(format!("loading authentication snapshot: {error}")))?;
         let policy = platform::ArapucaLaunchPolicy::from_config(&config, &sandbox_shell, network);
         Ok(ReloadSnapshot {
             config,

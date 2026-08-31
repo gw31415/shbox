@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! $XDG_CONFIG_HOME/shbox/config.toml            optional
+//! $XDG_CONFIG_HOME/shbox/allowed_keys           sandbox-only keys
 //! $XDG_DATA_HOME/shbox/registry.lock            sandbox data root lock
 //! $XDG_DATA_HOME/shbox/sandboxes/<id>/          metadata + workspace
 //! $XDG_STATE_HOME/shbox/host_key                Ed25519 host key
@@ -31,6 +32,7 @@ const PREFIX: &str = "shbox";
 pub struct Paths {
     config_dir: PathBuf,
     config_file: PathBuf,
+    allowed_keys_file: PathBuf,
     data_dir: PathBuf,
     sandboxes_root: PathBuf,
     registry_lock: PathBuf,
@@ -63,6 +65,7 @@ impl Paths {
     pub fn from_roots(config_dir: PathBuf, data_dir: PathBuf, state_dir: PathBuf) -> Paths {
         Paths {
             config_file: config_dir.join("config.toml"),
+            allowed_keys_file: config_dir.join("allowed_keys"),
             sandboxes_root: data_dir.join("sandboxes"),
             registry_lock: data_dir.join("registry.lock"),
             host_key: state_dir.join("host_key"),
@@ -89,6 +92,9 @@ impl Paths {
 
     pub fn config_file(&self) -> &Path {
         &self.config_file
+    }
+    pub fn allowed_keys_file(&self) -> &Path {
+        &self.allowed_keys_file
     }
 
     /// Sandbox data root: `$XDG_DATA_HOME/shbox`.
@@ -283,6 +289,7 @@ mod tests {
         assert_eq!(paths.data_dir(), data);
         assert_eq!(paths.state_dir(), state);
         assert_eq!(paths.config_file(), config.join("config.toml"));
+        assert_eq!(paths.allowed_keys_file(), config.join("allowed_keys"));
         assert_eq!(paths.registry_lock(), data.join("registry.lock"));
         assert_eq!(paths.sandboxes_root(), data.join("sandboxes"));
         assert_eq!(paths.host_key(), state.join("host_key"));

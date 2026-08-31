@@ -71,14 +71,12 @@ Options:
       --listen <ADDR>
       --network <MODE>
       --log-level <LEVEL>
-      --authorized-keys-host-access
       --completions <SHELL>
       --man
 ```
 
 `--listen` は repeat 可能で、未指定時は `0.0.0.0:22`。`--network` は `disabled`（default）
 または `outbound`、`--log-level` は `error`、`warn`、`info`（default）、`debug`、`trace`。
-`--authorized-keys-host-access` は全 authorized key に host/admin 権限を与える。
 `--completions` と `--man` は daemon を起動せず stdout に出力する。
 subcommand、daemonize、管理 command、`--config`、`--host-key`、`--authorized-keys` などの
 server 設定 option は持たない。sandbox 操作には SSH、
@@ -165,9 +163,7 @@ delete は対象 ID の lifecycle lock を取得し、次の順序で処理す�
 
 ## 6. Admin と host mode
 
-admin key は設定で複数指定できる。admin key は全 sandbox の list、shell、exec、delete を行え、sandbox 所有者による制限を受けない。`--authorized-keys-host-access` を指定すると、
-`admin_keys` に列挙していない authorized key も同じ Admin role になる。この flag は daemon の
-process lifetime 中固定であり、config file や reload から変更できない。
+daemon account の `~/.ssh/authorized_keys` に登録された key はすべて Admin となり、全 sandbox の list、shell、exec、delete を行え、sandbox 所有者による制限を受けない。
 
 username `_` は admin 専用の host selector である。
 

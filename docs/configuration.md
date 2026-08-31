@@ -7,7 +7,7 @@
 設定ファイルは任意である。設定ファイルが存在しない場合は、target OS に応じた built-in default で起動する。設定ファイルを使う場合は、`serde` と `toml` による typed parse を行い、未知の field、重複 key、不正な型、不正な値は起動または reload の失敗とする。値を黙って丸めたり、未知の設定を無視したりしない。
 
 daemon の起動時に決める operational settings は CLI で指定する。`--listen`、`--network`、
-`--log-level`、`--authorized-keys-host-access` は config file に書けず、SIGHUP でも変わらない。
+`--log-level` は config file に書けず、SIGHUP でも変わらない。
 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`、必要な場合の `XDG_RUNTIME_DIR` は、
 `xdg` crate の標準的な path 解決だけに使う。shbox の機能設定に `SHBOX_*` や `RUST_LOG` を使わない。
 
@@ -16,16 +16,10 @@ daemon の起動時に決める operational settings は CLI で指定する。`
 ## 2. 完全な v0.1 TOML schema
 
 この例は全 target で使える file-backed field を示す。コメントは説明用であり、指定しない
-field は built-in default が適用される。`authorized_keys`、`sandbox_shell`、`read_paths`
+field は built-in default が適用される。`sandbox_shell` や `read_paths`
 のような path は、設定ファイルに明示する場合は絶対 path でなければならない。
 
 ```toml
-# 省略時は daemon の home/.ssh/authorized_keys。
-# authorized_keys = "/home/shbox/.config/shbox/authorized_keys"
-
-# SHA256:<unpadded-base64> の Ed25519 fingerprint。空配列は admin 無し。
-admin_keys = []
-
 # 省略時は daemon OS user の login shell（passwd entry が空なら /bin/sh）。
 # 指定時は絶対 path の executable。
 # sandbox_shell = "/bin/bash"
@@ -42,8 +36,7 @@ listener、network、log level、host-access policy は daemon の CLI で指定
 例えば次のように起動する。
 
 ```console
-shbox --listen 127.0.0.1:2222 --network outbound --log-level debug \
-  --authorized-keys-host-access
+shbox --listen 127.0.0.1:2222 --network outbound --log-level debug
 ```
 
 この file schema 以外の field は v0.1 に存在しない。特に operational CLI options と resource
@@ -63,35 +56,31 @@ SSH listener の bind address で、repeat して複数指定できる。default
 listener は process-lifetime の設定であり、SIGHUP では再 bind しない。変更には daemon の
 restart が必要である。
 
-### 3.2 `authorized_keys`
+### 3.2 鍵ファイルと権限（host 認可鍵・sandbox 許可鍵）
 
-SSH 公開鍵を一つの OpenSSH 形式ファイルから読み込む。省略時は daemon OS user の home にある `~/.ssh/authorized_keys` であり、これは設定ファイル中の literal `~` ではない。sandbox ごとに別の認証ファイルは持たない。
+SSH 公開鍵は TOML 設定ではなく、明確な由来を持つ二つのファイルから読み込む。
 
-受理する行は次の bare form だけである。
+1. **Host 認可鍵**: daemon account の `~/.ssh/authorized_keys`
+   ここにある鍵はすべて `Admin` であり、host selector `_` と全 sandbox の操作を許可される。
+2. **Sandbox 許可鍵**: `$XDG_CONFIG_HOME/shbox/allowed_keys`
+   ここだけにある鍵は `Normal` であり、自分が所有する sandbox だけを利用できる。
+3. **両方にある鍵**: 一つの identity として扱い、強い権限である `Admin` を付与する。
+
+`~` は文字列展開ではなく、現在の daemon account の home directory から解決する。`allowed_keys` も `Paths` が導出する固定 path であり、TOML や CLI で変更できない。
+
+受理する行は次の bare OpenSSH Ed25519 形式だけである。
 
 ```text
 ssh-ed25519 <base64-public-key> [comment]
 ```
 
-空行と `#` で始まるコメントは無視する。options、証明書、別 algorithm、壊れた base64、重複 key、未知の line format は config/authentication file の validation error とする。1 行の上限は 8 KiB、ファイル全体の上限は 1 MiB。少なくとも一つの有効な Ed25519 key が必要であり、ファイルが無い、空、読めない場合は起動または reload を失敗させる。
+空行と `#` で始まるコメントは無視する。options、証明書、別 algorithm、壊れた base64、同一 source 内の重複 key、未知の line format は source 全体の error とする。1 行の上限は 8 KiB、ファイル全体の上限は 1 MiB。
 
-`authorized_keys` とその親 directory は daemon が所有し、group/world writable であってはならない。fingerprint は key bytes から shbox が計算する。username は OS user の lookup に使わない。
+各 source は個別には未作成、空、blank/comment のみを許す。ただし二つを合成した結果に有効な鍵が一つもない場合、起動や reload は拒否される。
 
-### 3.3 `admin_keys`
+存在する key file は daemon user 所有の regular file で、symlink ではなく、group/world writable であってはならない。直近 parent も daemon user 所有の directory で、symlink および group/world writable を拒否する。上位 ancestor にも write permission 検査を適用し、最終 path は `O_NOFOLLOW` で開く。
 
-admin key の fingerprint 配列である。
-
-```toml
-admin_keys = [
-  "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-]
-```
-
-形式は `SHA256:<unpadded-base64>` に厳密に限定する。重複、authorized key に存在しない fingerprint、Ed25519 以外の key に対応する fingerprint は設定 error である。配列が空、または field が省略された場合は admin 無しの sandbox-only mode になる。admin key は複数指定でき、別の `host_keys` や host 専用 role はない。
-
-admin key は全 sandbox を可視・操作でき、`_` host selector による host shell/exec/PTY/resize/signal を利用できる。`_` を通常 key で使うことはできない。admin を reload で全て削除することも可能であり、その場合は新規 admin access が無くなって sandbox-only mode に遷移する。既存 admin connection の権利は切断まで変わらない。
-
+admin key は全 sandbox を可視・操作でき、`_` host selector による host shell/exec/PTY/resize/signal を利用できる。`_` を通常 key で使うことはできない。SIGHUP で host file から鍵を削除して admin なしの sandbox-only mode に遷移することも可能である。既存 admin connection の権利は切断まで変わらない。
 ### 3.4 `sandbox_shell`
 
 省略時は daemon OS user の passwd entry の login shell を使い、その entry が空の場合だけ `/bin/sh` を fallback とする。passwd entry または設定で選ばれた非空 path が存在しない、通常 file でない、実行できない場合は startup/reload error とする。指定値は絶対 path の executable 一つだけであり、shell command、argv、shell fragment は指定しない。
@@ -228,11 +217,12 @@ XDG directory の lookup は `xdg::BaseDirectories` に `shbox` prefix を付け
 | 用途 | path |
 | --- | --- |
 | config | `$XDG_CONFIG_HOME/shbox/config.toml`（fallback `~/.config/shbox/config.toml`） |
+| sandbox 許可鍵 | `$XDG_CONFIG_HOME/shbox/allowed_keys`（fallback `~/.config/shbox/allowed_keys`） |
+| host 認可鍵 | `~/.ssh/authorized_keys`（daemon account の home directory） |
 | sandbox data | `$XDG_DATA_HOME/shbox/sandboxes/`（fallback `~/.local/share/shbox/sandboxes/`） |
 | host key | `$XDG_STATE_HOME/shbox/host_key`（fallback `~/.local/state/shbox/host_key`） |
 | registry lock | `$XDG_DATA_HOME/shbox/registry.lock`（fallback `~/.local/share/shbox/registry.lock`） |
 | daemon state lock | `$XDG_STATE_HOME/shbox/lock`（fallback `~/.local/state/shbox/lock`） |
-
 上記の `host_key`、二つの lock、sandbox root は固定 path であり、config field で変更できない。XDG runtime directory は v0.1 の必須 storage ではなく、cache directory も使用しない。sandbox data は runtime に置かない。
 
 host key は Ed25519 とし、無い場合だけ初回起動時に atomic create する。mode `0600`、daemon owner 固定であり、破損、wrong owner、group/world writable、保存失敗は startup error である。既存 host key の自動 rotation や OpenSSH daemon key の暗黙流用はしない。
@@ -245,19 +235,17 @@ daemon は data 側の registry lock と state 側の daemon lock をこの順�
 
 起動時は次の順で初期化する。
 
-1. CLI を parse し、listener、network、log level、host-access policy を固定する
+1. CLI を parse し、listener、network、log level を固定する
 2. XDG path を解決し、data の registry lock と state の daemon lock を取得する
 3. config（または built-in default）を parse/validate する
-4. authorized_keys、admin fingerprints、host key、logging を初期化する
-5. Arapuca backend を一度だけ生成する
-6. managed mode（admin key または host-access flag）なら listener を bind し、`_` だけを ready にする
-7. metadata を reconcile し、valid な `Active`/`Deleting` state を確認する
-8. sandbox operation を ready にし、sandbox-only mode ならここで listener を bind する
+4. host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）から auth snapshot を構築する
+5. host key、logging を初期化する
+6. Arapuca backend を一度だけ生成する
+7. managed mode（初期 Admin 数 > 0）なら listener を bind し、`_` だけを ready にする
+8. metadata を reconcile し、valid な `Active`/`Deleting` state を確認する
+9. sandbox operation を ready にし、sandbox-only mode（初期 Admin 数 == 0）ならここで listener を bind する
 
-admin key が一つ以上ある、または `--authorized-keys-host-access` を指定した managed mode では、
-host selector `_` を reconciliation より先に利用可能にする。reconcile が完了するまで sandbox
-operation は `not ready` として拒否する。admin policy が無い sandbox-only mode では、reconcile
-完了前に listener を公開しない。
+Admin key が一つ以上ある managed mode では、host selector `_` を reconciliation より先に利用可能にする。reconcile が完了するまで sandbox operation は `not ready` として拒否する。Admin が無い sandbox-only mode では、reconcile 完了前に listener を公開しない。
 
 sandbox-only mode は有効な構成だが、port 22 の listener に admin recovery route が無い
 ことを startup log で warning として一度通知する。
@@ -270,21 +258,22 @@ SIGHUP は、ファイルを新しい typed config として全体 parse/validat
 immutable snapshot として置き換える。parse、permission、path、key、platform capability の
 いずれかに失敗した場合は、旧 snapshot、既存 connection、既存 process を維持する。
 
-reload できる field は次のとおりである。
+reload は次の 4 項目を一つの reload 単位として読み、すべて成功した場合だけ atomic に publish する。
 
-- `authorized_keys`
-- `admin_keys`
-- `sandbox_shell`
-- `read_paths`
-- `sandbox_env`
+1. `$XDG_CONFIG_HOME/shbox/config.toml`
+2. daemon account の `~/.ssh/authorized_keys`
+3. `$XDG_CONFIG_HOME/shbox/allowed_keys`
+4. config から導出する sandbox shell/read path/environment policy
+
+どれか一つでも missing policy 違反、permission 違反、parse error、空の合成 key set になれば、config・auth・sandbox policy のどの部分も publish しない。
 
 変更後の値は、新しい connection と新しく作る process/sandbox operation に適用する。既存 connection
 の認証済み role/ownership rights、既存 process、既存 PTY は切断・再起動しない。既存 admin
 connection は、reload で最後の admin key が削除されても切断まで admin のままである。
 
-CLI で指定する `--listen`、`--network`、`--log-level`、`--authorized-keys-host-access`、
-組み込み caps/limits、host key path、XDG root、固定 selector `_`、metadata version は process
-の lifetime 中固定である。これらを TOML に書いた reload は unknown field として拒否される。
+CLI で指定する `--listen`、`--network`、`--log-level`、組み込み caps/limits、host key path、
+XDG root、固定 selector `_`、metadata version は process の lifetime 中固定である。
+これらを TOML に書いた reload は unknown field として拒否される。
 
 通常起動時に config file が無くても default で動作する。起動後に config file を新しく作成して
 SIGHUP した場合は、それを検証して採用できる。config が引き続き無ければ built-in default を
@@ -311,7 +300,18 @@ config、authorized_keys、host key、XDG directory の作成・permission・dis
 
 上限を超えた入力は切り詰めず拒否する。bounded buffer と SSH window backpressure を使い、client の送信失敗や channel close では対応する process を回収する。
 
-## 8. 関連文書
+
+## 8. 移行ガイド（Migration Guide）
+
+旧設定（`admin_keys`、TOML の `authorized_keys`、CLI `--authorized-keys-host-access`）から移行する場合は次を実施する。
+
+1. 旧 `admin_keys` に列挙していた host-capable key を daemon account の `~/.ssh/authorized_keys` へ移す。
+2. 旧 authorized key のうち sandbox-only にしたい key を `$XDG_CONFIG_HOME/shbox/allowed_keys` へ移す。
+3. `config.toml` から `authorized_keys` と `admin_keys` を削除する。
+4. service args / CLI から `--authorized-keys-host-access` を削除する。
+5. owner / mode（鍵ファイル `0600`、ディレクトリ `0700`）を検証してから daemon を restart する。旧 config を残したままでは意図的に起動失敗する。
+
+## 9. 関連文書
 
 - [product.md](./product.md): 外部 API、ownership、host mode、compatibility
 - [security.md](./security.md): 脅威境界、key role、filesystem safety

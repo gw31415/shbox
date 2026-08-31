@@ -80,10 +80,9 @@ sandbox-exec --version
 - Sandbox ID は `[A-Za-z0-9][A-Za-z0-9-]{0,63}`、case-sensitive。空、`_`、`.`、slash、Unicode、64 bytes 超を受理しない。内部 Arapuca task ID は `<id>-<32 lowercase hex>` とし、許可文字と 128-byte 上限を再検証する。
 - host selector は `_` のみ。通常 key の `_` 認証、admin 以外の host shell/exec、通常 key の全件 list を拒否する。
 - public-key authentication は Ed25519 のみ。none/password/keyboard-interactive と未知 key algorithm を拒否する。
-- authorized_keys の blank/comment は無視し、options、certificate、malformed/unsupported line は設定エラーとする。
-- admin fingerprint は authorized key と一致する必要があり、重複指定は設定エラーとする。
-  admin 配列が空でも起動できるが、`--authorized-keys-host-access` が無ければ sandbox-only
-  mode とする。flag を指定した場合は全 authorized key の host access を検証する。
+- host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）の blank/comment は無視し、options、certificate、malformed/unsupported line、同一 source 内の重複 key は設定エラーとする。
+- host 認可鍵の key は Admin、sandbox 許可鍵のみの key は Normal、両方にある key は Admin とする。
+- 各 source の未作成・空を許しつつ、合成結果が空の場合は起動・reload を拒否する。
 - config file は任意。欠落時は built-in default、存在時は typed TOML の unknown field/型/範囲エラーを拒否する。SIGHUP の失敗は旧設定を保持する。
 - managed env、`ARAPUCA_*`、loader injection、NUL、非 UTF-8、4 KiB 超の environment value を拒否する。client の env request は Sandbox に渡さない。
 - `--network disabled|outbound`、`--log-level error|warn|info|debug|trace` の enum 以外、
@@ -289,8 +288,8 @@ admin key で `ssh _@host` の shell、remote exec、PTY、resize、signal を�
 
 ### 8.2 Reload
 
-- SIGHUP で authorized_keys、admin_keys、shell、Sandbox env、read paths だけが atomic に更新
-  される。CLI の listener/network/log-level/host-access と built-in limits/caps は変わらない。
+- SIGHUP で config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy だけが atomic に更新
+  される。CLI の listener/network/log-level と built-in limits/caps は変わらない。
 - config 無しの defaults で起動した後に config file を作ると valid SIGHUP で採用される。一度
   file を採用した後に削除すると reload failure になり、旧 snapshot を保持する。
 - 新しい connection/process には新設定、既存 connection には元の role/rights を適用する。
