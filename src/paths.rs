@@ -14,7 +14,8 @@
 //!
 //! Every directory shbox creates is validated after creation: it must be a
 //! real directory (no symlink), owned by the daemon user, and neither group
-//! nor world writable.
+//! nor world writable. The config directory is a read-only input, so it is
+//! never created; it is only validated when it already exists.
 
 use std::fmt;
 use std::fs;
@@ -76,10 +77,18 @@ impl Paths {
         }
     }
 
-    /// Create missing shbox directories and validate ownership and modes of
-    /// every directory that already exists.
+    /// Create the directories shbox writes to, and validate every shbox
+    /// directory that already exists.
+    ///
+    /// The config directory is an operator-provided read-only input holding
+    /// `config.toml` and `allowed_keys`, so it is never created: a missing
+    /// one is fine, and one that exists is validated like the rest.
     pub fn ensure(&self) -> Result<(), Error> {
-        ensure_dir(&self.config_dir)?;
+        match fs::symlink_metadata(&self.config_dir) {
+            Ok(_) => validate_dir(&self.config_dir)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::stat(&self.config_dir, err)),
+        }
         ensure_dir(&self.data_dir)?;
         ensure_dir(&self.sandboxes_root)?;
         ensure_dir(&self.state_dir)?;
@@ -300,17 +309,31 @@ mod tests {
     fn ensure_creates_missing_directories_with_safe_modes() {
         let (_home, paths) = temp_paths();
         paths.ensure().expect("ensure");
-        for dir in [
-            paths.config_dir(),
-            paths.data_dir(),
-            paths.sandboxes_root(),
-            paths.state_dir(),
-        ] {
+        for dir in [paths.data_dir(), paths.sandboxes_root(), paths.state_dir()] {
             let metadata = fs::symlink_metadata(dir).expect("dir exists");
             assert!(metadata.is_dir(), "{dir:?} is not a directory");
             assert_eq!(metadata.permissions().mode() & 0o777, 0o700, "{dir:?}");
             assert_eq!(metadata.uid(), euid());
         }
+    }
+
+    #[test]
+    fn ensure_does_not_create_the_config_directory() {
+        let (_home, paths) = temp_paths();
+        paths.ensure().expect("ensure");
+        let err = fs::symlink_metadata(paths.config_dir()).expect_err("config dir untouched");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[test]
+    fn ensure_validates_an_existing_config_directory() {
+        let (_home, paths) = temp_paths();
+        fs::create_dir(paths.config_dir()).expect("create config dir");
+        paths.ensure().expect("writable config dir passes");
+        fs::set_permissions(paths.config_dir(), fs::Permissions::from_mode(0o730))
+            .expect("chmod");
+        let err = paths.ensure().expect_err("group writable config dir");
+        assert!(err.to_string().contains("group or world writable"), "{err}");
     }
 
     #[test]

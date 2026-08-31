@@ -721,6 +721,8 @@ mod tests {
     #[test]
     fn present_empty_file_uses_builtin_policy() {
         let (_home, paths) = test_paths();
+        // `ensure` no longer creates the read-only config directory.
+        std::fs::create_dir(paths.config_dir()).expect("create config dir");
         std::fs::write(paths.config_file(), "").expect("write empty config");
         let config = Config::load_snapshot(&paths).expect("empty config");
         assert!(config.read_paths().is_empty());
@@ -1056,6 +1058,8 @@ read_paths = ["/definitely/not/here"]"#,
             home.path().join("state"),
         );
         paths.ensure().expect("ensure");
+        // `ensure` no longer creates the read-only config directory.
+        std::fs::create_dir(paths.config_dir()).expect("create config dir");
         let path = paths.config_file();
         std::fs::write(path, "[sandbox]\nnetwork = \"disabled\"").expect("write config");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
@@ -1078,6 +1082,8 @@ read_paths = ["/definitely/not/here"]"#,
             home.path().join("state"),
         );
         paths.ensure().expect("ensure");
+        // `ensure` no longer creates the read-only config directory.
+        std::fs::create_dir(paths.config_dir()).expect("create config dir");
         let path = paths.config_file();
         std::fs::write(path, b"#").unwrap();
         // Build a file just over the limit out of harmless comment lines.
