@@ -24,6 +24,8 @@ struct TestDaemon {
     normal_key: KeyPair,
     ssh_config: PathBuf,
     config_path: PathBuf,
+    host_authorized_keys: PathBuf,
+    sandbox_allowed_keys: PathBuf,
 }
 
 struct KeyPair {
@@ -111,67 +113,65 @@ impl TestDaemon {
     }
 
     fn start_with_config(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
-        Self::start_with_options(admin_keys, extra_config, false)
-    }
-
-    fn start_with_host_access(admin_keys: &[&str], extra_config: &str) -> TestDaemon {
-        Self::start_with_options(admin_keys, extra_config, true)
-    }
-
-    fn start_with_options(
-        admin_keys: &[&str],
-        extra_config: &str,
-        all_authorized_keys_admin: bool,
-    ) -> TestDaemon {
+        use std::os::unix::fs::PermissionsExt;
         let root = ssh_tempdir();
+        let home_dir = root.path().join("home");
+        let ssh_dir = home_dir.join(".ssh");
         let config_dir = root.path().join("config/shbox");
         let data_dir = root.path().join("data/shbox");
         let state_dir = root.path().join("state/shbox");
         let keys_dir = root.path().join("keys");
-        for dir in [&config_dir, &data_dir, &state_dir, &keys_dir] {
+        for dir in [
+            &home_dir,
+            &ssh_dir,
+            &config_dir,
+            &data_dir,
+            &state_dir,
+            &keys_dir,
+        ] {
             std::fs::create_dir_all(dir).expect("create dirs");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
         }
 
         let admin_key = generated_key(&keys_dir, "admin");
         let normal_key = generated_key(&keys_dir, "normal");
 
-        // The authorized-keys file carries both keys; only the admin key is
-        // configured as admin.
-        let authorized_keys = config_dir.join("authorized_keys");
-        std::fs::write(
-            &authorized_keys,
-            format!(
-                "# test authorized keys\n{}\n{}\n",
+        let host_authorized_keys = ssh_dir.join("authorized_keys");
+        let sandbox_allowed_keys = config_dir.join("allowed_keys");
+
+        let mut host_content = String::new();
+        if admin_keys.contains(&"admin") {
+            host_content.push_str(
                 std::fs::read_to_string(&admin_key.public)
                     .expect("admin pub")
                     .trim(),
-                std::fs::read_to_string(&normal_key.public)
-                    .expect("normal pub")
-                    .trim(),
-            ),
-        )
-        .expect("write authorized_keys");
-
-        let admin_list: Vec<String> = admin_keys
-            .iter()
-            .filter(|name| **name == "admin")
-            .map(|_| admin_key.fingerprint.clone())
-            .collect();
-        let mut config = String::new();
-        let port = free_port();
-        config.push_str(&format!(
-            "authorized_keys = {:?}\n",
-            authorized_keys.display().to_string()
-        ));
-        config.push_str(&format!("admin_keys = {admin_list:?}\n"));
-        if !extra_config.is_empty() {
-            config.push_str(extra_config);
-            if !extra_config.ends_with('\n') {
-                config.push('\n');
-            }
+            );
+            host_content.push('\n');
         }
+        std::fs::write(&host_authorized_keys, &host_content).expect("write host authorized_keys");
+        std::fs::set_permissions(
+            &host_authorized_keys,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod host authorized_keys");
+
+        let allowed_content = format!(
+            "{}\n",
+            std::fs::read_to_string(&normal_key.public)
+                .expect("normal pub")
+                .trim()
+        );
+        std::fs::write(&sandbox_allowed_keys, &allowed_content)
+            .expect("write sandbox allowed_keys");
+        std::fs::set_permissions(
+            &sandbox_allowed_keys,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod sandbox allowed_keys");
+
         let config_path = config_dir.join("config.toml");
-        std::fs::write(&config_path, config).expect("write config");
+        std::fs::write(&config_path, extra_config).expect("write config");
 
         let ssh_config = keys_dir.join("ssh_config");
         std::fs::write(
@@ -180,16 +180,15 @@ impl TestDaemon {
         )
         .expect("write ssh_config");
 
+        let port = free_port();
         let mut daemon_command = Command::new(daemon_binary());
         daemon_command
+            .env("HOME", &home_dir)
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_STATE_HOME", root.path().join("state"))
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"));
-        if all_authorized_keys_admin {
-            daemon_command.arg("--authorized-keys-host-access");
-        }
         let child = daemon_command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -204,6 +203,8 @@ impl TestDaemon {
             normal_key,
             ssh_config,
             config_path,
+            host_authorized_keys,
+            sandbox_allowed_keys,
         };
         daemon.wait_ready();
         daemon
@@ -217,23 +218,36 @@ impl TestDaemon {
             .join("workspace")
     }
 
-    /// Replace only the admin-key line in the fixture's config file.
+    fn set_host_keys(&self, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&self.host_authorized_keys, content).expect("write host keys");
+        std::fs::set_permissions(
+            &self.host_authorized_keys,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod host keys");
+    }
+
+    fn set_allowed_keys(&self, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&self.sandbox_allowed_keys, content).expect("write allowed keys");
+        std::fs::set_permissions(
+            &self.sandbox_allowed_keys,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod allowed keys");
+    }
+
     fn set_admin_keys(&self, admin_keys: &[&str]) {
-        let current = std::fs::read_to_string(&self.config_path).expect("read config");
-        let replacement = format!("admin_keys = {admin_keys:?}\n");
-        let mut updated = String::with_capacity(current.len());
-        let mut replaced = false;
-        for line in current.lines() {
-            if line.starts_with("admin_keys = ") {
-                updated.push_str(&replacement);
-                replaced = true;
-            } else {
-                updated.push_str(line);
-                updated.push('\n');
-            }
+        if admin_keys.contains(&"admin")
+            || admin_keys.contains(&self.admin_key.fingerprint.as_str())
+        {
+            self.set_host_keys(
+                &std::fs::read_to_string(&self.admin_key.public).expect("admin pub"),
+            );
+        } else {
+            self.set_host_keys("");
         }
-        assert!(replaced, "fixture config has no admin_keys line");
-        std::fs::write(&self.config_path, updated).expect("write config");
     }
 
     /// Add a retired listener field to exercise fail-closed reload parsing.
@@ -773,19 +787,26 @@ fn normal_key_cannot_use_host_selector() {
     assert!(!result.stdout.contains("nope"));
 }
 
-/// The explicit CLI host-access policy promotes every authorized key,
-/// including a key absent from the configured admin subset, to the host role.
+/// A key present in both ~/.ssh/authorized_keys and allowed_keys is accepted
+/// with the Admin role.
 #[test]
-fn authorized_key_host_access_flag_promotes_normal_key() {
-    let daemon = TestDaemon::start_with_host_access(&[], "");
-    let result = daemon.ssh(&daemon.normal_key, "_", "printf host-access", &["-T"]);
+fn key_present_in_both_files_receives_admin_role() {
+    let daemon = TestDaemon::start(&["admin"]);
+    let admin_pub = std::fs::read_to_string(&daemon.admin_key.public).expect("admin pub");
+    let normal_pub = std::fs::read_to_string(&daemon.normal_key.public).expect("normal pub");
+    daemon.set_allowed_keys(&format!("{normal_pub}\n{admin_pub}\n"));
+    daemon.reload();
+
+    let result = retry_until("overlap admin key access", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf host-access", &["-T"]);
+        (result.ok() && result.stdout == "host-access").then_some(result)
+    });
     assert!(
         result.ok(),
-        "host access flag did not promote key: {result:?}"
+        "overlap key did not authenticate as admin: {result:?}"
     );
     assert_eq!(result.stdout, "host-access");
 }
-
 /// Unknown keys are rejected; `none`/password/keyboard-interactive methods
 /// are not offered or fail without revealing the key set.
 #[test]
@@ -1387,6 +1408,37 @@ fn sighup_retired_listener_field_is_rejected_atomically() {
         (result.ok() && result.stdout == "old-listener").then_some(result)
     });
     assert_eq!(result.stdout, "old-listener");
+}
+
+/// Emptying both key files on reload causes an empty union error, keeping the
+/// previous valid auth snapshot.
+#[test]
+fn sighup_empty_union_rejected_atomically() {
+    let daemon = TestDaemon::start(&["admin"]);
+    daemon.set_host_keys("");
+    daemon.set_allowed_keys("");
+    daemon.reload();
+
+    let result = retry_until("admin access after empty union reload", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-auth", &["-T"]);
+        (result.ok() && result.stdout == "old-auth").then_some(result)
+    });
+    assert_eq!(result.stdout, "old-auth");
+}
+
+/// A malformed allowed_keys file rejects the whole reload atomically,
+/// preserving the previous auth snapshot.
+#[test]
+fn sighup_malformed_allowed_keys_rejected_atomically() {
+    let daemon = TestDaemon::start(&["admin"]);
+    daemon.set_allowed_keys("not-a-valid-ssh-ed25519-key\n");
+    daemon.reload();
+
+    let result = retry_until("admin access after malformed allowed_keys reload", || {
+        let result = daemon.ssh(&daemon.admin_key, "_", "printf old-auth", &["-T"]);
+        (result.ok() && result.stdout == "old-auth").then_some(result)
+    });
+    assert_eq!(result.stdout, "old-auth");
 }
 
 /// The daemon exits cleanly on SIGTERM.

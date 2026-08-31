@@ -94,8 +94,8 @@ XDG path の解決には `xdg` crate を使い、shbox が `HOME` fallback を�
 
 ```text
 $XDG_CONFIG_HOME/shbox/
-└── config.toml                 # optional
-
+├── config.toml                 # optional
+└── allowed_keys                # sandbox-only keys
 $XDG_DATA_HOME/shbox/
 ├── registry.lock              # sandbox data root の排他的 advisory lock
 └── sandboxes/

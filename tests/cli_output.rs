@@ -88,13 +88,15 @@ fn help_and_version_print_and_exit_successfully() {
     assert!(help.contains("--network"), "help lists --network");
     assert!(help.contains("--log-level"), "help lists --log-level");
     assert!(
-        help.contains("--authorized-keys-host-access"),
-        "help lists --authorized-keys-host-access"
+        !help.contains("authorized-keys"),
+        "help must not list retired flags: {help}"
     );
 }
 
 #[test]
 fn unknown_flags_fail() {
-    let output = shbox().arg("--no-such-flag").output().expect("spawn shbox");
-    assert_ne!(output.status.code(), Some(0));
+    for flag in ["--no-such-flag", "--authorized-keys-host-access"] {
+        let output = shbox().arg(flag).output().expect("spawn shbox");
+        assert_ne!(output.status.code(), Some(0), "{flag} must exit non-zero");
+    }
 }

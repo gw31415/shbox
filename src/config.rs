@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::auth::KeyFingerprint;
 use crate::paths::{self, Paths};
 
 /// Maximum config file size.
@@ -33,8 +32,6 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 /// `Caps`/`Limits` are built-in constants.
 #[derive(Debug, Clone)]
 pub struct Config {
-    authorized_keys: Option<PathBuf>,
-    admin_keys: Vec<KeyFingerprint>,
     sandbox_shell: Option<PathBuf>,
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
@@ -67,21 +64,6 @@ impl Config {
             }
             None => build(RawConfig::default(), paths),
         }
-    }
-
-    /// Configured authorized_keys path, when overridden.
-    pub fn authorized_keys(&self) -> Option<&Path> {
-        self.authorized_keys.as_deref()
-    }
-
-    /// Admin fingerprints; empty means sandbox-only mode.
-    pub fn admin_keys(&self) -> &[KeyFingerprint] {
-        &self.admin_keys
-    }
-
-    /// Managed mode is active when at least one admin key is configured.
-    pub fn managed_mode(&self) -> bool {
-        !self.admin_keys.is_empty()
     }
 
     /// Configured sandbox shell override.
@@ -154,17 +136,11 @@ fn parse_file(path: &Path) -> Result<RawConfig, Error> {
     toml::from_str(&text).map_err(|err| Error::Parse(err.message().to_string()))
 }
 
-/// Apply semantic validation that needs the filesystem context.
 pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
-    let authorized_keys =
-        validate_configured_path(raw.authorized_keys.as_deref(), "authorized_keys")?;
-    let admin_keys = validate_admin_keys(raw.admin_keys.as_deref())?;
     let sandbox_shell = validate_configured_path(raw.sandbox_shell.as_deref(), "sandbox_shell")?;
     let read_paths = validate_read_paths(raw.read_paths.as_deref(), paths)?;
     let sandbox_env = validate_sandbox_env(raw.sandbox_env.as_ref())?;
     Ok(Config {
-        authorized_keys,
-        admin_keys,
         sandbox_shell,
         read_paths,
         sandbox_env,
@@ -211,24 +187,6 @@ fn validate_configured_path(
             Ok(Some(PathBuf::from(value)))
         }
     }
-}
-
-fn validate_admin_keys(raw: Option<&[String]>) -> Result<Vec<KeyFingerprint>, Error> {
-    let mut keys = Vec::new();
-    for value in raw.unwrap_or(&[]) {
-        let fingerprint = KeyFingerprint::parse(value).map_err(|err| Error::Invalid {
-            field: "admin_keys",
-            message: err.to_string(),
-        })?;
-        if keys.contains(&fingerprint) {
-            return Err(Error::Invalid {
-                field: "admin_keys",
-                message: format!("duplicate admin key {fingerprint}"),
-            });
-        }
-        keys.push(fingerprint);
-    }
-    Ok(keys)
 }
 
 fn validate_read_paths(raw: Option<&[String]>, paths: &Paths) -> Result<Vec<PathBuf>, Error> {
@@ -532,8 +490,6 @@ impl Default for Caps {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
-    authorized_keys: Option<String>,
-    admin_keys: Option<Vec<String>>,
     sandbox_shell: Option<String>,
     read_paths: Option<Vec<String>>,
     sandbox_env: Option<BTreeMap<String, String>>,
@@ -623,8 +579,8 @@ mod tests {
     fn missing_file_uses_builtin_defaults() {
         let (_home, paths) = test_paths();
         let config = Config::load_snapshot(&paths).expect("defaults");
-        assert!(config.admin_keys().is_empty());
-        assert!(!config.managed_mode());
+        assert!(config.read_paths().is_empty());
+        assert!(config.sandbox_env().is_empty());
         assert!(!config.loaded_from_file());
     }
 
@@ -634,8 +590,6 @@ mod tests {
         std::fs::write(paths.config_file(), "").expect("write empty config");
         let config = Config::load_snapshot(&paths).expect("empty config");
         assert!(config.loaded_from_file());
-        assert!(config.admin_keys().is_empty());
-        assert!(!config.managed_mode());
         assert!(config.read_paths().is_empty());
         assert!(config.sandbox_env().is_empty());
     }
@@ -670,8 +624,6 @@ mod tests {
     fn full_document_parses() {
         let config = build_ok(
             r#"
-            authorized_keys = "/etc/shbox/authorized_keys"
-            admin_keys = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]
             sandbox_shell = "/bin/bash"
             read_paths = ["/usr/share/terminfo"]
 
@@ -680,7 +632,6 @@ mod tests {
             EDITOR_DEFAULT = "vi"
             "#,
         );
-        assert_eq!(config.admin_keys().len(), 1);
         assert_eq!(config.read_paths().len(), 1);
         assert_eq!(
             config.sandbox_env().get("LANG").map(String::as_str),
@@ -714,26 +665,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_retired_auth_fields() {
+        for text in [
+            r#"authorized_keys = "/etc/shbox/authorized_keys""#,
+            r#"admin_keys = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]"#,
+            r#"allowed_keys = "/etc/shbox/allowed_keys""#,
+        ] {
+            let message = build_err(text);
+            assert!(message.contains("unknown field"), "{text}: {message}");
+        }
+    }
+
+    #[test]
     fn rejects_malformed_toml() {
         assert!(toml::from_str::<RawConfig>("listen = [").is_err());
     }
 
     #[test]
     fn rejects_relative_paths() {
-        assert!(build_err(r#"authorized_keys = "keys""#).contains("absolute path"));
+        assert!(build_err(r#"sandbox_shell = "bin/bash""#).contains("absolute path"));
         assert!(build_err(r#"sandbox_shell = "~/bin/bash""#).contains("absolute path"));
         assert!(build_err(r#"read_paths = ["relative/path"]"#).contains("absolute"));
         assert!(build_err(r#"read_paths = [""]"#).contains("absolute"));
-    }
-
-    #[test]
-    fn rejects_bad_and_duplicate_admin_keys() {
-        let message = build_err(r#"admin_keys = ["AAAA"]"#);
-        assert!(message.contains("SHA256"), "{message}");
-        let message = build_err(
-            r#"admin_keys = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]"#,
-        );
-        assert!(message.contains("duplicate admin key"), "{message}");
     }
 
     #[test]

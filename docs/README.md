@@ -34,7 +34,8 @@
 - **Arapuca process**: 一回の shell/exec のために起動する隔離 process。永続 sandbox object
   ではない。
 - **Owner**: sandbox を最初に atomic claim した正確な Ed25519 public key fingerprint。
-- **Admin**: config の `admin_keys` に fingerprint があり、認証にも成功した key。
+- **Admin**: daemon 実行ユーザーの `~/.ssh/authorized_keys` に登録され、認証にも成功した host 認可 key。host selector `_` と全 sandbox の操作権限を持つ。
+- **Normal**: `$XDG_CONFIG_HOME/shbox/allowed_keys` だけに登録された sandbox 許可 key。自分が所有する sandbox だけを利用できる。
 - **Host selector**: admin だけが使える予約 SSH username `_`。
 - **Managed mode**: 一つ以上の admin key が設定された動作 mode。
 - **Sandbox-only mode**: admin key がなく、host access を持たない動作 mode。

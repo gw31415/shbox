@@ -73,12 +73,19 @@ kernel、Arapuca、OpenSSH/russh、ホスト root、または admin key が侵�
   認証時点では `_` 以外の username を受け入れ、shell/exec/delete を実行する
   時点で selector として検証する。`_` は admin host selector として予約する。
 
-### 2.2 authorized_keys の形式
+### 2.2 鍵ファイルと権限の分離
 
-authorized keys は OpenSSH 形式の **一つのファイル**から読む。既定パスは
-daemon 実行ユーザーの `~/.ssh/authorized_keys`、設定で絶対パスを変更できる。
+SSH 公開鍵は、権限の由来が明確な二つのファイルへ分離して管理する。
 
-受け入れる行は次の形式に限る。
+1. **Host 認可鍵**: daemon 実行ユーザーの `~/.ssh/authorized_keys`
+   ここにある鍵はすべて `Admin` であり、host selector `_` と全 sandbox の操作権限を持つ。
+2. **Sandbox 許可鍵**: `$XDG_CONFIG_HOME/shbox/allowed_keys`
+   ここだけにある鍵は `Normal` であり、自分が所有する sandbox だけを利用できる。
+3. **両方にある鍵**: 一つの identity として扱い、強い権限である `Admin` を付与する。
+
+`~` は daemon account の home directory から解決する。`allowed_keys` も `Paths` が導出する固定 path であり、TOML や CLI で変更できない。
+
+受け入れる行は次の bare OpenSSH Ed25519 形式に限る。
 
 ```text
 ssh-ed25519 <base64-public-key> [comment]
@@ -88,51 +95,42 @@ ssh-ed25519 <base64-public-key> [comment]
 - key options、command restriction、environment option、証明書形式は
   受け入れない。コメントは保存せず認証にも使わない。
 - base64 と公開鍵 blob が不正、または unsupported な行が一つでもあれば、
-  ファイル全体を設定エラーとして扱う。壊れた行を黙って無視しない。
-- 同一の公開鍵が複数行に現れる場合も設定エラーとする。
+  source 全体を設定エラーとして扱う。壊れた行を黙って無視しない。
+- 同一 source 内の重複公開鍵は設定エラーとする。二つの source 間での重複は
+  正常であり、Admin が優先される。
 - 1 行は最大 8 KiB、ファイル全体は最大 1 MiB とする。
-- 空ファイルは無効であり、少なくとも一つの Ed25519 key が必要である。
+- 各 source は個別には未作成または空を許すが、二つを合成した結果に有効な鍵が
+  一つもない場合は起動・reload 全体を拒否する。
 
-admin key は設定の `admin_keys` に fingerprint の配列として指定する。指定は
-複数可能で、次の OpenSSH 表記に完全一致させる。
-
-```text
-SHA256:<padding なしの base64>
-```
-
-fingerprint はコメントや入力行の文字列ではなく、authorized key の公開鍵 blob
-から計算する。同じ fingerprint の重複、authorized_keys に存在しない fingerprint、
-Ed25519 でない fingerprint は設定エラーとする。
-
-authorized_keys のファイルと親ディレクトリ、設定ファイル、XDG state/data の
+存在する鍵ファイルと親ディレクトリ、設定ファイル、XDG state/data の
 管理ディレクトリは daemon user が所有し、group/world writable であってはならない。
-権限不備は起動・reload の失敗とする。秘密鍵を authorized_keys に置かず、host
+上位 ancestor にも write permission 検査を適用し、最終 path は `O_NOFOLLOW` で開く。
+権限不備は起動・reload の失敗とする。秘密鍵を authorized_keys / allowed_keys に置かず、host
 private key は XDG state 配下の mode `0600` のファイルに保存する。
 
 ### 2.3 認証 snapshot
 
-起動時に authorized_keys と admin_keys を読み込む。`SIGHUP` では新しい内容を
-全体検証し、成功した場合だけ一括で置き換える。失敗した場合は直前の認証設定を
-保持し、既存接続も新規接続も中断しない。
+起動時に host 認可鍵と sandbox 許可鍵を読み込み、immutable な snapshot を構築する。
+`SIGHUP` では新しい内容を全体検証し、成功した場合だけ一括で置き換える。失敗した場合は
+直前の認証設定を保持し、既存接続も新規接続も中断しない。
 
 認証成功時に connection へ、少なくとも次を保存する。
 
 - public key の fingerprint。
-- normal/admin の role。
+- Normal / Admin の role。
 - 認証時 username と selector context。
 
 この snapshot は接続が閉じるまで変わらない。reload で key を削除しても既存
 connection は切断されず、既存 connection が開く新しい channel も同じ role を
-使う。新規 connection は新しい authorized_keys で認証する。
+使う。新規 connection は新しい auth snapshot で認証する。
 
 ## 3. role、selector、所有権
 
 ### 3.1 role matrix
 
-`admin_keys` が空または未指定なら admin は存在せず、daemon は sandbox-only
-mode で動く。admin key を設定した場合、その key は自動的に全 sandbox 権限と
-host 権限を持つ。host 専用の別 role は設けない。
-
+host 認可鍵に有効な鍵が一つもなければ Admin は存在せず、daemon は sandbox-only
+mode で動く。host 認可鍵に登録された鍵は自動的に全 sandbox 権限と host 権限を持つ。
+host 専用の別 role は設けない。
 | principal | selector | shell / exec | list | delete | host mode |
 |---|---|---|---|---|---|
 | 通常 key | 自分が owner の有効な SandboxId | 自分の sandbox のみ | 自分の sandbox のみ | 自分の sandbox のみ | 不可 |
@@ -317,8 +315,7 @@ daemon を配置する。Arapuca は現在の process の cgroup scope を自動
 
 ## 6. host mode の特別な境界
 
-admin key だけが `_` selector を使える。`--authorized-keys-host-access` を指定した daemon
-では、authorized_keys にある全 key が Admin role となり、この route を使える。
+host 認可鍵（`~/.ssh/authorized_keys`）に登録された Admin key だけが `_` selector を使える。
 
 ```console
 ssh _@host
@@ -338,8 +335,8 @@ service unit や launchd の environment に token、秘密鍵、database passwo
 environment を運用で与えない。通常の sandbox mode は server が作る clean
 environment を使い、service environment 全体を継承しない。
 
-admin key も host-access flag も設定しない場合は sandbox-only mode で `_` route は認証
-されない。admin key がある、または host-access flag を指定した managed mode では `_`
+host 認可鍵に鍵が存在しない場合は sandbox-only mode で `_` route は認証
+されない。Admin key が存在する managed mode では `_`
 listener を先に公開して復旧経路を確保
 できるが、filesystem reconciliation が終わるまで sandbox 操作は fail closed
 とする。sandbox-only mode は reconciliation 完了後に listener を公開する。
@@ -406,9 +403,9 @@ invariant violation は位置と backtrace を log して daemon を abort す�
 
 ## 9. reload と shutdown
 
-SIGHUP は authorized_keys/admin_keys、shell、sandbox environment、read-only paths を
+SIGHUP は config.toml、host 認可鍵、sandbox 許可鍵、sandbox policy を
 全体検証したうえで atomic に反映する。`--listen`、`--network`、`--log-level`、
-`--authorized-keys-host-access` と built-in resource caps/limits、host key、data root の
+組み込み resource caps/limits、host key、data root の
 変更は process-lifetime または restart-only とし、SIGHUP で既存 listener や safety policy
 を切り替えない。reload failure は古い設定を保持する。
 
@@ -428,8 +425,8 @@ metadata は削除しない。二度目の signal は即時 force stop とする
 
 - owner/admin/非 owner の shell、exec、list、delete の認可 matrix。
 - `_` の host access、通常 key の拒否、admin の `_` delete 拒否。
-- authorized_keys の malformed/options/certificate/unsupported key、サイズ、
-  permission、atomic SIGHUP reload。
+- host 認可鍵 / sandbox 許可鍵の malformed/options/certificate/unsupported key、サイズ、
+  permission、二 source 合成、atomic SIGHUP reload。
 - key 削除後の既存 connection snapshot と、新規 connection の拒否。
 - 同時 claim、delete 中の新規 request、corrupt metadata、symlink traversal、
   restart 後の owner persistence。

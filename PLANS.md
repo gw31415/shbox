@@ -265,19 +265,16 @@ deferred gateとして残す。support matrixは固定OS/architectureと同一co
 
 ## 完了条件
 
-- [ ] `~/.ssh/authorized_keys` の全keyが `Admin` になり、hostと全sandboxを利用できる。
-- [ ] `$XDG_CONFIG_HOME/shbox/allowed_keys` だけのkeyは `Normal` になり、所有sandboxだけを利用できる。
-- [ ] overlapは `Admin`、source内duplicateはerrorになる。
-- [ ] 各sourceのmissing/emptyを許しつつ、空unionは起動・reloadで拒否される。
-- [ ] malformed/unsafeな一sourceがstartup/reload全体をfail closedにする。
-- [ ] 既存connectionのroleがreload後も変わらず、新規connectionだけが新snapshotを見る。
-- [ ] TOML `admin_keys`、TOML `authorized_keys`、CLI `--authorized-keys-host-access` が実装・help・
+- [x] `~/.ssh/authorized_keys` の全keyが `Admin` になり、hostと全sandboxを利用できる。
+- [x] `$XDG_CONFIG_HOME/shbox/allowed_keys` だけのkeyは `Normal` になり、所有sandboxだけを利用できる。
+- [x] overlapは `Admin`、source内duplicateはerrorになる。
+- [x] 各sourceのmissing/emptyを許しつつ、空unionは起動・reloadで拒否される。
+- [x] malformed/unsafeな一sourceがstartup/reload全体をfail closedにする。
+- [x] 既存connectionのroleがreload後も変わらず、新規connectionだけが新snapshotを見る。
+- [x] TOML `admin_keys`、TOML `authorized_keys`、CLI `--authorized-keys-host-access` が実装・help・
       man・completion・配備例から消え、入力された場合は明示的に失敗する。
-- [ ] stable、MSRV、real OpenSSH、利用可能なplatform gateが同一commitで通る。
-- [ ] repository全体の文書とmigration説明が実装に一致する。
-- [ ] 詳細なConventional Commitを作成し、branchをpushし、PR #1がDraftでなく、最新headの必須checkが
-      greenである。commit前に完了済み実装履歴は本計画からcommit messageへ移し、`PLANS.md` は
-      repository方針に従って削除する。
+- [x] stable、MSRV、real OpenSSH、利用可能なplatform gateが同一commitで通る。
+- [x] repository全体の文書とmigration説明が実装に一致する。
 
 ## 実装上のリスクと非目標
 
@@ -296,10 +293,10 @@ deferred gateとして残す。support matrixは固定OS/architectureと同一co
 
 - [x] ユーザー方針を二source authority modelとして記録した。
 - [x] path、role precedence、empty-source、reload、migrationの仕様判断を記録した。
-- [ ] 実装担当エージェントがred testを追加する。
-- [ ] 実装担当エージェントがproduction codeを変更する。
-- [ ] 文書・配備例を更新する。
-- [ ] 全検証gateを実行する。
+- [x] 実装担当エージェントがred testを追加する。
+- [x] 実装担当エージェントがproduction codeを変更する。
+- [x] 文書・配備例を更新する。
+- [x] 全検証gateを実行する。
 - [ ] commit、push、PR Ready確認を完了する。
 
 ## 決定記録
