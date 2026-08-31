@@ -20,6 +20,7 @@ mod server;
 mod ssh;
 
 use std::fmt;
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -34,13 +35,112 @@ use tracing::{debug, error, info, warn};
 /// Foreground SSH daemon mapping authenticated keys onto persistent sandbox
 /// workspaces.
 ///
-/// The v0.1 command line has no subcommands and no server-setting flags: the
-/// daemon reads its configuration from XDG paths. `parse` is the process
-/// entry; `--help`/`--version` print and exit 0, parse failures print to
-/// stderr and exit non-zero.
-#[derive(usage::Cli)]
-#[usage(bin = "shbox", version)]
-struct Args {}
+/// The command line has no subcommands: `parse` is the process entry.
+/// `--help`/`--version` print and exit 0, parse failures print to stderr and
+/// exit non-zero. `--completions`/`--man` print their artifact and exit
+/// without touching any daemon input.
+#[derive(usage_rs::Cli)]
+#[usage(bin = "shbox", version, completion)]
+struct Args {
+    /// Print a completion script for SHELL on stdout and exit.
+    #[usage(long, value_name = "SHELL", value_enum)]
+    completions: Option<CompletionShell>,
+    /// Print the roff man page on stdout and exit.
+    #[usage(long)]
+    man: bool,
+}
+
+/// A completion shell accepted by `--completions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, usage_rs::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    // The ValueEnum default spelling would be "power-shell"; every shell and
+    // the usage ecosystem itself name it as one word.
+    #[usage(name = "powershell")]
+    PowerShell,
+}
+
+impl CompletionShell {
+    fn to_usage_shell(self) -> usage_rs::complete::Shell {
+        match self {
+            CompletionShell::Bash => usage_rs::complete::Shell::Bash,
+            CompletionShell::Zsh => usage_rs::complete::Shell::Zsh,
+            CompletionShell::Fish => usage_rs::complete::Shell::Fish,
+            CompletionShell::PowerShell => usage_rs::complete::Shell::PowerShell,
+        }
+    }
+}
+
+/// A terminal action that prints a CLI artifact and exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputAction {
+    Completions(CompletionShell),
+    Man,
+}
+
+impl Args {
+    /// Resolve the requested output action, rejecting conflicting requests.
+    fn output_action(&self) -> Result<Option<OutputAction>, String> {
+        match (self.completions, self.man) {
+            (Some(shell), false) => Ok(Some(OutputAction::Completions(shell))),
+            (None, true) => Ok(Some(OutputAction::Man)),
+            (Some(_), true) => {
+                Err("--completions and --man are mutually exclusive output actions".to_string())
+            }
+            (None, false) => Ok(None),
+        }
+    }
+}
+
+/// Render the completion script for one supported shell, in process, from the
+/// same `usage` declaration that backs `--help`.
+fn completion_script(shell: CompletionShell) -> String {
+    Args::completion_script(shell.to_usage_shell())
+}
+
+/// Render the roff man page, in process, from the same `usage` declaration
+/// that backs `--help` and the completion scripts. The derive-generated spec
+/// is the single source of truth; the renderer consumes its KDL form.
+fn render_man_page() -> Result<String, Box<dyn std::error::Error>> {
+    // `parse_spec` is the only public usage-lib entry point that reads raw
+    // KDL, which is exactly what the derive's `to_kdl()` writes; its bare
+    // deprecation has no replacement.
+    #[allow(deprecated)]
+    let spec = usage::Spec::parse_spec(&Args::to_kdl())?;
+    let man = usage::docs::manpage::ManpageRenderer::new(spec)
+        .with_section(1)
+        .render()?;
+    Ok(man)
+}
+
+/// Print a terminal artifact on stdout and translate failure to an exit code.
+fn emit(action: OutputAction) -> ExitCode {
+    let outcome = match action {
+        OutputAction::Completions(shell) => Ok(completion_script(shell)),
+        OutputAction::Man => render_man_page(),
+    };
+    match outcome {
+        Ok(text) => {
+            let mut stdout = std::io::stdout().lock();
+            match stdout
+                .write_all(text.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("shbox: cannot write output: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("shbox: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn main() -> ExitCode {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -48,7 +148,15 @@ fn main() -> ExitCode {
         return run_embedded_arapuca_wrapper();
     }
 
-    let _args = Args::parse();
+    let args = Args::parse();
+    match args.output_action() {
+        Ok(Some(action)) => return emit(action),
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("shbox: {message}");
+            return ExitCode::FAILURE;
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
@@ -478,5 +586,80 @@ impl SignalReceiver {
             _ = self.interrupt.recv() => {},
             _ = self.terminate.recv() => {},
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn parse(argv: &[&str]) -> Result<Args, String> {
+        let os: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
+        Args::parse_from(&os).map_err(|err| format!("{err:?}"))
+    }
+
+    #[test]
+    fn no_flags_requests_no_output_action() {
+        let args = parse(&[]).expect("empty argv parses");
+        assert_eq!(args.output_action().expect("no conflict"), None);
+    }
+
+    #[test]
+    fn completions_requests_the_named_shell() {
+        for (name, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+            ("fish", CompletionShell::Fish),
+            ("powershell", CompletionShell::PowerShell),
+        ] {
+            let args = parse(&["--completions", name]).expect("valid shell");
+            assert_eq!(
+                args.output_action().expect("no conflict"),
+                Some(OutputAction::Completions(expected)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_completion_shell_is_a_parse_error() {
+        for name in ["nu", "elvish", "sh", "pwsh", ""] {
+            assert!(
+                parse(&["--completions", name]).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_output_actions_are_rejected() {
+        let args = parse(&["--completions", "zsh", "--man"]).expect("argv itself parses");
+        let message = args.output_action().expect_err("conflict rejected");
+        assert!(message.contains("mutually exclusive"), "{message}");
+    }
+
+    #[test]
+    fn completion_scripts_carry_the_cli_flags() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+            CompletionShell::PowerShell,
+        ] {
+            let script = completion_script(shell);
+            assert!(script.contains("@generated by usage"), "{shell:?}");
+            assert!(script.contains("shbox"), "{shell:?}");
+        }
+    }
+
+    #[test]
+    fn man_page_renders_the_declaration() {
+        let man = render_man_page().expect("man page renders");
+        assert!(man.contains(".TH SHBOX 1"), "{man}");
+        // roff escapes flag hyphens, so `--completions` appears as
+        // `\-\-completions` in the rendered page.
+        assert!(man.contains("\\-\\-completions"), "{man}");
+        assert!(man.contains("\\-\\-man"), "{man}");
     }
 }
