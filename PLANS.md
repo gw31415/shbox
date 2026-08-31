@@ -320,3 +320,6 @@ deferred gateとして残す。support matrixは固定OS/architectureと同一co
   CLI専用である契約は変更対象外」（scope節）は本変更に置き換えられた。CLI flagはトップレベルconfig
   項目に対応する上書き層のみ（`--listen`、`--log-level`）とし、`[sandbox]` 以下には対応flagを
   作らない。process-lifetime契約自体は維持し、SIGHUPでこれらの値が変わったreloadは全体を拒否する。
+- 2026-09-01: 文字列配列のconfig項目（`listen`、`[sandbox] read_paths`）は、要素1つの配列の
+  代わりに単一 string も受け付けるschemaにする。空・重複・存在確認などのvalidationと
+  process-lifetime契約は変更しない。CLI flag（repeat可能な `--listen`）は影響を受けない。
