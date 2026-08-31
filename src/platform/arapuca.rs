@@ -1008,6 +1008,12 @@ mod tests {
         let profile = policy.profile_for(directory.path());
 
         assert!(profile.allow_exec);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            profile.write_paths,
+            vec![directory.path().to_path_buf(), PathBuf::from("/dev/null")]
+        );
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(profile.write_paths, vec![directory.path().to_path_buf()]);
         assert_eq!(profile.max_open_files, 1024);
         assert_eq!(profile.seccomp_profile, ::arapuca::SeccompProfile::Strict);

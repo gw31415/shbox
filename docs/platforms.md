@@ -62,7 +62,7 @@ Arapuca option を TOML の直接の露出名にはしない。内部 adapter �
 
 ### 2.1 Profile の mapping
 
-- shell/exec は shell を起動するため、内部 profile は実行を許可する。ただし追加 write path は作らず、実行可能な read-only system path と workspace だけを明示する。
+- shell/exec は shell を起動するため、内部 profile は実行を許可する。write は workspace に限定し、実行可能な read-only system path と workspace を明示する。Linux だけは後述の単一 device `/dev/null` も write 可能である。
 - `[sandbox] read_paths` は管理者が設定した絶対 path と、shell/loader/TLS に必要な curated system path に限定する。
 - workspace は `read/write`、他の Sandbox directory、shbox の metadata、cgroup filesystem は渡さない。
 - client の SSH environment request は受け付けず、Sandbox 側の環境は shbox が構成する。`HOME` と `PWD` は workspace、`SHELL` は選択 shell、`TMPDIR` は launch ごとの private temporary directory にする。Arapuca の現行実装に依存するため、最終値は各正式 platform の統合試験で確認する。
@@ -101,8 +101,10 @@ Linux の固定 curated read set は、存在する次の path に限る。
 `/proc`、`/sys`、blanket `/dev`、`/dev/pts`、`/dev/tty`、host 共用 `/tmp` は内部 set に
 含めない。distribution に存在しない optional entry は追加しないが、selected shell と loader
 に必要な path を適用できない場合は launch を失敗させる。macOS の system path は pinned
-Seatbelt profile の固定 allowlist を用い、利用者の `read_paths` だけを追加する。どちらも
-workspace 以外の追加 write path は作らない。
+Seatbelt profile の固定 allowlist を用い、利用者の `read_paths` だけを追加する。write path は
+どちらも workspace であり、Linux だけは shell の出力 discard に必要な単一 device
+`/dev/null` を追加する。`/dev` 全体や他の追加 write path は許可せず、macOS は workspace
+以外の write path を追加しない。
 
 ## 3. Network policy
 
