@@ -50,8 +50,8 @@ pub(crate) struct ArapucaLaunchPolicy {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct LinuxScope {
-    parent: PathBuf,
     private: PathBuf,
+    restore: PathBuf,
     active_tasks: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
@@ -79,7 +79,7 @@ impl Drop for LinuxScope {
         }
 
         let pid = std::process::id().to_string();
-        if let Err(error) = fs::write(self.parent.join("cgroup.procs"), &pid) {
+        if let Err(error) = fs::write(self.restore.join("cgroup.procs"), &pid) {
             tracing::warn!(
                 scope = %self.private.display(),
                 error = %error,
@@ -135,6 +135,15 @@ impl ArapucaLaunchPolicy {
             .map(|limits| (limits.max_cpu_pct, limits.max_pids))
             .unwrap_or((0, 0));
 
+        // Shell commands commonly discard output through `/dev/null`.  Keep
+        // this single device writable without granting write access to the
+        // rest of `/dev`.
+        let write_paths = if cfg!(target_os = "linux") {
+            vec![workspace, PathBuf::from("/dev/null")]
+        } else {
+            vec![workspace]
+        };
+
         let seccomp_profile = match self.network {
             NetworkMode::Disabled => ::arapuca::SeccompProfile::Strict,
             NetworkMode::Outbound => ::arapuca::SeccompProfile::Baseline,
@@ -142,7 +151,7 @@ impl ArapucaLaunchPolicy {
         ::arapuca::Profile {
             isolation: ::arapuca::Isolation::Process,
             read_paths,
-            write_paths: vec![workspace],
+            write_paths,
             max_memory_mb: self.limits.max_memory_mb,
             max_cpu_pct,
             max_pids,
@@ -834,7 +843,12 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(target_os = "linux")]
 fn linux_scope_preflight() -> Result<LinuxScope, LaunchError> {
-    let parent = current_linux_cgroup_path()?;
+    let restore = current_linux_cgroup_path()?;
+    let parent = restore
+        .parent()
+        .filter(|path| *path != Path::new("/sys/fs/cgroup"))
+        .map(Path::to_path_buf)
+        .ok_or_else(|| LaunchError::new("sandbox cgroup scope has no delegated parent"))?;
     verify_linux_parent_scope(&parent)?;
 
     let pid = std::process::id().to_string();
@@ -859,7 +873,7 @@ fn linux_scope_preflight() -> Result<LinuxScope, LaunchError> {
         }
 
         if let Err(error) = verify_linux_scope(&private, false) {
-            let _ = fs::write(parent.join("cgroup.procs"), &pid);
+            let _ = fs::write(restore.join("cgroup.procs"), &pid);
             let _ = fs::remove_dir(&private);
             return Err(error);
         }
@@ -869,8 +883,8 @@ fn linux_scope_preflight() -> Result<LinuxScope, LaunchError> {
         // child, so Arapuca's stale `arapuca-*` cleanup cannot touch sibling
         // workloads in a shared service/session scope.
         return Ok(LinuxScope {
-            parent,
             private,
+            restore,
             active_tasks: None,
         });
     }

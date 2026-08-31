@@ -1,6 +1,6 @@
 # OpenSSH client configuration for talking to a local shbox test daemon.
 #
-# Manual verification (PLANS.md Milestone 2 gate):
+# Manual verification (Milestone 2 gate):
 #
 #   1. Start a daemon with an isolated XDG tree and a test listener, e.g.
 #        XDG_CONFIG_HOME=$TMP/config XDG_DATA_HOME=$TMP/data \

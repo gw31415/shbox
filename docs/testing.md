@@ -1,6 +1,6 @@
 # Testing と release gate
 
-この文書は、shbox の実装を v0.1 の契約として認めるための試験計画と検証記録である。unit/state test と実 OpenSSH harness の手元証跡は更新済みだが、実 Arapuca と delegated cgroup を必要とする platform tuple は別の release gate で検証する。組合せごとのログと revision を保存し、full passing run のあるものだけを正式対応とする。
+この文書は、shbox の実装を v0.1 の契約として認めるための試験計画と検証記録である。unit/state test と実 OpenSSH harness の手元証跡は更新済みで、Linux aarch64 の実 Arapuca と delegated cgroup を必要とする同等 gate も native arm64 Docker で検証済みである。組合せごとのログと revision を保存し、full passing run のあるものだけを正式対応とする。
 
 ## 1. 試験の基本方針
 
@@ -17,7 +17,7 @@ release gate は OS/architecture/version の tuple 単位で判定する。mutab
 | 組合せ | 初期扱い | gate |
 |---|---|---|
 | Linux `x86_64` | 正式対応候補 | 専用 delegated cgroup scope 上で全必須 suite を通過 |
-| Linux `aarch64` | 正式対応候補 | 実機または同等の native runner 上で全必須 suite を通過 |
+| Linux `aarch64` | local equivalent verified / formal support unclaimed | native arm64 Docker 上で全必須 suite を通過。hosted formal artifact は作成しない |
 | macOS 15 `arm64` | 初期試験対象・正式対応候補 | `sandbox-exec`、PTY/raw mode、resize、cleanup を含む全必須 suite を通過 |
 | macOS 26 `arm64` | 初期試験対象・正式対応候補 | 同上。runner image/version を記録し、将来 version を自動包含しない |
 | macOS `x86_64` | 未検証・非対応 | upstream の cross-build だけでは gate を満たさない |
@@ -163,7 +163,8 @@ path、root 外 symlink、二つの advisory lock、再起動後の metadata/wor
 test harness は shbox を一時 config で起動し、実 `ssh` client から接続する。以下は代表的な command 例であり、`$PORT`、`$OWNER_KEY`、`$ADMIN_KEY` は harness が作る。
 
 リポジトリに含まれる現在の OpenSSH harness は、次のコマンドで実行する。stable と MSRV
-1.91 の各 full test run で unit/state 113 件、harness 21 件が通過する。うち M8 の real
+1.91 の各 full test run で unit/state 113 件、harness 21 件が通過する（Linux target では
+Linux-only crash test を含むため 22 件）。うち M8 の real
 Arapuca cases 6 件は `SHBOX_RUN_ARAPUCA_INTEGRATION` を設定した platform gate でだけ実行し、
 通常 run では fail-closed 側を安全に確認して終了する。loopback bind を
 制限する環境では、`server::tests::bind_all_is_all_or_nothing` だけが権限エラーになるため、

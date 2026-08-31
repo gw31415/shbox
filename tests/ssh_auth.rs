@@ -1,6 +1,5 @@
 //! OpenSSH integration harness for the public-key server and the admin host
-//! route and the SandboxManager management operations (PLANS.md Milestones
-//! 2-8).
+//! route and the SandboxManager management operations (Milestones 2-8).
 //!
 //! Every test starts a real daemon binary with a temporary XDG tree and its
 //! own listener, then drives it with the real `ssh` client. Tests share

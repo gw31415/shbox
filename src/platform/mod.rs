@@ -579,7 +579,8 @@ mod tests {
 
     /// Compile-time probe of the pinned Arapuca public API. Building the
     /// production adapter on top of an unverified abstraction is the risk the
-    /// plan calls out; this keeps the surface compiling from Milestone 1 on.
+    /// platform gate calls out; this keeps the surface compiling from
+    /// Milestone 1 on.
     #[test]
     fn pinned_arapuca_public_api_compiles() {
         let profile = ::arapuca::Profile::default();

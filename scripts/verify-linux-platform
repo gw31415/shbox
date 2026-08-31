@@ -130,9 +130,15 @@ cgroup_mount='/sys/fs/cgroup'
 cgroup_relative="$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)"
 [[ -n "$cgroup_relative" && "$cgroup_relative" != '/' ]] || die "the gate is running in the cgroup root, not a delegated service scope"
 [[ "$cgroup_relative" != *'..'* ]] || die "the current cgroup path is invalid"
-cgroup_relative="${cgroup_relative#/}"
-cgroup_path="$cgroup_mount/$cgroup_relative"
-[[ -d "$cgroup_path" ]] || die "current cgroup does not resolve below $cgroup_mount"
+delegated_relative="${cgroup_relative%/*}"
+[[ -n "$delegated_relative" && "$delegated_relative" != "$cgroup_relative" ]] || \
+  die "the current cgroup has no delegated parent scope"
+current_relative="${cgroup_relative#/}"
+delegated_relative="${delegated_relative#/}"
+current_cgroup="$cgroup_mount/$current_relative"
+cgroup_path="$cgroup_mount/$delegated_relative"
+[[ -d "$current_cgroup" ]] || die "current cgroup does not resolve below $cgroup_mount"
+[[ -d "$cgroup_path" ]] || die "delegated cgroup does not resolve below $cgroup_mount"
 
 required_controllers=(cpu cpuset memory pids)
 for controller in "${required_controllers[@]}"; do
@@ -148,6 +154,8 @@ done
 # this child; it must leave the child empty so cleanup never kills an unknown
 # process. This is a capability check, not a best-effort probe.
 private_cgroup="$cgroup_path/shbox-m8-${PPID}-$$-${RANDOM}"
+private_name="${private_cgroup##*/}"
+private_relative="/$delegated_relative/$private_name"
 mkdir -- "$private_cgroup" || die "cannot create a private delegated cgroup child"
 
 cleanup_private_cgroup() {
@@ -172,7 +180,7 @@ if ! sh -c '
     grep -Eq "(^|[[:space:]])${controller}($|[[:space:]])" "$child/cgroup.controllers"
   done
   grep -qx "$$" "$child/cgroup.procs"
-' sh "$private_cgroup" "/$cgroup_relative"; then
+' sh "$private_cgroup" "$private_relative"; then
   die "cannot move a helper into and inspect a private delegated cgroup child"
 fi
 
@@ -195,7 +203,7 @@ rustc_host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
 [[ "$rustc_host" == "$target" ]] || die "rustc host is $rustc_host, expected native target $target"
 
 printf 'M8 Linux gate: %s %s, kernel %s, user %s (uid %s)\n' "$actual_machine" "$target" "$kernel_release" "$runner_user" "$uid"
-printf 'M8 Linux gate: delegated cgroup %s with controllers cpu cpuset memory pids\n' "$cgroup_path"
+printf 'M8 Linux gate: process cgroup %s, delegated parent %s with controllers cpu cpuset memory pids\n' "$current_cgroup" "$cgroup_path"
 printf 'M8 Linux gate: /proc/self/cgroup\n'
 cat /proc/self/cgroup
 printf 'M8 Linux gate: cgroup.controllers\n'

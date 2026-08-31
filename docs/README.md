@@ -13,8 +13,8 @@
 6. [Platforms](platforms.md) — Arapuca Adapter、OS 差、配備条件、正式対応範囲
 7. [Testing and release gates](testing.md) — acceptance test と正式対応の証明条件
 
-実装の順序と再開手順は repository root の [PLANS.md](../PLANS.md) に置く。`PLANS.md` は
-rolling execution plan であり、製品仕様を変更する文書ではない。
+実装の検証状況と運用上の再開手順は [Testing and release gates](testing.md) と
+[release runbook](release.md) に記録する。
 
 ## Normative language
 
@@ -49,7 +49,7 @@ rolling execution plan であり、製品仕様を変更する文書ではない
 - selector、role、ownership: `product.md`、`security.md`、`ssh-protocol.md`
 - metadata/lifecycle: `architecture.md`、`testing.md`
 - config default/validation: `configuration.md`、`testing.md`
-- OS behavior/dependency revision: `platforms.md`、`testing.md`、`PLANS.md`
+- OS behavior/dependency revision: `platforms.md`、`testing.md`、`release.md`
 - user-visible request/output: `product.md`、`ssh-protocol.md`、integration test
 
 Arapuca 固有 field や backend selector を利用者向け config に直接露出しない。新しい設定が
