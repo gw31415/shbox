@@ -43,14 +43,13 @@ generated in-process from the same `usage-rs` CLI declaration as `--help`.
 - [x] Real CLI completion/man/help checks and OpenSSH integration coverage.
 - [x] macOS 26 arm64 platform gate with the pinned Arapuca wrapper.
 - [ ] Native delegated Linux platform gate, to be covered by a Linux CI runner.
-- [ ] Commit the verified implementation and push the branch.
-- [ ] Confirm the existing pull request is green for the pushed commit and
+- [x] Commit the verified implementation and push the branch.
+- [x] Confirm the existing pull request is green for the pushed commit and
       ready for review/merge.
 
 ## Acceptance criteria remaining
 
 - [ ] Linux platform gate passes on a native delegated Linux runner.
-- [ ] The pushed commit's PR checks are green.
 
 ## Decisions and discoveries
 
