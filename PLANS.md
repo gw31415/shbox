@@ -54,51 +54,39 @@ rejected at startup (`unknown field`), not silently ignored.
   `docs/architecture.md`, `docs/product.md`, `docs/platforms.md`;
   deployment examples `deploy/systemd/shbox.service`, `deploy/launchd/com.example.shbox.plist`.
 
-### usage-rs 6.5.0 API findings (verified from the vendored crate sources)
+### usage-rs 6.5.0 API findings (verified with the compiler, not just sources)
 
-- `usage-derive` generates `Args::spec() -> usage_argv Spec`, `Args::to_kdl() -> String`,
-  and typed `FromStr`-based flag parsing; `#[usage(long)]` per field.
-- Completions are behind a crate feature: enable
-  `usage = { package = "usage-rs", version = "=6.5.0", features = ["completions"] }`.
-  With `#[usage(completion)]` on the derive, `Args::completion_script(shell) -> String` is
-  generated (in-process; the generated script calls the shbox binary itself at shell
-  runtime — no external `usage` executable is required to generate or to complete).
-  `usage::complete::Shell` is `#[non_exhaustive]` with
-  `Bash/Elvish/Zsh/Fish/Nu/PowerShell` and `Shell::from_name` accepting
-  `bash|elvish|zsh|fish|nu|nushell|powershell|pwsh`.
-- Man page rendering lives in `usage-lib` (`docs::manpage::ManpageRenderer::new(spec)
-  .with_section(1).render()`), a separate crate from `usage-argv` with its own `Spec` type
-  (usage-lib does not depend on usage-argv). MSRV of usage-lib 6.5.0 is 1.91; default
-  features include `docs`→`manpage`. Bridge in-process:
-  `Args::to_kdl()` → `usage_lib::Spec::parse_spec(&kdl)` → `ManpageRenderer`.
-  The derive stays the single source of truth; no hand-written roff, no duplicate flag table.
-- Repeated flags: `Vec<T>` fields collect repeated `--flag value`; validation of
-  duplicates/emptiness stays our job after parse. Verify both with a compiler probe first
-  (Milestone 1 acceptance).
+- Dependency naming: `usage-lib`'s lib target is literally named `usage`, so the facade
+  cannot also be aliased `usage`. `Cargo.toml` declares
+  `usage-rs = { package = "usage-rs", version = "=6.5.0", features = ["completions"] }`
+  (crate `usage_rs`) and `usage-lib = "=6.5.0"` (crate `usage`). The derive reads the
+  manifest and emits `::usage_rs::…` paths, so `use usage_rs::Cli;` + `#[usage(...)]` works.
+- Completions: `#[usage(completion)]` on the `Cli` derive + the `completions` feature
+  generate `Args::completion_script(usage_rs::complete::Shell) -> String` in process.
+  The generated script calls the shbox binary itself (`shbox __complete_word__ …`) at
+  shell runtime — no external `usage` executable anywhere.
+- Enums: a field must be annotated `#[usage(long, value_enum)]` (not just a type-level
+  derive) to bind through `usage_rs::ValueEnum`; variant spellings are kebab-case by
+  default, overridden with `#[usage(name = "powershell")]` on the variant.
+- `usage_rs::Error` implements neither `Display` nor `ToString` (Debug only).
+- Man pages: usage-lib `docs::manpage::ManpageRenderer::new(spec).with_section(1).render()`;
+  the only public raw-KDL entry is `usage::Spec::parse_spec` (bare `#[deprecated]`, no
+  replacement), fed by the derive's `Args::to_kdl()`. roff output escapes flag hyphens
+  (`\-\-completions`).
 
 ## Milestones
 
 Each milestone is independently verifiable; commit (via `$archive-commit`) and push after
 each verified slice. Prune this plan in the same commit that implements a milestone.
 
-### M1 — CLI surface on `Args` (options + output actions)
+### M1 — `--completions` / `--man` output actions (implemented; prune with this commit)
 
-- Goal: `Args` carries `--listen` (repeatable), `--network`, `--log-level`,
-  `--authorized-keys-host-access`, `--completions <SHELL>`, `--man`; typed parsing
-  rejects invalid values before bootstrap; output actions are side-effect free and
-  mutually exclusive; defaults are `0.0.0.0:22` / `disabled` / `info` / false.
-- Edits: `src/main.rs` (Args definition, completion/man emission before any IO),
-  `Cargo.toml` (usage features, add `usage-lib = "=6.5.0"`); compiler probe test for
-  `Vec<SocketAddr>` repeated flags and enum-from-str behavior where uncertain.
-- Result: `shbox --completions bash|zsh|fish|powershell` and `shbox --man` print and exit 0
-  without touching config/keys/host key/sockets; `--completions nu` exits non-zero;
-  `--completions bash --man` exits non-zero; invalid `--listen`/`--network`/`--log-level`
-  values are parse errors.
-- Proof: `cargo test --locked --all-targets -- --test-threads=1` plus a unit test module
-  for `Args` covering the plan's CLI parser matrix, and a real-CLI check
-  (`cargo run -- --completions zsh | head`, `--man | head`, exit codes).
+Done in `src/main.rs` + `tests/cli_output.rs`: `CompletionShell` (bash|zsh|fish|powershell),
+`Args::output_action()` with conflict rejection, in-process `completion_script` and
+`render_man_page`, `emit()` writing stdout before any daemon input is touched. Verified by
+119 bin unit tests, 6 `cli_output` integration tests, clippy `-D warnings` clean.
 
-### M2 — `listen`/`network`/`log_level` move from TOML to CLI
+### M2 — operational options on `Args`; `listen`/`network`/`log_level` leave TOML
 
 - Goal: `RawConfig`/`Config` lose `listen`, `network`, `log_level` (fields, accessors,
   validators); daemon takes them from `Args`; `deny_unknown_fields` makes old configs an
@@ -194,18 +182,13 @@ each verified slice. Prune this plan in the same commit that implements a milest
 
 ## Decisions and discoveries (live)
 
-- Completions use the derive-generated `completion_script` (`#[usage(completion)]` +
-  `features = ["completions"]`) rather than `usage::complete::complete(&CompleteOptions)`:
-  it is the in-process path that embeds the CLI's own spec and needs no external binary.
-  Shell name mapping via `usage::complete::Shell::from_name`; unsupported names are our
-  typed-parse/argument error (non-zero exit).
-- Man pages require adding `usage-lib = "=6.5.0"` (separate crate from `usage-rs`;
-  its `Spec` is distinct from the `usage-argv` `Spec`). Bridge by KDL round-trip
-  (`to_kdl()` → `Spec::parse_spec`) so the derive remains authoritative.
-- `NetworkMode`/`LogLevel` domain types stay in `config.rs` and are constructed from CLI
-  values (typed at the `Args` layer) instead of from TOML strings.
-- `--listen` validation (duplicates, empty) happens after parse in our code; parse itself
-  rejects malformed `SocketAddr`.
+- Output actions are emitted in `main()` before the tokio runtime exists, so
+  `--completions`/`--man` cannot touch config, keys, sockets, or logging.
+- Unsupported completion shells are ValueEnum parse errors (non-zero exit) rather than a
+  runtime `Shell::from_name` miss; the accepted set is exactly the four documented shells.
+- M1 was committed alone (before the operational flags) because a flag-bearing `Args`
+  with unread fields would trip `dead_code` under `-D warnings`, and an intermediate
+  daemon that ignores its own flags is not a coherent slice.
 - Rollback: work is a series of ordinary commits on
   `feat/cli-config-simplification`; any milestone can be reverted by
   `git revert <commit>` without data risk (no external state is touched).
