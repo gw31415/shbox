@@ -47,13 +47,13 @@ pub(crate) enum ReadPathClass {
 
 /// The curated default readable paths for Linux, frozen as (path, class).
 ///
-/// Inherited from the audited Arapuca defaults and re-approved for nono:
+/// Curated for the Linux nono policy:
 /// system binaries and libraries, TLS trust stores, resolver/loader data,
 /// locale and account databases, and the entropy devices. `/tmp` is
 /// deliberately absent (host-shared; the per-launch temp directory replaces
 /// it), `/proc` and `/sys` are deliberately absent, `/dev/pts` is deliberately
 /// absent (it would expose every host pseudo-terminal), and `/dev/tty` is the
-/// only added grant beyond the Arapuca list.
+/// only terminal-device grant in the list.
 #[cfg(target_os = "linux")]
 pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[
     ("/usr", ReadPathClass::ExecutableRuntime),
@@ -238,7 +238,7 @@ impl SandboxLaunchPolicy {
     /// A `pty-req` is authoritative for `TERM`, and the launch temp directory
     /// is authoritative for `TMPDIR`; neither can be shadowed by an operator
     /// `sandbox.env` entry. Passing `None` for the temp directory is the
-    /// transitional Arapuca behavior and leaves `TMPDIR` untouched.
+    /// callers that omit a launch temp leave `TMPDIR` untouched.
     pub(crate) fn environment_for(
         &self,
         workspace: &Path,
@@ -616,7 +616,7 @@ mod tests {
             Some("xterm-256color")
         );
 
-        // Without a temp dir (transitional Arapuca path) TMPDIR is untouched.
+        // Without a temp dir, TMPDIR is untouched.
         let legacy = policy.environment_for(directory.path(), None, None);
         assert_eq!(
             legacy

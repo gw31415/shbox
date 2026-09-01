@@ -2,7 +2,7 @@
 //! persistent sandbox workspaces.
 //!
 //! Bootstrap: resolve and validate every local input, reconcile durable
-//! sandbox metadata, initialize the process-lifetime Arapuca adapter, then
+//! sandbox metadata, initialize the process-lifetime platform launcher, then
 //! run the public-key SSH server with the admin-only `_` host route. Adapter
 //! initialization remains fail-closed for sandbox launches so host recovery
 //! and metadata management do not depend on a working sandbox runtime.
@@ -301,44 +301,23 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    #[cfg(target_os = "linux")]
-    let launcher: Arc<dyn platform::ProcessLauncher> = {
-        let launch_policy = platform::SandboxLaunchPolicy::from_config(
-            &app_config,
-            &sandbox_shell,
-            paths.runtime_dir(),
-        );
-        match platform::LinuxLauncher::new(launch_policy) {
-            Ok(launcher) => {
-                info!("sandbox process adapter initialized");
-                Arc::new(launcher)
-            }
-            Err(error) => {
-                warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
-                Arc::new(platform::UnavailableLauncher)
-            }
+    let launch_policy = platform::SandboxLaunchPolicy::from_config(
+        &app_config,
+        &sandbox_shell,
+        paths.runtime_dir(),
+    );
+    let launcher: Arc<dyn platform::ProcessLauncher> = match platform::production_launcher(
+        launch_policy,
+    ) {
+        Ok(launcher) => {
+            info!("sandbox process adapter initialized");
+            launcher
+        }
+        Err(error) => {
+            warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
+            Arc::new(platform::UnavailableLauncher)
         }
     };
-    #[cfg(target_os = "macos")]
-    let launcher: Arc<dyn platform::ProcessLauncher> = {
-        let launch_policy = platform::SandboxLaunchPolicy::from_config(
-            &app_config,
-            &sandbox_shell,
-            paths.runtime_dir(),
-        );
-        match platform::MacosLauncher::new(launch_policy) {
-            Ok(launcher) => {
-                info!("sandbox process adapter initialized");
-                Arc::new(launcher)
-            }
-            Err(error) => {
-                warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
-                Arc::new(platform::UnavailableLauncher)
-            }
-        }
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let launcher: Arc<dyn platform::ProcessLauncher> = Arc::new(platform::UnavailableLauncher);
     let managed_mode = auth_store.admin_count() > 0;
     let sandbox_manager = Arc::new(
         if managed_mode {
@@ -354,11 +333,10 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
     );
 
     debug!(
-        limits = ?config::Limits::default(),
         caps = ?config::Caps::default(),
         read_paths = app_config.read_paths().len(),
         sandbox_env = app_config.sandbox_env().len(),
-        "enforcing built-in limits and caps"
+        "enforcing built-in caps and sandbox policy"
     );
     if managed_mode {
         info!(

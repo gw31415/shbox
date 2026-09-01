@@ -3,11 +3,10 @@ name = "shbox"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Foreground SSH daemon that maps OpenSSH clients onto persistent Arapuca sandbox workspaces"
+description = "Foreground SSH daemon that maps OpenSSH clients onto persistent sandbox workspaces"
 publish = false
 
 [dependencies]
-arapuca = { git = "https://github.com/LeGambiArt/arapuca", rev = "c94802c4d8b6b880334c0d643b16b7326ec7f039" }
 libc = "0.2"
 nix = { version = "0.31", features = ["term"] }
 rand = { version = "0.10", features = ["thread_rng"] }

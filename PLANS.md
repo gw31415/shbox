@@ -1264,7 +1264,11 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - Native proof covers deny-by-default filesystem isolation, disabled/client-only outbound TCP, PTY/session state, signal forwarding, TERM/KILL cleanup, daemon shutdown, and recursive launch-temp cleanup.
   - Linux arm64 Docker/Rust 1.95 regression remains green at 157/157 plus check/Clippy.
   - macOS 15 remains a blocking release-matrix run under Milestones 7-8; it is not available on the current macOS 26 host.
-- [ ] Milestone 5 Arapuca/cgroup/limit removal.
+- [x] Milestone 5 Arapuca/cgroup/limit removal.
+  - Production source and deploy artifacts no longer contain Arapuca, launcher-control `ARAPUCA_` behavior, sandbox cgroup delegation/access, or internal resource-limit types.
+  - Cargo manifest/lock contain no Arapuca dependency; production bootstrap selects Linux nono or macOS Seatbelt through `platform::production_launcher`.
+  - macOS arm64/Rust 1.95: 156 unit + 6 CLI + 24 OpenSSH integration tests pass, plus check/Clippy `-D warnings`.
+  - Linux arm64 Docker/Rust 1.95: 157 unit + 6 CLI + 25 OpenSSH integration tests pass, plus check/Clippy `-D warnings`.
 - [ ] Milestone 6 SSH/PTTY integration suite.
 - [ ] Milestone 7 deploy/platform scripts.
 - [ ] Milestone 8 CI gates.

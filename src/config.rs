@@ -37,8 +37,7 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 /// `log_level`), the `[sandbox] network` mode included — is process-lifetime:
 /// it is read exactly once at startup, the CLI flags layer on top of the
 /// first two, and nothing re-reads the file afterwards. Applying a config
-/// change means restarting the daemon. `Caps`/`Limits` are built-in
-/// constants.
+/// change means restarting the daemon. `Caps` are built-in constants.
 #[derive(Debug, Clone)]
 pub struct Config {
     listen: Vec<SocketAddr>,
@@ -459,7 +458,7 @@ const RESERVED_ENV_NAMES: &[&str] = &[
 ];
 
 const RESERVED_ENV_PREFIXES: &[&str] = &[
-    "SHBOX_", "ARAPUCA_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
+    "SHBOX_", "LD_", "DYLD_", "COR_", "CORECLR_", "DOTNET_", "COMPLUS_",
 ];
 
 /// Sandbox network policy. File-backed under `[sandbox]`, chosen once at
@@ -512,57 +511,6 @@ impl LogLevel {
             "debug" => Some(LogLevel::Debug),
             "trace" => Some(LogLevel::Trace),
             _ => None,
-        }
-    }
-}
-
-/// Resource limits for sandbox processes; `0` means "no limit".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    pub max_memory_mb: u64,
-    pub cpu_timeout_secs: u64,
-    pub max_file_size_mb: u64,
-    pub max_open_files: u64,
-    /// Linux-only cgroup settings; absent on macOS.
-    pub linux: Option<LinuxLimits>,
-}
-
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits {
-            max_memory_mb: 0,
-            cpu_timeout_secs: 0,
-            max_file_size_mb: 0,
-            max_open_files: 1024,
-            linux: default_linux_limits(),
-        }
-    }
-}
-
-/// Linux cgroup defaults exist only on Linux targets; the `[limits.linux]`
-/// table is a schema error elsewhere.
-#[cfg(target_os = "linux")]
-fn default_linux_limits() -> Option<LinuxLimits> {
-    Some(LinuxLimits::default())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn default_linux_limits() -> Option<LinuxLimits> {
-    None
-}
-
-/// Linux-only cgroup limits (`[limits.linux]`); `0` means "no limit".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LinuxLimits {
-    pub max_cpu_pct: u32,
-    pub max_pids: u32,
-}
-
-impl Default for LinuxLimits {
-    fn default() -> LinuxLimits {
-        LinuxLimits {
-            max_cpu_pct: 0,
-            max_pids: 256,
         }
     }
 }
@@ -731,18 +679,6 @@ mod tests {
 
     #[test]
     fn defaults_match_documented_values() {
-        let limits = Limits::default();
-        assert_eq!(limits.max_open_files, 1024);
-        // The Linux cgroup table only exists on Linux targets.
-        assert_eq!(limits.linux.is_some(), cfg!(target_os = "linux"));
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            limits.linux,
-            Some(LinuxLimits {
-                max_cpu_pct: 0,
-                max_pids: 256
-            })
-        );
         let caps = Caps::default();
         assert_eq!(caps.max_unauthenticated_connections, 32);
         assert_eq!(caps.max_connections, 128);
@@ -998,7 +934,6 @@ read_paths = ["/definitely/not/here"]"#,
             "TMPDIR",
             "TERM",
             "SHBOX_LEVEL",
-            "ARAPUCA_X",
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
             "NODE_OPTIONS",

@@ -669,21 +669,16 @@ fn run_ssh_command(
         .expect("ssh runs")
 }
 
-/// Real Arapuca execution is an explicit environment-gated acceptance test on
-/// Linux. macOS arm64 has an embedded rlimit wrapper, so its normal OpenSSH
-/// harness exercises the real Seatbelt path without a separately installed
-/// `arapuca` binary.
-fn arapuca_integration_enabled() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        || std::env::var_os("SHBOX_RUN_ARAPUCA_INTEGRATION").is_some()
+/// Linux and macOS both use their native production sandbox launcher in the
+/// ordinary OpenSSH harness. Unsupported targets keep the fail-closed branch.
+fn native_sandbox_integration_expected() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
-/// A normal Linux test can authenticate successfully even when the optional
-/// Arapuca runtime is unavailable. In that configuration the daemon reports a
-/// stable generic failure after authentication; keep those assertions separate
-/// from the real-platform success path.
+/// Supported platforms execute the real sandbox path. Unsupported targets may
+/// authenticate successfully but must fail the sandbox request generically.
 fn sandbox_request_accepted(result: &SshResult, expected_stdout: &str) -> bool {
-    if arapuca_integration_enabled() {
+    if native_sandbox_integration_expected() {
         result.ok() && result.stdout == expected_stdout
     } else {
         result.status == 111
@@ -863,14 +858,14 @@ fn unregistered_key_and_non_publickey_methods_are_refused() {
 }
 
 /// Sandbox launches fail closed by default. A real-platform harness opts in
-/// explicitly with SHBOX_RUN_ARAPUCA_INTEGRATION and must then observe a real
+/// explicitly with native production sandbox launcher and must then observe a real
 /// successful launch.
 #[test]
 fn sandbox_requests_execute_or_fail_closed() {
     let daemon = TestDaemon::start(&["admin"]);
     let result = daemon.ssh(&daemon.normal_key, "dev", "printf nope", &["-T"]);
-    if arapuca_integration_enabled() {
-        assert_eq!(result.status, 0, "real Arapuca launch failed: {result:?}");
+    if native_sandbox_integration_expected() {
+        assert_eq!(result.status, 0, "real sandbox launch failed: {result:?}");
         assert_eq!(result.stdout, "nope");
     } else {
         assert_eq!(result.status, 111, "sandbox must fail closed: {result:?}");
@@ -888,8 +883,8 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
     // The request exercises lazy first-owner claim. The real-platform suite
     // opts in explicitly; the default path proves unavailable is fail-closed.
     let claim = daemon.ssh(&daemon.normal_key, "dev", "printf ignored", &["-T"]);
-    if arapuca_integration_enabled() {
-        assert!(claim.ok(), "real Arapuca launch failed: {claim:?}");
+    if native_sandbox_integration_expected() {
+        assert!(claim.ok(), "real sandbox launch failed: {claim:?}");
         assert_eq!(claim.stdout, "ignored");
     } else {
         assert_eq!(claim.status, 111, "sandbox must fail closed: {claim:?}");
@@ -922,11 +917,11 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
     assert!(empty.stdout.is_empty());
 }
 
-/// The real Arapuca path keeps non-PTY stdout/stderr separate and forwards a
+/// The real sandbox path keeps non-PTY stdout/stderr separate and forwards a
 /// non-zero shell exit status through the OpenSSH client.
 #[test]
-fn arapuca_sandbox_non_pty_exec_reports_streams_and_status() {
-    if !arapuca_integration_enabled() {
+fn sandbox_non_pty_exec_reports_streams_and_status() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 
@@ -945,8 +940,8 @@ fn arapuca_sandbox_non_pty_exec_reports_streams_and_status() {
 /// The real PTY path exposes the requested terminal modes and size, supports
 /// raw byte input, and applies a later OpenSSH window-change request.
 #[test]
-fn arapuca_sandbox_pty_applies_modes_and_resize() {
-    if !arapuca_integration_enabled() {
+fn sandbox_pty_applies_modes_and_resize() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 
@@ -1032,8 +1027,8 @@ fn arapuca_sandbox_pty_applies_modes_and_resize() {
 /// The real launch maps HOME/PWD to the durable workspace, injects only the
 /// configured sandbox environment, and keeps a client env request out.
 #[test]
-fn arapuca_sandbox_maps_environment_and_workspace() {
-    if !arapuca_integration_enabled() {
+fn sandbox_maps_environment_and_workspace() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 
@@ -1077,8 +1072,8 @@ fn arapuca_sandbox_maps_environment_and_workspace() {
 /// Client EOF closes a non-PTY stdin and still permits output/status delivery;
 /// PTY EOF does not inject a VEOF byte into the sandbox child.
 #[test]
-fn arapuca_sandbox_eof_behavior_is_transport_correct() {
-    if !arapuca_integration_enabled() {
+fn sandbox_eof_behavior_is_transport_correct() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 
@@ -1175,8 +1170,8 @@ fn arapuca_sandbox_eof_behavior_is_transport_correct() {
 /// A terminal VINTR byte reaches the sandbox process group and is surfaced by
 /// the real PTY exec as the command's handled interrupt exit.
 #[test]
-fn arapuca_sandbox_pty_forwards_terminal_signal() {
-    if !arapuca_integration_enabled() {
+fn sandbox_pty_forwards_terminal_signal() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 
@@ -1202,8 +1197,8 @@ fn arapuca_sandbox_pty_forwards_terminal_signal() {
 /// A real sandbox shutdown removes both the direct process and an ignored-TERM
 /// descendant from the sandbox runtime before the daemon exits.
 #[test]
-fn arapuca_sandbox_shutdown_cleans_up_descendants() {
-    if !arapuca_integration_enabled() {
+fn sandbox_shutdown_cleans_up_descendants() {
+    if !native_sandbox_integration_expected() {
         return;
     }
 

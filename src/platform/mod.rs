@@ -142,6 +142,33 @@ pub(crate) trait ProcessLauncher: fmt::Debug + Send + Sync {
     fn launch(&self, request: LaunchRequest) -> Result<LaunchedProcess, LaunchError>;
 }
 
+/// Build the single production launcher for this target from the immutable
+/// process-lifetime sandbox policy.
+#[cfg(target_os = "linux")]
+pub(crate) fn production_launcher(
+    policy: SandboxLaunchPolicy,
+) -> Result<Arc<dyn ProcessLauncher>, LaunchError> {
+    LinuxLauncher::new(policy).map(|launcher| Arc::new(launcher) as Arc<dyn ProcessLauncher>)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn production_launcher(
+    policy: SandboxLaunchPolicy,
+) -> Result<Arc<dyn ProcessLauncher>, LaunchError> {
+    MacosLauncher::new(policy).map(|launcher| Arc::new(launcher) as Arc<dyn ProcessLauncher>)
+}
+
+/// Unsupported Unix targets fail closed rather than selecting a degraded
+/// process backend.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn production_launcher(
+    _policy: SandboxLaunchPolicy,
+) -> Result<Arc<dyn ProcessLauncher>, LaunchError> {
+    Err(LaunchError::new(
+        "sandbox process adapter is unavailable on this platform",
+    ))
+}
+
 /// Adapter-level launch failure, intentionally free of platform-specific
 /// fields at the manager boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +193,7 @@ impl fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
-/// Fallback used when the process-lifetime Arapuca adapter could not be
+/// Fallback used when the production sandbox launcher could not be
 /// initialized. Sandbox requests fail closed after the durable claim. This
 /// adapter is deliberately not selectable through config or SSH.
 #[derive(Debug, Default)]
@@ -581,30 +608,5 @@ mod tests {
         launched.control.resize(30, 100);
         assert_eq!(fake.signals(), vec![libc::SIGINT]);
         assert_eq!(fake.resizes(), vec![(30, 100)]);
-    }
-
-    /// Compile-time probe of the pinned Arapuca public API. Building the
-    /// production adapter on top of an unverified abstraction is the risk the
-    /// platform gate calls out; this keeps the surface compiling from
-    /// Milestone 1 on.
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn pinned_arapuca_public_api_compiles() {
-        let profile = ::arapuca::Profile::default();
-        assert_eq!(profile.max_open_files, 0);
-        assert_eq!(profile.seccomp_profile, ::arapuca::SeccompProfile::Strict);
-
-        let task_id = "dev-0123456789abcdef0123456789abcdef";
-        assert_eq!(
-            ::arapuca::sanitize_task_id(task_id).expect("valid task id"),
-            task_id
-        );
-        assert!(::arapuca::sanitize_task_id("bad_task").is_err());
-
-        fn implements_sandbox_trait<T: ::arapuca::platform::Sandbox>() {}
-        #[cfg(target_os = "linux")]
-        implements_sandbox_trait::<::arapuca::platform::Linux>();
-        #[cfg(target_os = "macos")]
-        implements_sandbox_trait::<::arapuca::platform::Darwin>();
     }
 }

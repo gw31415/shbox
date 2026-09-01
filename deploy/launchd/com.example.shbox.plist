@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <!--
-    WARNING: Arapuca's macOS backend depends on Apple's deprecated
+    WARNING: shbox's macOS confinement depends on Apple's deprecated
     /usr/bin/sandbox-exec (Seatbelt). This job is a blocking release artifact
     only for the exact macOS 15/26 arm64 gates that pass; it is not a claim
     that future macOS versions are supported.
