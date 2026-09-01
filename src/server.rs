@@ -11,10 +11,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use russh::server::{self, Config};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::config::Caps;
+use crate::endpoint::ListenEndpoint;
 use russh::{MethodKind, MethodSet};
 
 use crate::ssh::ConnHandler;
@@ -308,15 +310,17 @@ impl SshServer {
         })
     }
 
-    /// Serve until the shutdown signal fires. `sockets` are already bound,
-    /// all-or-nothing, by [`bind_all`].
+    /// Serve until the shutdown signal fires. `listeners` are already bound,
+    /// all-or-nothing, by [`bind_all`]. Every transport feeds the same SSH
+    /// session handling path; authentication and sandbox selection never
+    /// depend on the transport a connection arrived over.
     pub async fn serve(
         self: Arc<Self>,
-        sockets: Vec<TcpListener>,
+        listeners: Vec<BoundListener>,
         shutdown: watch::Receiver<bool>,
     ) {
         let mut listener_tasks = tokio::task::JoinSet::new();
-        for socket in sockets {
+        for listener in listeners {
             let server = self.clone();
             let mut shutdown_rx = shutdown.clone();
             listener_tasks.spawn(async move {
@@ -324,7 +328,7 @@ impl SshServer {
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
-                        accepted = socket.accept() => match accepted {
+                        accepted = listener.accept() => match accepted {
                             Ok((stream, peer)) => {
                                 if *shutdown_rx.borrow() {
                                     drop(stream);
@@ -334,7 +338,7 @@ impl SshServer {
                                 let connection_shutdown = shutdown_rx.clone();
                                 connection_tasks.spawn(async move {
                                     connection_server
-                                        .handle_connection(stream, Some(peer), connection_shutdown)
+                                        .handle_connection(stream, peer, connection_shutdown)
                                         .await;
                                 });
                             }
@@ -371,13 +375,17 @@ impl SshServer {
         self.host_tasks.join_all().await;
     }
 
-    /// Admit, supervise, and run one connection.
-    async fn handle_connection(
+    /// Admit, supervise, and run one connection over any transport's byte
+    /// stream; TCP and WebSocket connections are indistinguishable from here
+    /// on.
+    async fn handle_connection<S>(
         self: Arc<Self>,
-        stream: tokio::net::TcpStream,
+        stream: S,
         peer: Option<std::net::SocketAddr>,
         mut shutdown: watch::Receiver<bool>,
-    ) {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         if *shutdown.borrow() {
             return;
         }
@@ -467,19 +475,98 @@ impl SshServer {
     }
 }
 
-/// Bind every configured address or none of them.
-pub async fn bind_all(addresses: &[std::net::SocketAddr]) -> Result<Vec<TcpListener>, Error> {
-    let mut bound = Vec::with_capacity(addresses.len());
-    for address in addresses {
-        match TcpListener::bind(*address).await {
-            Ok(listener) => bound.push(listener),
+/// One bound listener. Each transport adapts its accepted TCP connection
+/// into the shared boxed SSH byte stream before session handling.
+pub enum BoundListener {
+    #[cfg(feature = "tcp")]
+    Tcp(TcpListener),
+
+    #[cfg(feature = "ws")]
+    WebSocket { listener: TcpListener, path: String },
+}
+
+impl std::fmt::Debug for BoundListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundListener")
+            .field("local_addr", &self.local_addr())
+            .finish()
+    }
+}
+
+/// The byte stream every transport hands to the SSH engine.
+pub type SshStream = Box<dyn AsyncReadWrite>;
+
+/// Object-safe alias for the stream contract `russh::server::run_stream`
+/// accepts.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl BoundListener {
+    /// Accept one connection and adapt it to the shared SSH byte stream.
+    /// WebSocket connections complete their upgrade here; a failed upgrade
+    /// is logged and surfaces as an accept error for that one connection.
+    pub async fn accept(&self) -> std::io::Result<(SshStream, Option<std::net::SocketAddr>)> {
+        match self {
+            #[cfg(feature = "tcp")]
+            BoundListener::Tcp(listener) => {
+                let (stream, peer) = listener.accept().await?;
+                Ok((Box::new(stream), Some(peer)))
+            }
+            #[cfg(feature = "ws")]
+            BoundListener::WebSocket { listener, path } => {
+                // A refused upgrade (probe, wrong path, missing subprotocol)
+                // ends that one connection; the listener itself keeps
+                // serving.
+                loop {
+                    let (stream, peer) = listener.accept().await?;
+                    match crate::ws::upgrade(stream, path, Some(peer)).await {
+                        Ok(stream) => return Ok((Box::new(stream), Some(peer))),
+                        Err(_) => continue,
+                    }
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("no transport feature"),
+        }
+    }
+
+    /// The bound local address, for startup logging.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            #[cfg(feature = "tcp")]
+            BoundListener::Tcp(listener) => listener.local_addr(),
+            #[cfg(feature = "ws")]
+            BoundListener::WebSocket { listener, .. } => listener.local_addr(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("no transport feature"),
+        }
+    }
+}
+
+/// Bind every configured endpoint or none of them.
+pub async fn bind_all(endpoints: &[ListenEndpoint]) -> Result<Vec<BoundListener>, Error> {
+    let mut bound = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let address = endpoint.address();
+        match TcpListener::bind(address).await {
+            Ok(listener) => {
+                let bound_listener = match endpoint {
+                    #[cfg(feature = "tcp")]
+                    ListenEndpoint::Tcp { .. } => BoundListener::Tcp(listener),
+                    #[cfg(feature = "ws")]
+                    ListenEndpoint::WebSocket { path, .. } => BoundListener::WebSocket {
+                        listener,
+                        path: path.clone(),
+                    },
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("no transport feature"),
+                };
+                bound.push(bound_listener);
+            }
             Err(source) => {
                 // All-or-nothing: drop what already bound and report.
                 drop(bound);
-                return Err(Error::Bind {
-                    address: *address,
-                    source,
-                });
+                return Err(Error::Bind { address, source });
             }
         }
     }
@@ -517,6 +604,7 @@ impl std::error::Error for Error {
 mod tests {
     use super::*;
     use crate::config::Caps;
+    #[cfg(feature = "tcp")]
     use std::net::SocketAddr;
 
     fn limiter(caps: &Caps) -> Arc<Limiter> {
@@ -584,17 +672,22 @@ mod tests {
 
     #[test]
     fn bind_all_is_all_or_nothing() {
-        let holder =
-            std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("holder");
-        let occupied = holder.local_addr().expect("addr");
-        let err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                bind_all(&[SocketAddr::from(([127, 0, 0, 1], 0)), occupied])
-                    .await
-                    .expect_err("occupied address")
-            });
-        let Error::Bind { address, .. } = &err;
-        assert_eq!(address, &occupied);
+        #[cfg(feature = "tcp")]
+        {
+            let holder =
+                std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("holder");
+            let occupied = holder.local_addr().expect("addr");
+            let endpoints = [
+                ListenEndpoint::Tcp {
+                    address: SocketAddr::from(([127, 0, 0, 1], 0)),
+                },
+                ListenEndpoint::Tcp { address: occupied },
+            ];
+            let err = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(async { bind_all(&endpoints).await.expect_err("occupied address") });
+            let Error::Bind { address, .. } = &err;
+            assert_eq!(address, &occupied);
+        }
     }
 }

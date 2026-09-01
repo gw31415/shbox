@@ -173,8 +173,12 @@ mod tests {
         }
 
         let (_home, paths) = temp_paths();
-        let raw: config::RawConfig =
-            toml::from_str("[sandbox]\nshell = \"/bin/sh\"").expect("toml");
+        // A ws-only build has no default listener, so pin one explicitly.
+        #[cfg(feature = "tcp")]
+        let text = "listen = [\"tcp://127.0.0.1:2222\"]\n[sandbox]\nshell = \"/bin/sh\"";
+        #[cfg(not(feature = "tcp"))]
+        let text = "listen = [\"ws://127.0.0.1:8080/ssh\"]\n[sandbox]\nshell = \"/bin/sh\"";
+        let raw: config::RawConfig = toml::from_str(text).expect("toml");
         let config = config::build(raw, &paths).expect("config");
         assert_eq!(
             account.sandbox_shell(&config).expect("configured shell"),

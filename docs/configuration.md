@@ -13,8 +13,8 @@ config file が存在しなければ built-in defaults を使う。存在する�
 ## 2. 完全な TOML schema
 
 ```toml
-# 省略時: ["0.0.0.0:22"]
-listen = ["0.0.0.0:22"]
+# 省略時: ["tcp://0.0.0.0:22"] (tcp build のみ)
+listen = ["tcp://0.0.0.0:22"]
 
 # error | warn | info | debug | trace
 # 省略時: info
@@ -47,18 +47,27 @@ LANG = "C.UTF-8"
 
 ### 3.1 `listen`
 
-`listen` は socket address の一個または配列。default は `0.0.0.0:22`。
+`listen` は transport 修飾付き endpoint URI の一個または配列。default は `tcp://0.0.0.0:22`（`tcp` feature が有効な build のみ。`ws`-only build では `listen` の明示指定が必須）。
 
 - 空配列は禁止。
-- `host:port` として parse できない値は禁止。
-- duplicate address は禁止。
+- endpoint は `tcp://host:port` または `ws://host:port/path`。他の scheme（`wss` を含む）は拒否。
+- build に含まれない transport を要求する endpoint は fail-closed で拒否する。
+- duplicate endpoint は禁止。
 - CLI `--listen` が一つでも指定された場合、config の list 全体を置き換える。
 
 例:
 
 ```toml
-listen = ["127.0.0.1:2222", "[::1]:2222"]
+listen = ["tcp://127.0.0.1:2222", "tcp://[::1]:2222"]
 ```
+
+`ws` build での WebSocket transport（SSH byte stream の transport adapter にすぎず、追加の application protocol はない。`wss://` は reverse proxy で終端する）:
+
+```toml
+listen = ["ws://0.0.0.0:8080/ssh"]
+```
+
+WebSocket 接続は `Sec-WebSocket-Protocol: ssh` の要求・選択を必須とし、frame は binary のみ。URL の query parameter は sandbox 選択や認可に一切使われない。sandbox 選択は SSH username のみが権威を持つ。
 
 ### 3.2 `log_level`
 
@@ -264,7 +273,7 @@ OS confinement prerequisite が利用できない場合、daemon 自体は metad
 CLI は top-level operational fields だけを override する。
 
 ```text
---listen ADDR       repeatable; config listen を置換
+--listen ENDPOINT   repeatable; config listen を置換 (tcp://ADDR または ws://ADDR/PATH)
 --log-level LEVEL   config log_level を置換
 ```
 

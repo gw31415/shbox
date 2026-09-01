@@ -50,12 +50,12 @@ process、PTY、environment、launch temp は durable sandbox stateではない�
 shbox の通常実行には subcommand がない。
 
 ```sh
-shbox [--listen ADDR]... [--log-level LEVEL]
+shbox [--listen ENDPOINT]... [--log-level LEVEL]
 ```
 
 主な option:
 
-- `--listen ADDR`: config の `listen` を完全に override。repeatable。
+- `--listen ENDPOINT`: config の `listen` を完全に override。repeatable。endpoint は `tcp://host:port` または（`ws` build では）`ws://host:port/path`。
 - `--log-level error|warn|info|debug|trace`: config の `log_level` を override。
 - `--completions bash|elvish|fish|powershell|zsh`: completion script を stdout に出して終了。
 - `--man`: roff man page を stdout に出して終了。

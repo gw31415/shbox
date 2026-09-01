@@ -16,7 +16,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -24,6 +23,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 use serde_with::{OneOrMany, serde_as};
 
+use crate::endpoint::ListenEndpoint;
 use crate::paths::{self, Paths};
 
 /// Maximum config file size.
@@ -40,7 +40,7 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 /// change means restarting the daemon. `Caps` are built-in constants.
 #[derive(Debug, Clone)]
 pub struct Config {
-    listen: Vec<SocketAddr>,
+    listen: Vec<ListenEndpoint>,
     log_level: LogLevel,
     network: NetworkMode,
     sandbox_shell: Option<PathBuf>,
@@ -52,8 +52,15 @@ impl Config {
     /// Load the optional config file and validate it completely.
     ///
     /// A missing file selects the built-in defaults; a present but unusable
-    /// file is an error, never a silent fallback.
-    pub fn load_snapshot(paths: &Paths) -> Result<Config, Error> {
+    /// file is an error, never a silent fallback. `cli_listen` is the
+    /// already-parsed `--listen` layer: when the file omits `listen` and the
+    /// CLI provides endpoints, those stand in for the file value before the
+    /// default resolution runs — a `ws`-only build with an explicit
+    /// `--listen` therefore starts even though it has no default listener.
+    pub fn load_snapshot(
+        paths: &Paths,
+        cli_listen: Option<&[ListenEndpoint]>,
+    ) -> Result<Config, Error> {
         let path = paths.config_file();
         let raw = match fs::metadata(path) {
             Ok(_) => Some(parse_file(path)?),
@@ -66,14 +73,17 @@ impl Config {
                 });
             }
         };
-        match raw {
-            Some(raw) => build(raw, paths),
-            None => build(RawConfig::default(), paths),
+        let mut raw = raw.unwrap_or_default();
+        if raw.listen.is_none()
+            && let Some(endpoints) = cli_listen
+        {
+            raw.listen = Some(endpoints.iter().map(|e| e.to_string()).collect());
         }
+        build(raw, paths)
     }
 
-    /// Listener addresses to bind, with the built-in default applied.
-    pub fn listen(&self) -> &[SocketAddr] {
+    /// Listener endpoints to bind, with the built-in default applied.
+    pub fn listen(&self) -> &[ListenEndpoint] {
         &self.listen
     }
 
@@ -167,14 +177,29 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
     })
 }
 
-/// The listener the daemon binds when the config file names none.
-pub fn default_listen() -> Vec<SocketAddr> {
-    vec![SocketAddr::from(([0, 0, 0, 0], 22))]
+/// The listener the daemon binds when the config file names none: the
+/// ordinary TCP default, available only in `tcp`-enabled builds. A `ws`-only
+/// build has no WebSocket convention to fall back on and must configure
+/// `listen` explicitly.
+pub fn default_listen() -> Result<Vec<ListenEndpoint>, Error> {
+    #[cfg(feature = "tcp")]
+    {
+        Ok(vec![ListenEndpoint::Tcp {
+            address: std::net::SocketAddr::from(([0, 0, 0, 0], 22)),
+        }])
+    }
+    #[cfg(not(feature = "tcp"))]
+    {
+        Err(Error::Invalid {
+            field: "listen",
+            message: "listen must be set explicitly: this build has no `tcp` feature, so there is no default listener".into(),
+        })
+    }
 }
 
-fn validate_listen(raw: Option<&[String]>) -> Result<Vec<SocketAddr>, Error> {
+fn validate_listen(raw: Option<&[String]>) -> Result<Vec<ListenEndpoint>, Error> {
     let Some(values) = raw else {
-        return Ok(default_listen());
+        return default_listen();
     };
     if values.is_empty() {
         return Err(Error::Invalid {
@@ -184,17 +209,17 @@ fn validate_listen(raw: Option<&[String]>) -> Result<Vec<SocketAddr>, Error> {
     }
     let mut listen = Vec::with_capacity(values.len());
     for value in values {
-        let address = SocketAddr::from_str(value).map_err(|err| Error::Invalid {
+        let endpoint = ListenEndpoint::from_str(value).map_err(|err| Error::Invalid {
             field: "listen",
-            message: format!("listen entry {value:?} is not a valid socket address: {err}"),
+            message: err.0,
         })?;
-        if listen.contains(&address) {
+        if listen.contains(&endpoint) {
             return Err(Error::Invalid {
                 field: "listen",
-                message: format!("duplicate listen address {address}"),
+                message: format!("duplicate listen endpoint {endpoint}"),
             });
         }
-        listen.push(address);
+        listen.push(endpoint);
     }
     Ok(listen)
 }
@@ -226,9 +251,17 @@ fn validate_network(raw: Option<&str>) -> Result<NetworkMode, Error> {
 }
 
 /// The built-in defaults, as they would be parsed from an empty config.
+/// A `ws`-only build has no default listener, so the test view pins an
+/// explicit WebSocket endpoint instead.
 #[cfg(test)]
 pub fn defaults() -> Config {
-    build(RawConfig::default(), &default_paths()).expect("built-in defaults are valid")
+    #[allow(unused_mut)]
+    let mut raw = RawConfig::default();
+    #[cfg(not(feature = "tcp"))]
+    {
+        raw.listen = Some(vec!["ws://127.0.0.1:8080/ssh".to_string()]);
+    }
+    build(raw, &default_paths()).expect("built-in defaults are valid")
 }
 
 /// Paths value used only to validate the built-in defaults, which reference
@@ -642,8 +675,15 @@ mod tests {
 
     fn build_toml(text: &str) -> Result<Config, Error> {
         let (_home, paths) = test_paths();
-        let raw: RawConfig =
+        #[allow(unused_mut)]
+        let mut raw: RawConfig =
             toml::from_str(text).map_err(|err| Error::Parse(err.message().to_string()))?;
+        // A `ws`-only build has no default listener; pin one so tests that
+        // are not about `listen` do not depend on the compiled transports.
+        #[cfg(not(feature = "tcp"))]
+        if raw.listen.is_none() {
+            raw.listen = Some(vec!["ws://127.0.0.1:8080/ssh".to_string()]);
+        }
         build(raw, &paths)
     }
 
@@ -655,15 +695,49 @@ mod tests {
         build_toml(text).expect_err("invalid config").to_string()
     }
 
+    /// Parse raw TOML, pinning a listener in `ws`-only builds.
+    fn raw_toml(text: &str) -> RawConfig {
+        #[allow(unused_mut)]
+        let mut raw: RawConfig = toml::from_str(text).expect("toml");
+        #[cfg(not(feature = "tcp"))]
+        if raw.listen.is_none() {
+            raw.listen = Some(vec!["ws://127.0.0.1:8080/ssh".to_string()]);
+        }
+        raw
+    }
+
     #[test]
     fn missing_file_uses_builtin_defaults() {
         let (_home, paths) = test_paths();
-        let config = Config::load_snapshot(&paths).expect("defaults");
-        assert_eq!(config.listen(), default_listen().as_slice());
-        assert_eq!(config.log_level(), LogLevel::Info);
-        assert_eq!(config.network(), NetworkMode::Disabled);
-        assert!(config.read_paths().is_empty());
-        assert!(config.sandbox_env().is_empty());
+        let snapshot = Config::load_snapshot(&paths, None);
+        #[cfg(feature = "tcp")]
+        {
+            let config = snapshot.expect("defaults");
+            assert_eq!(
+                config
+                    .listen()
+                    .iter()
+                    .map(ListenEndpoint::to_string)
+                    .collect::<Vec<_>>(),
+                default_listen()
+                    .expect("default listen")
+                    .iter()
+                    .map(ListenEndpoint::to_string)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(config.log_level(), LogLevel::Info);
+            assert_eq!(config.network(), NetworkMode::Disabled);
+            assert!(config.read_paths().is_empty());
+            assert!(config.sandbox_env().is_empty());
+        }
+        #[cfg(not(feature = "tcp"))]
+        {
+            // A ws-only build must not invent a default listener.
+            let message = snapshot
+                .expect_err("no default in a ws-only build")
+                .to_string();
+            assert!(message.contains("must be set explicitly"), "{message}");
+        }
     }
 
     #[test]
@@ -672,9 +746,18 @@ mod tests {
         // `ensure` no longer creates the read-only config directory.
         std::fs::create_dir(paths.config_dir()).expect("create config dir");
         std::fs::write(paths.config_file(), "").expect("write empty config");
-        let config = Config::load_snapshot(&paths).expect("empty config");
-        assert!(config.read_paths().is_empty());
-        assert!(config.sandbox_env().is_empty());
+        let snapshot = Config::load_snapshot(&paths, None);
+        #[cfg(feature = "tcp")]
+        {
+            let config = snapshot.expect("empty config");
+            assert!(config.read_paths().is_empty());
+            assert!(config.sandbox_env().is_empty());
+        }
+        #[cfg(not(feature = "tcp"))]
+        {
+            // A ws-only build refuses an empty (listener-less) config.
+            assert!(snapshot.is_err());
+        }
     }
 
     #[test]
@@ -693,9 +776,25 @@ mod tests {
 
     #[test]
     fn full_document_parses() {
-        let config = build_ok(
+        #[cfg(feature = "tcp")]
+        let (listen, expected) = (
+            r#""tcp://127.0.0.1:2222", "tcp://[::1]:2222""#,
+            vec![
+                "tcp://127.0.0.1:2222".to_string(),
+                "tcp://[::1]:2222".to_string(),
+            ],
+        );
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let (listen, expected) = (
+            r#""ws://127.0.0.1:2222/a", "ws://[::1]:2222/b""#,
+            vec![
+                "ws://127.0.0.1:2222/a".to_string(),
+                "ws://[::1]:2222/b".to_string(),
+            ],
+        );
+        let config = build_ok(&format!(
             r#"
-            listen = ["127.0.0.1:2222", "[::1]:2222"]
+            listen = [{listen}]
             log_level = "debug"
 
             [sandbox]
@@ -706,14 +805,15 @@ mod tests {
             [sandbox.env]
             LANG = "C.UTF-8"
             EDITOR_DEFAULT = "vi"
-            "#,
-        );
+            "#
+        ));
         assert_eq!(
-            config.listen(),
-            &[
-                SocketAddr::from(([127, 0, 0, 1], 2222)),
-                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 2222)),
-            ]
+            config
+                .listen()
+                .iter()
+                .map(ListenEndpoint::to_string)
+                .collect::<Vec<_>>(),
+            expected
         );
         assert_eq!(config.log_level(), LogLevel::Debug);
         assert_eq!(config.network(), NetworkMode::Outbound);
@@ -726,8 +826,12 @@ mod tests {
 
     #[test]
     fn operational_fields_live_in_their_new_homes() {
+        #[cfg(feature = "tcp")]
+        let listen_entry = r#"listen = ["tcp://127.0.0.1:2222"]"#;
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let listen_entry = r#"listen = ["ws://127.0.0.1:2222/ssh"]"#;
         for text in [
-            r#"listen = ["127.0.0.1:2222"]"#,
+            listen_entry,
             r#"log_level = "debug""#,
             "[sandbox]\nnetwork = \"outbound\"",
         ] {
@@ -756,15 +860,63 @@ mod tests {
         let message = build_err("listen = []");
         assert!(message.contains("must not be empty"), "{message}");
         let message = build_err(r#"listen = ["127.0.0.1"]"#);
-        assert!(message.contains("not a valid socket address"), "{message}");
-        let message = build_err(r#"listen = ["127.0.0.1:2222", "127.0.0.1:2222"]"#);
-        assert!(message.contains("duplicate listen address"), "{message}");
+        assert!(message.contains("must be a transport URI"), "{message}");
+        #[cfg(feature = "tcp")]
+        {
+            let message = build_err(r#"listen = ["tcp://127.0.0.1"]"#);
+            assert!(message.contains("not a valid host:port"), "{message}");
+        }
+        #[cfg(not(feature = "tcp"))]
+        {
+            let message = build_err(r#"listen = ["tcp://127.0.0.1:2222"]"#);
+            assert!(message.contains("without the `tcp` feature"), "{message}");
+        }
+        let message = build_err(r#"listen = ["unix:///tmp/s"]"#);
+        assert!(message.contains("unknown transport scheme"), "{message}");
+        #[cfg(feature = "tcp")]
+        let duplicate = r#"listen = ["tcp://127.0.0.1:2222", "tcp://127.0.0.1:2222"]"#;
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let duplicate = r#"listen = ["ws://127.0.0.1:2222/ssh", "ws://127.0.0.1:2222/ssh"]"#;
+        let message = build_err(duplicate);
+        assert!(message.contains("duplicate listen endpoint"), "{message}");
+    }
+
+    #[test]
+    fn ws_listen_entries_parse_when_the_transport_is_compiled_in() {
+        #[cfg(feature = "ws")]
+        {
+            let config = build_ok(r#"listen = ["ws://127.0.0.1:8080/ssh"]"#);
+            assert_eq!(
+                config
+                    .listen()
+                    .iter()
+                    .map(ListenEndpoint::to_string)
+                    .collect::<Vec<_>>(),
+                ["ws://127.0.0.1:8080/ssh".to_string()]
+            );
+        }
+        #[cfg(not(feature = "ws"))]
+        {
+            let message = build_err(r#"listen = ["ws://127.0.0.1:8080/ssh"]"#);
+            assert!(message.contains("without the `ws` feature"), "{message}");
+        }
     }
 
     #[test]
     fn string_array_fields_accept_a_single_bare_string() {
-        let config = build_ok(r#"listen = "127.0.0.1:2222""#);
-        assert_eq!(config.listen(), &[SocketAddr::from(([127, 0, 0, 1], 2222))]);
+        #[cfg(feature = "tcp")]
+        let listen_value = "tcp://127.0.0.1:2222";
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let listen_value = "ws://127.0.0.1:2222/ssh";
+        let config = build_ok(&format!(r#"listen = "{listen_value}""#));
+        assert_eq!(
+            config
+                .listen()
+                .iter()
+                .map(ListenEndpoint::to_string)
+                .collect::<Vec<_>>(),
+            [listen_value.to_string()]
+        );
         let config = build_ok("[sandbox]\nread_paths = \"/usr/share/terminfo\"");
         assert_eq!(config.read_paths(), &[PathBuf::from("/usr/share/terminfo")]);
     }
@@ -880,31 +1032,25 @@ read_paths = [""]"#
     #[test]
     fn read_paths_must_exist_and_stay_out_of_shbox_roots() {
         let (home, paths) = test_paths();
-        let raw: RawConfig = toml::from_str(
-            r#"[sandbox]
-read_paths = ["/definitely/not/here"]"#,
-        )
-        .unwrap();
+        let raw = raw_toml("[sandbox]\nread_paths = [\"/definitely/not/here\"]");
         let message = build(raw, &paths).expect_err("missing path").to_string();
         assert!(message.contains("does not exist"), "{message}");
 
         let inside_data = paths.data_dir().join("exposed");
         std::fs::create_dir_all(&inside_data).expect("create");
-        let raw: RawConfig = toml::from_str(&format!(
+        let raw = raw_toml(&format!(
             "[sandbox]\nread_paths = [{:?}]",
             inside_data.display()
-        ))
-        .unwrap();
+        ));
         let message = build(raw, &paths).expect_err("data root").to_string();
         assert!(message.contains("sandbox data root"), "{message}");
 
         let inside_state = paths.state_dir().join("exposed");
         std::fs::create_dir_all(&inside_state).expect("create");
-        let raw: RawConfig = toml::from_str(&format!(
+        let raw = raw_toml(&format!(
             "[sandbox]\nread_paths = [{:?}]",
             inside_state.display()
-        ))
-        .unwrap();
+        ));
         let message = build(raw, &paths).expect_err("state root").to_string();
         assert!(message.contains("state root"), "{message}");
 
@@ -912,12 +1058,11 @@ read_paths = ["/definitely/not/here"]"#,
         // otherwise acceptable.
         let allowed = home.path().join("extra");
         std::fs::create_dir_all(&allowed).expect("create");
-        let raw: RawConfig = toml::from_str(&format!(
+        let raw = raw_toml(&format!(
             "[sandbox]\nread_paths = [{:?}, {:?}]",
             allowed.display(),
             allowed.display()
-        ))
-        .unwrap();
+        ));
         let message = build(raw, &paths).expect_err("duplicate").to_string();
         assert!(message.contains("duplicate read path"), "{message}");
     }
@@ -995,14 +1140,18 @@ read_paths = ["/definitely/not/here"]"#,
         let path = paths.config_file();
         std::fs::write(path, "[sandbox]\nnetwork = \"disabled\"").expect("write config");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
-        let message = match Config::load_snapshot(&paths) {
+        let message = match Config::load_snapshot(&paths, None) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("group writable config must be rejected"),
         };
         assert!(message.contains("group or world writable"), "{message}");
         // A missing config is still fine when nothing unsafe exists.
         std::fs::remove_file(path).expect("remove");
-        Config::load_snapshot(&paths).expect("missing config");
+        let missing = Config::load_snapshot(&paths, None);
+        #[cfg(feature = "tcp")]
+        missing.expect("missing config");
+        #[cfg(not(feature = "tcp"))]
+        assert!(missing.is_err());
     }
 
     #[test]
@@ -1026,7 +1175,7 @@ read_paths = ["/definitely/not/here"]"#,
         }
         std::fs::write(path, body).expect("write big config");
         assert!(matches!(
-            Config::load_snapshot(&paths),
+            Config::load_snapshot(&paths, None),
             Err(Error::TooLarge { .. })
         ));
     }

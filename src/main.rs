@@ -13,6 +13,7 @@
 mod account;
 mod auth;
 mod config;
+mod endpoint;
 mod hostkey;
 mod lockfile;
 mod logging;
@@ -21,6 +22,11 @@ mod platform;
 mod sandbox;
 mod server;
 mod ssh;
+#[cfg(feature = "ws")]
+mod ws;
+
+#[cfg(not(any(feature = "tcp", feature = "ws")))]
+compile_error!("at least one transport feature must be enabled: tcp or ws");
 
 use std::fmt;
 use std::io::Write;
@@ -44,10 +50,12 @@ use tracing::{debug, error, info, warn};
 #[derive(usage_rs::Cli)]
 #[usage(bin = "shbox", version, completion)]
 struct Args {
-    /// SSH listener address; repeat the flag to override the config file's
-    /// `listen` entirely. Defaults to the config file value, or 0.0.0.0:22.
-    #[usage(long, value_name = "ADDR")]
-    listen: Option<Vec<std::net::SocketAddr>>,
+    /// SSH listener endpoint URI (`tcp://ADDR` or, in `ws` builds,
+    /// `ws://ADDR/PATH`); repeat the flag to override the config file's
+    /// `listen` entirely. Defaults to the config file value, or
+    /// tcp://0.0.0.0:22.
+    #[usage(long, value_name = "ENDPOINT")]
+    listen: Option<Vec<endpoint::ListenEndpoint>>,
     /// Daemon log verbosity; overrides the config file's `log_level`.
     /// Defaults to the config file value, or info.
     #[usage(long, value_name = "LEVEL", value_enum)]
@@ -95,18 +103,18 @@ enum OutputAction {
 /// `config::build` has already defaulted and validated; a present one
 /// replaces it wholesale. All-or-nothing binding stays the binding-time rule.
 fn effective_listen(
-    cli: Option<&[std::net::SocketAddr]>,
-    from_config: &[std::net::SocketAddr],
-) -> Result<Vec<std::net::SocketAddr>, String> {
+    cli: Option<&[endpoint::ListenEndpoint]>,
+    from_config: &[endpoint::ListenEndpoint],
+) -> Result<Vec<endpoint::ListenEndpoint>, String> {
     let Some(listen) = cli else {
         return Ok(from_config.to_vec());
     };
     let mut seen = Vec::with_capacity(listen.len());
-    for address in listen {
-        if seen.contains(address) {
-            return Err(format!("duplicate --listen address {address}"));
+    for endpoint in listen {
+        if seen.contains(endpoint) {
+            return Err(format!("duplicate --listen endpoint {endpoint}"));
         }
-        seen.push(*address);
+        seen.push(endpoint.clone());
     }
     Ok(seen)
 }
@@ -266,8 +274,8 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
         .map_err(|err| fail("creating shbox directories", err))?;
     let locks =
         lockfile::Locks::acquire(&paths).map_err(|err| fail("acquiring daemon locks", err))?;
-    let app_config =
-        config::Config::load_snapshot(&paths).map_err(|err| fail("loading configuration", err))?;
+    let app_config = config::Config::load_snapshot(&paths, args.listen.as_deref())
+        .map_err(|err| fail("loading configuration", err))?;
 
     // The config file is a logging input (`log_level`), so the subscriber is
     // installed only after the snapshot exists.
@@ -365,10 +373,10 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
     let server = Arc::new(server::SshServer::new(shared, host_key.key().clone()));
     let sockets = server::bind_all(&listen)
         .await
-        .map_err(|err| fail("binding listen addresses", err))?;
+        .map_err(|err| fail("binding listen endpoints", err))?;
     let bound: Vec<_> = sockets
         .iter()
-        .filter_map(|listener| listener.local_addr().ok())
+        .map(|listener| listener.local_addr().ok())
         .collect();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -498,6 +506,7 @@ impl SignalReceiver {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::str::FromStr;
 
     fn parse(argv: &[&str]) -> Result<Args, String> {
         let os: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
@@ -517,11 +526,23 @@ mod tests {
 
     #[test]
     fn cli_flags_layer_on_top_of_the_config_values() {
+        #[cfg(feature = "tcp")]
+        let (first, second, config_value) = (
+            "tcp://127.0.0.1:2222",
+            "tcp://[::1]:2222",
+            "tcp://192.168.0.1:2200",
+        );
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let (first, second, config_value) = (
+            "ws://127.0.0.1:2222/a",
+            "ws://127.0.0.1:2222/b",
+            "ws://192.168.0.1:2200/c",
+        );
         let args = parse(&[
             "--listen",
-            "127.0.0.1:2222",
+            first,
             "--listen",
-            "[::1]:2222",
+            second,
             "--log-level",
             "debug",
         ])
@@ -531,7 +552,7 @@ mod tests {
         assert_eq!(listen.len(), 2);
 
         // The CLI layer wins over whatever the config file carries...
-        let from_config = [std::net::SocketAddr::from(([192, 168, 0, 1], 2200))];
+        let from_config = [endpoint::ListenEndpoint::from_str(config_value).expect("endpoint")];
         assert_eq!(
             effective_listen(Some(&listen), &from_config).expect("layered listen"),
             listen
@@ -554,11 +575,25 @@ mod tests {
 
     #[test]
     fn duplicate_cli_listeners_are_rejected() {
-        let duplicate = parse(&["--listen", "127.0.0.1:2222", "--listen", "127.0.0.1:2222"])
-            .expect("duplicate addresses parse before semantic validation");
-        let message = effective_listen(duplicate.listen.as_deref(), &config::default_listen())
-            .expect_err("duplicates rejected");
+        #[cfg(feature = "tcp")]
+        let endpoint = "tcp://127.0.0.1:2222";
+        #[cfg(all(not(feature = "tcp"), feature = "ws"))]
+        let endpoint = "ws://127.0.0.1:2222/ssh";
+        let duplicate = parse(&["--listen", endpoint, "--listen", endpoint])
+            .expect("duplicate endpoints parse before semantic validation");
+        let message =
+            effective_listen(duplicate.listen.as_deref(), &[]).expect_err("duplicates rejected");
         assert!(message.contains("duplicate --listen"), "{message}");
+    }
+
+    #[test]
+    fn listen_flag_accepts_only_transport_uris() {
+        assert!(parse(&["--listen", "0.0.0.0:22"]).is_err());
+        assert!(parse(&["--listen", "unix:///tmp/s"]).is_err());
+        #[cfg(feature = "tcp")]
+        assert!(parse(&["--listen", "tcp://0.0.0.0:22"]).is_ok());
+        #[cfg(not(feature = "tcp"))]
+        assert!(parse(&["--listen", "tcp://0.0.0.0:22"]).is_err());
     }
 
     #[test]

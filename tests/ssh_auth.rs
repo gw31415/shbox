@@ -3,7 +3,10 @@
 //!
 //! Every test starts a real daemon binary with a temporary XDG tree and its
 //! own listener, then drives it with the real `ssh` client. Tests share
-//! nothing and are run serially (`--test-threads=1`).
+//! nothing and are run serially (`--test-threads=1`). The harness speaks
+//! plain TCP SSH, so it only applies to `tcp` builds.
+
+#![cfg(feature = "tcp")]
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -174,7 +177,7 @@ impl TestDaemon {
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_STATE_HOME", root.path().join("state"))
             .arg("--listen")
-            .arg(format!("127.0.0.1:{port}"));
+            .arg(format!("tcp://127.0.0.1:{port}"));
         let mut child = daemon_command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
