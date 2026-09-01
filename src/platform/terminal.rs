@@ -702,11 +702,39 @@ mod tests {
         // child's new group is the terminal's foreground group. TIOCSCTTY
         // sets the foreground group as the first session leader to acquire
         // an unowned terminal; tcsetpgrp is deliberately never called.
-        let slave = pair.slave_for_tests();
-        assert!(wait_until(|| unsafe { libc::tcgetsid(slave) } == pid as i32));
-        assert!(wait_until(
-            || unsafe { libc::tcgetpgrp(pair.master()) } == pid
-        ));
+        //
+        // POSIX only specifies tcgetsid()/tcgetpgrp() when `fd` names the
+        // caller's controlling terminal. Darwin permits this cross-session
+        // observation, while Linux returns ENOTTY to the parent even though
+        // the child's TIOCSCTTY succeeded. On Linux, /proc/<pid>/stat exposes
+        // the child's session, controlling-tty device, and foreground pgrp
+        // without changing either process.
+        #[cfg(target_os = "linux")]
+        assert!(wait_until(|| {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                return false;
+            };
+            let fields: Vec<&str> = fields.split_whitespace().collect();
+            let session = fields
+                .get(3)
+                .and_then(|value| value.parse::<libc::pid_t>().ok());
+            let tty_nr = fields.get(4).and_then(|value| value.parse::<i64>().ok());
+            let foreground = fields
+                .get(5)
+                .and_then(|value| value.parse::<libc::pid_t>().ok());
+            session == Some(pid) && tty_nr.is_some_and(|tty| tty != 0) && foreground == Some(pid)
+        }));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let slave = pair.slave_for_tests();
+            assert!(wait_until(|| unsafe { libc::tcgetsid(slave) } == pid as i32));
+            assert!(wait_until(
+                || unsafe { libc::tcgetpgrp(pair.master()) } == pid
+            ));
+        }
 
         // Window size and terminal modes were applied before the spawn.
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
@@ -716,7 +744,10 @@ mod tests {
         );
         assert_eq!((size.ws_row, size.ws_col), (40, 100));
         let mut state: libc::termios = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::tcgetattr(slave, &mut state) }, 0);
+        assert_eq!(
+            unsafe { libc::tcgetattr(pair.slave_for_tests(), &mut state) },
+            0
+        );
         assert_eq!(state.c_lflag & libc::ECHO, 0);
         assert_eq!(state.c_lflag & libc::ICANON, 0);
 
@@ -756,9 +787,11 @@ mod tests {
         );
         let mut child = spawn_setup_child(&pair, true, script);
 
-        // Collect everything the child writes to the slave through the
-        // master until the child exits and the master reports end of stream.
-        let master = duplicate_fd(pair.master()).expect("master dup");
+        // Production consumes the pair immediately after spawn: the parent
+        // retains only the master and closes its slave copy. Mirror that
+        // ownership transition here; keeping the parent slave open prevents
+        // Linux PTY masters from ever reporting EOF/EIO after child exit.
+        let master = pair.into_master();
         let reader = std::thread::spawn(move || {
             let mut output = Vec::new();
             let mut chunk = [0u8; 256];

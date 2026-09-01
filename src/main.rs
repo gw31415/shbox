@@ -360,21 +360,40 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    let launch_policy = platform::ArapucaLaunchPolicy::from_config(
-        &app_config,
-        &sandbox_shell,
-        paths.runtime_dir(),
-    );
-    let launcher: Arc<dyn platform::ProcessLauncher> = match platform::ArapucaLauncher::new(
-        launch_policy,
-    ) {
-        Ok(launcher) => {
-            info!("sandbox process adapter initialized");
-            Arc::new(launcher)
+    #[cfg(target_os = "linux")]
+    let launcher: Arc<dyn platform::ProcessLauncher> = {
+        let launch_policy = platform::SandboxLaunchPolicy::from_config(
+            &app_config,
+            &sandbox_shell,
+            paths.runtime_dir(),
+        );
+        match platform::LinuxLauncher::new(launch_policy) {
+            Ok(launcher) => {
+                info!("sandbox process adapter initialized");
+                Arc::new(launcher)
+            }
+            Err(error) => {
+                warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
+                Arc::new(platform::UnavailableLauncher)
+            }
         }
-        Err(error) => {
-            warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
-            Arc::new(platform::UnavailableLauncher)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let launcher: Arc<dyn platform::ProcessLauncher> = {
+        let launch_policy = platform::ArapucaLaunchPolicy::from_config(
+            &app_config,
+            &sandbox_shell,
+            paths.runtime_dir(),
+        );
+        match platform::ArapucaLauncher::new(launch_policy) {
+            Ok(launcher) => {
+                info!("sandbox process adapter initialized");
+                Arc::new(launcher)
+            }
+            Err(error) => {
+                warn!(error = %error, "sandbox process adapter unavailable; launches will fail closed");
+                Arc::new(platform::UnavailableLauncher)
+            }
         }
     };
     let managed_mode = auth_store.admin_count() > 0;

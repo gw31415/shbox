@@ -55,40 +55,34 @@ pub(crate) enum ReadPathClass {
 /// absent (it would expose every host pseudo-terminal), and `/dev/tty` is the
 /// only added grant beyond the Arapuca list.
 #[cfg(target_os = "linux")]
-pub(crate) const CURATED_READ_PATHS: &[(PathBuf, ReadPathClass)] = &[
-    (PathBuf::from("/usr"), ReadPathClass::ExecutableRuntime),
-    (PathBuf::from("/lib"), ReadPathClass::ExecutableRuntime),
-    (PathBuf::from("/lib64"), ReadPathClass::ExecutableRuntime),
-    (PathBuf::from("/bin"), ReadPathClass::ExecutableRuntime),
-    (PathBuf::from("/sbin"), ReadPathClass::ExecutableRuntime),
-    (PathBuf::from("/etc/ssl"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/pki"), ReadPathClass::SystemData),
-    (
-        PathBuf::from("/etc/ca-certificates"),
-        ReadPathClass::SystemData,
-    ),
-    (PathBuf::from("/etc/resolv.conf"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/hosts"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/host.conf"), ReadPathClass::SystemData),
-    (
-        PathBuf::from("/etc/nsswitch.conf"),
-        ReadPathClass::SystemData,
-    ),
-    (PathBuf::from("/etc/ld.so.cache"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/localtime"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/passwd"), ReadPathClass::SystemData),
-    (PathBuf::from("/etc/group"), ReadPathClass::SystemData),
-    (PathBuf::from("/dev/zero"), ReadPathClass::SystemData),
-    (PathBuf::from("/dev/urandom"), ReadPathClass::SystemData),
-    (PathBuf::from("/dev/random"), ReadPathClass::SystemData),
-    (PathBuf::from("/dev/tty"), ReadPathClass::TerminalDevice),
+pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[
+    ("/usr", ReadPathClass::ExecutableRuntime),
+    ("/lib", ReadPathClass::ExecutableRuntime),
+    ("/lib64", ReadPathClass::ExecutableRuntime),
+    ("/bin", ReadPathClass::ExecutableRuntime),
+    ("/sbin", ReadPathClass::ExecutableRuntime),
+    ("/etc/ssl", ReadPathClass::SystemData),
+    ("/etc/pki", ReadPathClass::SystemData),
+    ("/etc/ca-certificates", ReadPathClass::SystemData),
+    ("/etc/resolv.conf", ReadPathClass::SystemData),
+    ("/etc/hosts", ReadPathClass::SystemData),
+    ("/etc/host.conf", ReadPathClass::SystemData),
+    ("/etc/nsswitch.conf", ReadPathClass::SystemData),
+    ("/etc/ld.so.cache", ReadPathClass::SystemData),
+    ("/etc/localtime", ReadPathClass::SystemData),
+    ("/etc/passwd", ReadPathClass::SystemData),
+    ("/etc/group", ReadPathClass::SystemData),
+    ("/dev/zero", ReadPathClass::SystemData),
+    ("/dev/urandom", ReadPathClass::SystemData),
+    ("/dev/random", ReadPathClass::SystemData),
+    ("/dev/tty", ReadPathClass::TerminalDevice),
 ];
 
 /// macOS has no curated default read grants: the generated Seatbelt profile
 /// enumerates the system paths the shell needs, and the profile is validated
 /// in the macOS backend tests.
 #[cfg(not(target_os = "linux"))]
-pub(crate) const CURATED_READ_PATHS: &[(PathBuf, ReadPathClass)] = &[];
+pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[];
 
 /// The curated writable device paths for Linux.
 ///
@@ -96,10 +90,10 @@ pub(crate) const CURATED_READ_PATHS: &[(PathBuf, ReadPathClass)] = &[];
 /// single device writable without granting write access to the rest of
 /// `/dev`. macOS handles `/dev/null` inside its Seatbelt profile instead.
 #[cfg(target_os = "linux")]
-pub(crate) const CURATED_WRITE_PATHS: &[PathBuf] = &[PathBuf::from("/dev/null")];
+pub(crate) const CURATED_WRITE_PATHS: &[&str] = &["/dev/null"];
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) const CURATED_WRITE_PATHS: &[PathBuf] = &[];
+pub(crate) const CURATED_WRITE_PATHS: &[&str] = &[];
 
 /// The immutable, process-lifetime launch policy snapshot.
 ///
@@ -189,7 +183,7 @@ impl SandboxLaunchPolicy {
     pub(crate) fn resolved_read_paths(&self) -> Vec<PathBuf> {
         let mut read_paths: Vec<PathBuf> = CURATED_READ_PATHS
             .iter()
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| PathBuf::from(path))
             .collect();
         read_paths.push(self.shell.clone());
         if let Some(parent) = self.shell.parent() {
@@ -211,8 +205,8 @@ impl SandboxLaunchPolicy {
         read_paths
     }
 
-    pub(crate) fn curated_write_paths(&self) -> &[PathBuf] {
-        CURATED_WRITE_PATHS
+    pub(crate) fn curated_write_paths(&self) -> Vec<PathBuf> {
+        CURATED_WRITE_PATHS.iter().map(PathBuf::from).collect()
     }
 
     /// The environment for one sandbox process: workspace-scoped basics, the
@@ -316,32 +310,45 @@ impl LaunchTemp {
         &self.path
     }
 
-    /// Best-effort removal that tolerates an already-removed directory but
-    /// reports a still-owned directory that could not be deleted.
+    /// Best-effort recursive removal that tolerates an already-removed path
+    /// but reports a still-owned tree that could not be deleted. The root is
+    /// inspected without following symlinks before deletion, so a replaced
+    /// launch-temp path cannot redirect cleanup into another tree.
     pub(crate) fn remove(self) -> Result<(), LaunchError> {
         let path = self.path.clone();
-        drop(self);
-        match fs::remove_dir(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(LaunchError::new(format!(
+        let result = remove_launch_temp_tree(&path);
+        // Avoid running Drop a second time after the explicit removal attempt.
+        std::mem::forget(self);
+        result.map_err(|error| {
+            LaunchError::new(format!(
                 "sandbox launch temp directory could not be removed: {error}"
-            ))),
-        }
+            ))
+        })
     }
 }
 
 impl Drop for LaunchTemp {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir(&self.path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
+        if let Err(error) = remove_launch_temp_tree(&self.path) {
             tracing::warn!(
                 path = %self.path.display(),
                 error = %error,
                 "could not remove launch temp directory"
             );
         }
+    }
+}
+
+fn remove_launch_temp_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
     }
 }
 
@@ -381,7 +388,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn curated_linux_read_paths_are_frozen() {
-        let expected: Vec<(PathBuf, ReadPathClass)> = [
+        let expected = [
             ("/usr", ReadPathClass::ExecutableRuntime),
             ("/lib", ReadPathClass::ExecutableRuntime),
             ("/lib64", ReadPathClass::ExecutableRuntime),
@@ -402,10 +409,7 @@ mod tests {
             ("/dev/urandom", ReadPathClass::SystemData),
             ("/dev/random", ReadPathClass::SystemData),
             ("/dev/tty", ReadPathClass::TerminalDevice),
-        ]
-        .into_iter()
-        .map(|(path, class)| (PathBuf::from(path), class))
-        .collect();
+        ];
         assert_eq!(CURATED_READ_PATHS, &expected[..]);
 
         // The deliberately absent broad grants stay absent.
@@ -413,7 +417,7 @@ mod tests {
             assert!(
                 !CURATED_READ_PATHS
                     .iter()
-                    .any(|(granted, _)| granted == Path::new(path)),
+                    .any(|(granted, _)| *granted == path),
                 "{path} must not be broadly granted"
             );
         }
@@ -422,7 +426,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn curated_linux_write_paths_are_only_dev_null() {
-        assert_eq!(CURATED_WRITE_PATHS, &[PathBuf::from("/dev/null")]);
+        assert_eq!(CURATED_WRITE_PATHS, &["/dev/null"]);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -498,8 +502,11 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         assert!(first.path().starts_with(root.path()));
 
-        // Removing one temp does not affect the sibling.
+        // Removing one temp recursively removes child-created contents and
+        // does not affect the sibling.
         let first_path = first.path().to_path_buf();
+        fs::create_dir(first.path().join("nested")).expect("nested launch temp");
+        fs::write(first.path().join("nested/file"), b"residue").expect("launch temp residue");
         first.remove().expect("remove first");
         assert!(!first_path.exists());
         assert!(second.path().exists());

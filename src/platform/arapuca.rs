@@ -119,7 +119,7 @@ impl ArapucaLaunchPolicy {
             .unwrap_or((0, 0));
 
         let mut write_paths = vec![workspace.to_path_buf()];
-        write_paths.extend(self.inner.curated_write_paths().iter().cloned());
+        write_paths.extend(self.inner.curated_write_paths());
 
         let seccomp_profile = match self.inner.network() {
             NetworkMode::Disabled => ::arapuca::SeccompProfile::Strict,
