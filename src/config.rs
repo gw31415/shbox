@@ -807,10 +807,7 @@ mod tests {
     fn rejects_unknown_fields_and_bad_types() {
         let message = build_err("unknown_field = 1");
         assert!(message.contains("unknown field"), "{message}");
-        for text in [
-            "caps = { max_connections = 1 }",
-            "limits = { max_memory_mb = 1 }",
-        ] {
+        for text in ["caps = { max_connections = 1 }", "limits = { memory = 1 }"] {
             let message = build_err(text);
             assert!(message.contains("unknown field"), "{text}: {message}");
         }

@@ -23,7 +23,7 @@ usage: scripts/verify-linux-platform --arch x86_64|aarch64 [--target TARGET]
 Runs the native shbox Linux gate as the current non-root account. The gate
 requires Rust 1.95, OpenSSH, a C compiler for the PTY identity fixture, and a
 kernel on which the pinned nono policy can prepare and enforce Landlock.
-No cgroup delegation, Arapuca wrapper, runner binary, or nono CLI is used.
+No control-group delegation, sibling runner binary, external wrapper, or nono CLI is used.
 USAGE
   exit 2
 }

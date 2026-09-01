@@ -1,58 +1,53 @@
 # shbox specification
 
-この directory は shbox v0.1 の仕様の正本である。実装と文書が異なる場合、未解決の差分として
-扱い、どちらかへ暗黙に寄せてはならない。
+このディレクトリは shbox v0.1 の外部契約、内部境界、security/release 条件を記述する。実装と文書が衝突した場合は、release 前にどちらかを修正して一致させる。古い backend や移行用互換経路を仕様として残さない。
 
 ## Reading order
 
-1. [Product and external interface](product.md) — 目的、利用者から見える操作、非目標
-2. [Security model](security.md) — 認証、所有権、admin/host access、信頼境界
-3. [SSH protocol](ssh-protocol.md) — request、channel、PTY、stream、終了規則
-4. [Architecture and lifecycle](architecture.md) — module 境界、永続状態、並行処理、復旧
-5. [Configuration](configuration.md) — TOML schema、既定値、validation、鍵の更新
-6. [Platforms](platforms.md) — Arapuca Adapter、OS 差、配備条件、正式対応範囲
-7. [Testing and release gates](testing.md) — acceptance test と正式対応の証明条件
-
-実装の検証状況と運用上の再開手順は [Testing and release gates](testing.md) と
-[release runbook](release.md) に記録する。
+1. [product.md](product.md) — 利用者から見た目的、SSH 操作、非目標
+2. [architecture.md](architecture.md) — lifecycle、`ProcessLauncher`、PTY/process ownership
+3. [configuration.md](configuration.md) — TOML、XDG path、built-in concurrency caps
+4. [ssh-protocol.md](ssh-protocol.md) — SSH request/stream/signal semantics
+5. [security.md](security.md) — trust boundary、OS confinement、既知の限界
+6. [platforms.md](platforms.md) — Linux/macOS backend と正式 support 条件
+7. [testing.md](testing.md) — unit/OpenSSH/native platform acceptance
+8. [release.md](release.md) — blocking CI、release evidence、deployment gate
 
 ## Normative language
 
-- **必須**: v0.1 の適合実装が満たさなければならない。
-- **禁止**: v0.1 の適合実装が行ってはならない。
-- **推奨**: 強い既定方針。同等の性質と検証を示せる場合だけ変更できる。
-- **非目標**: v0.1 が interface、互換性、運用を保証しない機能。
+`must` / 「必須」は release-blocking contract、`must not` / 「禁止」は実装・運用の禁止事項を表す。`may` / 「可能」は optional behavior である。
 
-英語の `MUST`、`MUST NOT`、`SHOULD` を引用するときは RFC の意味で使う。文書内の例は、
-「例」と明記しない限り protocol/config contract の一部である。
+正式 support は「コンパイルできる」ことではなく、対象 OS/architecture 上で実 confinement と実 OpenSSH/PTTY acceptance が passing であることを意味する。
 
 ## Core vocabulary
 
-- **Sandbox**: shbox が所有する永続 metadata と workspace、およびそこへ接続する一時的な
-  sandboxed process の論理的集合。
-- **Workspace**: sandbox ごとに永続化され、process の `HOME` と初期 cwd になる directory。
-- **Arapuca process**: 一回の shell/exec のために起動する隔離 process。永続 sandbox object
-  ではない。
-- **Owner**: sandbox を最初に atomic claim した正確な Ed25519 public key fingerprint。
-- **Admin**: daemon 実行ユーザーの `~/.ssh/authorized_keys` に登録され、認証にも成功した host 認可 key。host selector `_` と全 sandbox の操作権限を持つ。
-- **Normal**: `$XDG_CONFIG_HOME/shbox/allowed_keys` だけに登録された sandbox 許可 key。自分が所有する sandbox だけを利用できる。
-- **Host selector**: admin だけが使える予約 SSH username `_`。
-- **Managed mode**: 一つ以上の admin key が設定された動作 mode。
-- **Sandbox-only mode**: admin key がなく、host access を持たない動作 mode。
-- **Formal support**: 対象 OS/version/architecture で全 blocking integration suite に合格した
-  組合せ。build 成功や upstream の一般的な対応表だけでは正式対応にならない。
+- **Principal**: 認証済み Ed25519 public key fingerprint と role の組。
+- **Sandbox**: durable metadata と workspace を持つ shbox resource。ID は `[A-Za-z0-9][A-Za-z0-9-]{0,63}`。
+- **Workspace**: sandbox に永続する唯一の writable project tree。
+- **Launch**: shell/exec 一回に対応する disposable process lifecycle。process、PTY、private `TMPDIR` は durable ではない。
+- **ProcessLauncher**: backend-neutral な private launch seam。SSH 層は OS confinement implementation を知らない。
+- **PTY**: shbox が直接 allocate/own する pseudo-terminal。OS confinement layer の責務ではない。
+- **Host mode**: admin key が username `_` を使ったときだけ利用できる daemon account 上の非-sandbox route。
+
+## Current architecture
+
+```text
+SSH/session layer
+    -> ProcessLauncher
+        -> shbox-owned PTY/process lifecycle
+        -> OS confinement
+            Linux: nono 0.74.0 / Landlock
+                   (+ nono-selected seccomp fallback when required)
+            macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
+```
+
+Linux では nono を library として利用し、外部 sandbox CLI、sibling helper、delegated cgroup controller を必要としない。macOS では parent process が Seatbelt profile を構築し、`/usr/bin/sandbox-exec` に適用を委ねる。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
 
 ## Change discipline
 
-仕様変更では、影響する全文書と acceptance test を同時に更新する。特に次は一文書だけで
-変更してはならない。
-
-- selector、role、ownership: `product.md`、`security.md`、`ssh-protocol.md`
-- metadata/lifecycle: `architecture.md`、`testing.md`
-- config default/validation: `configuration.md`、`testing.md`
-- OS behavior/dependency revision: `platforms.md`、`testing.md`、`release.md`
-- user-visible request/output: `product.md`、`ssh-protocol.md`、integration test
-
-Arapuca 固有 field や backend selector を利用者向け config に直接露出しない。新しい設定が
-必要な場合は、まず shbox の domain concept として意味・全 platform での契約・検証方法を
-定義する。
+- public config に backend selector や backend 固有 option を追加しない。
+- sandbox resource limits（CPU/memory/PID/file quota）を shbox の機能として暗黙に復活させない。
+- PTY failure を pipe ベースの疑似 interactive mode で回避しない。
+- Linux confinement failure を unconfined execution に degrade しない。
+- macOS Seatbelt prerequisite failure を unconfined execution に degrade しない。
+- release 前に [testing.md](testing.md) と [release.md](release.md) の blocking matrix を実行する。

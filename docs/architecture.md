@@ -1,421 +1,241 @@
 # Architecture and lifecycle
 
-この文書は、shbox の内部境界、永続状態、並行処理、復旧手順を規定する。
-利用者向けの操作は [product.md](product.md)、SSH channel の詳細は
-[ssh-protocol.md](ssh-protocol.md)、認証境界は [security.md](security.md) を参照する。
-
-本文中の「必須」「禁止」は v0.1 の要件である。「推奨」は、同等の性質を証明できる
-実装へ置き換えられる。
+shbox は durable sandbox metadata/workspace と disposable process lifecycle を分離する SSH daemon である。SSH handler は filesystem policy や OS sandbox API を直接操作せず、`SandboxManager` と `ProcessLauncher` を境界として利用する。
 
 ## 1. System boundary
 
-shbox は foreground で動作する単一 host・単一 process の SSH daemon である。HTTP API、
-専用 client、multi-node scheduler、永続 terminal session は持たない。
-
-```mermaid
-flowchart LR
-    Client[OpenSSH client] -->|SSH| Server[russh server]
-    Server --> Session[connection and channel handlers]
-    Session --> Manager[SandboxManager]
-    Manager --> Registry[(metadata + workspace)]
-    Manager --> Launcher[ProcessLauncher seam]
-    Launcher --> Adapter[Arapuca adapter]
-    Adapter --> Process[sandboxed process]
-    Session --> Host[admin host process]
+```text
+OpenSSH client
+    |
+    v
+russh SSH/session layer
+    |
+    +--> auth / role / selector routing
+    |
+    +--> SandboxManager ------------------------------+
+    |      durable metadata + workspace ownership     |
+    |                                                 |
+    +--> ProcessLauncher <-----------------------------+
+           |
+           +--> shbox-owned process lifecycle
+           |      fork/exec, wait/reap, process group,
+           |      signal forwarding, shutdown cleanup
+           |
+           +--> shbox-owned PTY lifecycle
+           |      allocation, fd 0/1/2, setsid,
+           |      controlling TTY, termios, resize
+           |
+           +--> OS confinement
+                  Linux: nono 0.74.0 / Landlock
+                         + nono-selected seccomp fallback
+                  macOS: generated Seatbelt profile
+                         applied by /usr/bin/sandbox-exec
 ```
 
-重要な境界は次のとおりである。
-
-- shbox の **sandbox** は、shbox が永続化する metadata と workspace の組である。
-- Arapuca の通常の Process backend は、一回の process 起動を隔離する primitive である。
-  永続 sandbox object、registry、create/list/delete API ではない。
-- 同じ sandbox の複数 process は同じ workspace を共有するが、別々の Arapuca
-  `Process` として起動する。
-- host selector `_` の process は Arapuca を経由しない。daemon と同じ OS uid/gid の
-  host process であり、認証済み admin だけが起動できる。
+Host selector `_` は例外であり、admin key のみが daemon account の host process route を使う。host mode は sandbox confinement を経由しないため、admin credential は強い権限境界である。
 
 ## 2. Domain model
 
-### 2.1 Validated values
+### 2.1 Principal
 
-raw SSH input や TOML string は、validation が完了するまで domain value として扱わない。
-少なくとも次の型を分ける。
+認証済み Ed25519 key fingerprint と role（normal/admin）を connection state に固定する。username は routing selector であり identity ではない。
 
-- `SandboxId`: ASCII 1--64 bytes、正規表現
-  `[A-Za-z0-9][A-Za-z0-9-]{0,63}` に一致する case-sensitive ID
-- `KeyFingerprint`: Ed25519 public key の OpenSSH SHA-256 fingerprint
-- `Principal`: fingerprint と、通常鍵または admin の role を含む認証結果
-- `Selector`: validated `SandboxId` または予約済みの `Host` (`_`)
-- `ConnectionId` / `ChannelId` / `ProcessId`: log と runtime registry 用の opaque ID
+### 2.2 Sandbox ID
 
-`_` は `SandboxId` ではない。raw string と validated value の混用、および path 文字列の
-連結による sandbox 解決は禁止する。
+`SandboxId` は ASCII・case-sensitive で、grammar は次の通り。
 
-### 2.2 Persistent sandbox record
-
-各 sandbox は、正本となる v1 metadata を一つ持つ。
-
-```toml
-version = 1
-id = "dev"
-owner = "SHA256:base64-without-padding"
-state = "active"
+```text
+[A-Za-z0-9][A-Za-z0-9-]{0,63}
 ```
 
-`state` の wire value は `active` または `deleting` だけである。概念上はそれぞれ
-**Active**、**Deleting** と呼ぶ。未知 field、未知 version、ID と directory 名の不一致、
-不正 fingerprint、不正 state は corruption である。
+`_` は host selector なので sandbox ID にならない。path separator、dot、underscore、whitespace、Unicode は拒否する。
 
-owner は sandbox を最初に作成した正確な public key fingerprint であり、admin key も
-例外ではない。v0.1 は共有 owner、譲渡、owner rotation を持たない。
+### 2.3 Persistent sandbox record
 
-### 2.3 State machine
+各 sandbox は XDG data root 以下に durable metadata と workspace を持つ。metadata は owner fingerprint と lifecycle state を記録し、workspace と同じ sandbox directory に属する。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Absent
-    Absent --> Active: first shell/exec atomically claims ID
-    Active --> Active: shell/exec/list
-    Active --> Deleting: durable delete intent
-    Deleting --> Absent: processes stopped and tree removed
-    Deleting --> Deleting: retry after partial failure or restart
+概念的な state は次である。
+
+```text
+Absent -> Active -> Deleting -> Absent
 ```
 
-- create 用の永続 **Creating** state は設けない。metadata の atomic publish が create の
-  commit point である。
-- directory はあるが valid metadata がない状態は `Absent` ではなく **Blocked/Corrupt**
-  として扱う。同じ ID を自動再利用、削除、修復してはならない。
-- `Deleting` は list から隠し、新しい shell/exec を拒否する。
-- delete 完了後の同じ ID は、後続の shell/exec により新しい owner で再作成できる。
+create/claim は owner を durable に確定してから process launch を許可する。delete は `Deleting` を durable に記録してから runtime を停止し、workspace/metadata を削除する。crash 後は startup reconciliation が incomplete delete を再開する。
 
 ## 3. Persistent layout
 
-XDG path の解決には `xdg` crate を使い、shbox が `HOME` fallback を再実装しない。
+`xdg` crate の application prefix `shbox` を使う。
 
 ```text
-$XDG_CONFIG_HOME/shbox/
-├── config.toml                 # optional
-└── allowed_keys                # sandbox-only keys
-$XDG_DATA_HOME/shbox/
-├── registry.lock              # sandbox data root の排他的 advisory lock
-└── sandboxes/
-    └── <id>/
-        ├── metadata.toml       # v1 record, mode 0600
-        └── workspace/          # persistent HOME and cwd, mode 0700
+$XDG_CONFIG_HOME/shbox/config.toml       optional, operator input
+$XDG_CONFIG_HOME/shbox/allowed_keys      sandbox-only public keys
 
-$XDG_STATE_HOME/shbox/
-├── host_key                    # Ed25519 private host key, mode 0600
-└── lock                        # daemon state root の排他的 advisory lock
+$XDG_DATA_HOME/shbox/registry.lock
+$XDG_DATA_HOME/shbox/sandboxes/<id>/     metadata + workspace
+
+$XDG_STATE_HOME/shbox/host_key
+$XDG_STATE_HOME/shbox/lock
+$XDG_STATE_HOME/shbox/runtime/           per-launch private temp root
 ```
 
-標準 fallback は、それぞれ `~/.config/shbox`、`~/.local/share/shbox`、
-`~/.local/state/shbox` である。sandbox root、host key path、二つの lock path は v0.1 では固定し、
-config option にしない。persistent data を `XDG_RUNTIME_DIR` へ置かない。
-
-管理 directory は daemon user 所有かつ原則 mode `0700`、管理 file は `0600` とする。
-group/world writable な config、authorized keys、host key、その管理 parent は拒否する。
-local filesystem と、atomic rename・directory `fsync` を提供する通常の POSIX semantics を
-前提とする。
-
-management path の解決では no-follow/open-at 相当の安全な操作を使う。`metadata.toml` や
-`workspace` 自体が symlink、device、FIFO、socket など期待外の file type なら corruption
-として block する。workspace 内部に利用者が作る symlink は許可するが、delete は
-sandbox directory の外へ絶対に辿ってはならない。
+shbox が作成する directory は owner-only を要求し、symlink や group/world writable path を拒否する。config directory は operator input なので自動作成しない。
 
 ## 4. Module boundaries
 
-### 4.1 `SandboxManager`: deep lifecycle module
+### 4.1 `SandboxManager`
 
-`SandboxManager` は次の知識を一箇所へ隠蔽する深い Module である。
+`SandboxManager` は次を所有する。
 
-- owner authorization と存在秘匿
-- metadata の読み書き、状態遷移、reconciliation
-- per-ID lock と count limit
-- workspace 作成・安全な再利用・安全な削除
-- active process registry
-- list/create/delete/shutdown の concurrency semantics
-- Arapuca launch 用の内部 profile と task ID
+- owner claim と metadata transition
+- global/per-owner sandbox caps
+- workspace path validation
+- active runtime lease registry
+- delete と startup reconciliation
+- daemon shutdown 時の sandbox runtime drain
 
-SSH handler が filesystem layout、Arapuca `Process`、metadata TOML を直接操作することを
-禁止する。SSH 側の Interface は、概念的に次の小さい操作だけを使う。
+SSH handler は metadata file を直接編集しない。
 
-```rust
-trait SandboxService {
-    async fn launch(&self, request: LaunchRequest) -> Result<RunningProcess, RequestError>;
-    async fn list(&self, principal: &Principal) -> Result<Vec<SandboxId>, RequestError>;
-    async fn delete(&self, principal: &Principal, id: &SandboxId) -> Result<(), RequestError>;
-}
-```
+### 4.2 `ProcessLauncher`
 
-これは public plugin API を意味しない。実際の型は crate-private とし、必要な protocol
-情報だけを request/response value に含める。
+`ProcessLauncher` は private trait であり、public plugin/backend selector ではない。入力は validated workspace、shell/exec operation、PTY specification。出力は owned stdin/stdout/stderr、process control、wait result である。
 
-### 4.2 `ProcessLauncher`: private test seam
+backend-neutral policy は一度だけ構築し、以下を保持する。
 
-`ProcessLauncher` は process 起動と終了を差し替えるための private Seam である。
-production Adapter は Arapuca と OS PTY/ioctl/process-group 操作を包む。test Adapter は
-barrier、失敗注入、遅延、確定した exit/output を提供する。
+- validated shell
+- `disabled` / `outbound` network policy
+- curated + configured read-only paths
+- operator sandbox environment
+- per-launch private temp root
 
-backend selector や利用者設定可能な Adapter は作らない。Arapuca 固有の profile field、
-cgroup path、seccomp mode などを config や SSH interface に漏らさない。
+CPU、memory、PID、file quota の sandbox resource limits は policy に存在しない。
 
-filesystem 全体を抽象化する trait は作らない。storage test は temporary XDG directory の
-実 filesystem を使う。
+### 4.3 Linux launcher
 
-### 4.3 Suggested source layout
+Linux launcher は parent 側で filesystem/network capability set と nono policy を prepare する。child を作る前に path lookup、allocation、Landlock ABI detection を終える。
 
-実装時の初期 layout は次を基準とする。責務を深く保てる場合は file 分割を変えてよい。
+post-fork child が行うのは、事前準備済み data を使った raw/fixed operation に限定する。
 
-```text
-src/
-├── main.rs                    # process bootstrap and signal loop
-├── config.rs                  # typed TOML, defaults, validation, snapshots
-├── auth.rs                    # key parsing, fingerprints, role snapshots
-├── server.rs                  # listener and russh server configuration
-├── ssh/
-│   ├── mod.rs                 # per-connection handler
-│   ├── channel.rs             # per-channel request state
-│   └── bridge.rs              # bounded SSH/process I/O bridge
-├── sandbox/
-│   ├── mod.rs                 # SandboxManager interface
-│   ├── id.rs                  # validated SandboxId
-│   ├── metadata.rs            # v1 format and durable writes
-│   └── storage.rs             # safe filesystem operations
-└── platform/
-    ├── mod.rs                 # private ProcessLauncher seam
-    └── arapuca.rs             # production Adapter
-```
+1. parent-death signal を設定し parent PID を再確認
+2. PTY なら fd 0/1/2 を slave に揃える
+3. `setsid()`
+4. PTY なら controlling terminal を取得
+5. workspace へ `chdir`
+6. prepared nono sandbox を raw apply
+7. target shell を `exec`
 
-巨大な共通 `Error` enum を作らない。各 Module は呼び手が処理できる小さい error taxonomy
-を返し、source chain を内部 log 用に保持する。
+child setup failure は CLOEXEC status pipe で stage/errno を parent に返し、client には generic launch failure を返す。
+
+nono 0.74.0 は library としてのみ利用する。外部 nono executable は不要である。
+
+### 4.4 macOS launcher
+
+macOS launcher は parent 側で deny-default Seatbelt profile を生成する。profile は workspace/private temp を writable、curated system/runtime paths を readable とし、network mode を shbox policy から決定する。
+
+PTY/session setup は shbox child setup が行い、その後 `/usr/bin/sandbox-exec -p <profile> <shell> ...` を exec する。別 helper や self-exec path はない。
 
 ## 5. Startup and readiness
 
-startup は概ね次の順序で行う。
+startup の主要順序は次である。
 
-1. CLI を parse し、`listen` と `log_level` の上書き要求を保持する。
-2. XDG path を解決し、data の `registry.lock`、state の `lock` の順に non-blocking で取得する。
-   どちらか一方でも失敗したら、取得済み lock を解放して起動を失敗させる。
-3. optional config を読み、file-backed policy とトップレベルの operational 設定を検証する。
-4. `listen` と `log_level` を config 値と CLI 層から確定し、logging を初期化する。
-5. host authorized_keys と sandbox allowed_keys を読み、検証済み鍵集合を保持する鍵ストア
-   （`KeyStore`）を構築する。以降は認証要求ごとに鍵 file の状態を比較し、変化時だけ全検証する。
-6. Ed25519 host key を読み込む。存在しない場合だけ安全に atomic 作成する。
-7. OS preflight を行い、Arapuca backend instance を一度だけ構築する。
-8. 初期 authentication snapshot に Admin key があれば managed mode として扱い、listener を
-   全 address へ bind して `_` host route を有効にする。
-9. sandbox registry を走査し、valid metadata を読み、`deleting` の削除を再開する。
-10. sandbox operation を ready にする。sandbox-only mode では `_` host route だけを無効にする。
+1. XDG paths resolve/validate
+2. config snapshot load/validate
+3. data/state lock acquisition
+4. host key load/create
+5. authorized key snapshot load
+6. daemon account/sandbox shell resolve
+7. backend-neutral launch policy construct
+8. production `ProcessLauncher` preflight
+9. listener bind
+10. managed mode なら startup reconciliation
 
-config file と各 key source は存在しなくてもよいが、合成 snapshot には少なくとも一つの
-valid Ed25519 key が必要である。host authorized_keys 由来の Admin key が一つ以上ある状態を
-**managed mode**、それ以外を **sandbox-only mode** と呼ぶ。
+config と launch policy は process-lifetime snapshot であり SIGHUP では再読込しない。SIGHUP は key source の再検証だけを強制する。
 
-- managed mode は、repair のため registry reconciliation 中でも listener と `_` の
-  host shell/exec を利用可能にする。この期間の sandbox 操作は一律 unavailable とする。
-- sandbox-only mode は reconciliation 完了後に listener を公開する。
-- backend initialization に失敗しても daemon 自体は起動できる。host mode と、
-  reconciliation 後の認可済み metadata list/delete は利用できるが、sandbox launch は
-  fail closed する。backend は起動時に一度だけ構築し、接続ごとに再構築せず、process 起動の
-  復旧には daemon restart が必要である。
-- 複数 listen address の bind は all-or-nothing である。一つでも失敗すれば起動しない。
+sandbox backend preflight が利用不能な場合、sandbox shell/exec は fail closed にする。host mode や metadata operationへ unconfined sandbox fallback はしない。
 
-同じ data root または同じ state root を使う二つ目の daemon は、別 listener でも lock
-acquisition に失敗して起動しない。
-lock file の存在だけでは所有を判断せず、OS advisory lock の保持を判断基準にする。
+## 6. Atomic claim and ownership
 
-## 6. Atomic create
+最初に valid key で sandbox ID に接続した principal が owner claim を作る。claim は atomic global reservation と metadata write を経て durable になる。同じ ID への競合 claim は一人だけが成功する。
 
-shell または exec が valid SandboxId を初めて使うときだけ lazy create する。list、delete、
-PTY request 単独は作成しない。
-
-1. ID の keyed lock を取得し、path と metadata を再確認する。
-2. valid Active record があれば owner/admin authorization を行い、sandbox count を消費せず
-   process admission へ進む。
-3. valid Deleting record または corrupt entry があれば拒否する。
-4. absent の場合だけ caller の owner/global sandbox count を atomic に予約する。上限到達時は
-   directory を作らず拒否する。
-5. sandbox directory と `workspace/` を mode `0700` で作る。
-6. caller fingerprint を owner とする Active metadata を temporary file に完全に書く。
-7. file を `fsync`、`metadata.toml` へ atomic rename、parent directory を `fsync` する。
-8. lock を保持したまま committed record を再読して sandbox count reservation を確定する。
-9. process capacity を予約し、runtime registry に cancel 可能な `Launching` marker を置く。
-10. keyed lock と capacity/registry lock を解放して process launch を開始する。
-11. launch 完了後に keyed lock を取り直す。record がまだ Active なら marker を
-    `RunningProcess` に置き換え、Deleting なら起動直後の process を回収する。
-
-metadata publish より前に失敗した場合は count reservation を必ず解放する。publish 後は
-process launch が失敗しても sandbox count と owner record を保持する。delete 完了時だけ
-対応する count を減らす。すべての create/delete は keyed ID lock の後に count state を
-更新する同じ lock order を守る。launch failure/cancel は process reservation と marker を
-必ず解放する。delete は `Launching` marker も対象 workload として cancel または完了待ちし、
-起動途中の process を取り逃がさない。
-
-同じ ID を異なる key が同時に要求した場合、metadata を先に publish した一方だけが owner
-となる。敗者には対象の存在や owner を明かさない一般的な拒否を返す。最初の process
-launch が失敗しても、commit 済み sandbox と workspace は残し、同じ owner が再試行できる。
-
-partial directory や不正 metadata は自動消去しない。管理者は `_` の host access または
-out-of-band access で調査・修復する。
+owner だけが通常の shell/exec と delete を行える。admin は管理 route を持つが、identity/ownership の記録を曖昧にしない。
 
 ## 7. Process launch
 
-各 launch は次を行う。
+一つの SSH shell/exec channel は一つの launch に対応する。同一 sandbox で複数 channel/process を並行実行でき、共有するのは durable workspace だけである。
 
-- sandbox workspace を process の `HOME` と初期 cwd にする。
-- configured sandbox shell、固定の managed environment、validated sandbox environment、
-  `[sandbox] network` policy、read-only paths、built-in resource limits を shbox domain value から組み立てる。
-- workspace だけを sandbox 固有の read/write tree とする。
-- `Config.env` による `HOME` 上書きを使う現在の Arapuca behavior は固定 revision 上で
-  Linux/macOS integration test を行い、上流の未固定契約として一般化しない。
-- PTY の rows/columns と terminal modes は固定 revision の `launch()` が target を spawn
-  して master FD を返した直後に適用する。I/O bridge より前には反映するが、target の
-  最初の命令より前であることは v0.1 の契約にしない。
-- channel state は desired PTY size の revision を持つ。`pty-req` 後、master 生成前または
-  launch 中の `window-change` も state を更新し、launcher は最新 revision の適用を確認して
-  から running/bridge-ready を publish する。PTY 未要求の resize は state を変えない。
-- SSH client の `env` request はすべて拒否する。
+launch ごとの disposable state:
 
-Arapuca `task_id` は registry ID ではない。launch ごとに
-`<sandbox-id>-<32 lowercase hexadecimal characters>` を生成する。active set と照合して
-衝突時は再生成し、128 bytes 以下かつ `[A-Za-z0-9-]+` を再検証する。外部 ID の最大長が
-64 bytes なので上限内に収まる。監査上の相関には外部 SandboxId、connection/channel ID、
-process ID を別々に使う。
+- direct child + process group/session
+- PTY master/slave（PTY request 時）
+- stdin/stdout/stderr pipes（non-PTY 時）
+- private `TMPDIR`
+- runtime lease
 
-同じ workspace への複数同時 read/write process を許す。shbox は file lock、transaction、
-single-writer policy を提供しない。競合時の内容は application と filesystem の semantics
-に従う。
+workspace は `HOME` と initial `PWD` になる。shell は `SHELL`。PTY request があると `TERM` は request 値が authoritative で、`TMPDIR` は shbox の private launch directory が authoritative である。
 
-## 8. Runtime ownership and cleanup
+## 8. PTY lifecycle
 
-runtime registry は process を sandbox ID と channel ID の両方から引けるようにする。
-`Process` handle を channel callback の一時 borrow に結び付けず、I/O task と cleanup task が
-所有できる形にする。
+PTY は SSH の first-class feature であり shbox が直接実装する。
 
-- channel close/disconnect: その channel の process だけを停止する。
-- client EOF: 既受信入力を drain して新規入力を停止し、process output と終了通知を
-  継続する。非 PTY は stdin pipe を閉じる。PTY は write 用 master duplicate だけを
-  閉じ、read/lifecycle 用 duplicate を保持し、child EOF を保証せず `VEOF` を合成しない。
-- delete: 対象 sandbox の全 process/channel を停止する。他 sandbox や SSH connection 全体は
-  閉じない。delete request 自身の管理 channel は結果の EOF/status/close まで維持する。
-- graceful daemon shutdown: 新規 request を停止し、全 runtime process を並列に終了する。
-- process completion: output を drain し、SSH EOF、exit-status または exit-signal、channel
-  close の順で通知する。
+1. parent が PTY pair を allocate
+2. request terminal modes と initial rows/columns を slave に設定
+3. child setup 専用 FD を CLOEXEC で予約
+4. child が slave を fd 0/1/2 へ duplicate
+5. child が新しい session を作り controlling terminal を取得
+6. parent は slave/setup FD を閉じ、master だけを lifecycle ownership として保持
+7. stdout/stderr は terminal stream として merge
+8. `window-change` は master への ioctl で size を更新
+9. SSH signal request は foreground process groupへ転送
 
-通常停止は process group へ終了要求を送り、最大 5 秒待ち、その後 group 全体を強制終了する。
-Linux は Arapuca の cgroup/process-group cleanup と組み合わせる。macOS は shbox Adapter が
-明示的な process-group cleanup を補い、同じ契約を満たす。daemon crash、descendant、setsid
-相当の hostile case を実機試験し、満たさない OS/version/architecture は正式対応にしない。
+interactive shell の job control、Ctrl-C、Ctrl-Z、`jobs`/`fg`/`bg` は OS の controlling-terminal/foreground-PGID semantics をそのまま使う。
 
-Tokio worker 上で blocking `Process::wait()` を直接実行しない。専用 blocking task を使い、
-process/PTY FD の lifetime を wait/cleanup より短くしない。
+## 9. Process control and cleanup
 
-## 9. Delete and recovery
+normal completion では direct child を必ず一度 reap し、残る owned process group を force-cleanup して private temp を削除する。
 
-delete は valid ID ごとの keyed lock で開始し、一つの in-memory delete lease を作る。同じ ID の
-別 delete はその lease の結果を共有するか、完了後に idempotent retry する。
+channel close/client disconnect/delete/daemon shutdown では managed process groupへ graceful termination を送り、grace period 後に kill へ escalate する。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task が disconnect を観測できるようにする。
 
-1. metadata を検証する。absent、または通常 key が所有しない valid record なら、存在を
-   明かさず成功 no-op とする。
-2. authorized `Active` record は owner fingerprint を保持したまま durable に `Deleting` へ
-   更新する。既に valid `Deleting` なら、保存された owner fingerprint で owner/admin を
-   認可し、state を再書込みせず step 3 から再開する。startup reconciliation は durable な
-   delete intent として caller 無しで step 3 から再開する。
-3. runtime registry から `Launching` marker と process handle を drain する。
-4. keyed/registry lock を解放し、対象 launch を cancel して process を並列に graceful stop し、
-   5 秒後に強制終了する。
-5. delete lease の所有下で no-follow の tree walk により workspace と sandbox directory を削除する。
-6. sandboxes root directory を `fsync` して Absent を commit し、count と lease を解放する。
+Linux direct sandbox child は parent-death signal を設定するため daemon の abrupt deathでも direct child cleanupを補助する。
 
-途中で失敗した場合は Deleting のまま残し、list から隠し、新規 launch を拒否する。startup
-reconciliation または owner/admin による再度の delete が同じ手順を idempotent に再開する。
-成功後の trash、undo、自動 backup は提供しない。
+### 9.1 重要な containment limit
 
-## 10. List semantics
+process-group cleanup は cgroup tree containment と同一ではない。sandbox descendant が自ら `setsid()` して新しい session/process groupへ deliberate に detach した場合、shbox の元 process group cleanup から外れ得る。
 
-list の正本は request 開始時に読み取れた valid Active metadata の集合である。Arapuca の
-process list や directory 名だけを正本にしてはならない。
+filesystem/network confinement は子孫へ継承されるが、process-tree lifecycle の強制回収を cgroup 相当として主張しない。この差は security/release 文書と Fly acceptance で明示的に試験する。
 
-- 通常 key: owner fingerprint が一致する Active ID だけ
-- admin key: 全 Active ID
-- Deleting、corrupt、metadata 欠落: 非表示
-- result: case-sensitive ASCII byte order、重複なし、request 開始時点の近似 snapshot
+## 10. Delete and recovery
 
-同時 create/delete を全体 lock で停止しない。各 ID の atomic metadata publish と状態を
-使って一貫した各 entry を読み、集合全体について linearizable snapshot は約束しない。
+delete は runtime と persistent state の競合を避ける。
 
-## 11. 鍵の更新と shutdown
+1. Active metadata を Deleting に durable transition
+2. new launch を拒否
+3. registered runtime leases を terminate/force cleanup
+4. workspace tree を安全に削除
+5. metadata を削除
+6. global reservation を解放
 
-config file、sandbox policy、組み込み caps/limits は process-lifetime であり、再読込は
-一切行わない。適用には daemon の restart が必要である。再読込の対象は鍵 file だけである。
-`KeyStore` は公開鍵認証要求のたびに両鍵 file の identity（device/inode/ctime/size、欠落を含む）
-を比較し、変化があれば `SIGHUP` なしで両 source を読み直して全検証し、成功した場合だけ
-immutable snapshot を atomic に交換する。失敗時は旧 snapshot を保持し、観測した identity を
-採用して次の変化まで再 parse しない。`SIGHUP` は identity が不変でも次の認証要求で強制
-再検証を行う手動 trigger であり、config は読み直さない。
+途中 crash では `Deleting` record が restart 後の再開点になる。target workspace が既に無い場合も idempotent に完了する。
 
-鍵更新の適用範囲は次のとおりである。
+## 11. List semantics
 
-- 新しい認証要求: 現時点の auth/admin snapshot
-- 既存 connection: 認証時の principal/role を切断まで保持
-- 実行中 process: 変更しない
-- `listen`、`log_level`、`[sandbox] network` と built-in capacity/limits: 固定。config file
-  を書き換えても稼働中の daemon には適用されない
-- host key、storage root、Arapuca backend: 固定、更新しない
+`list` は current principal から見える valid Active metadata の ID を sorted で返す。corrupt/unsafe entry は公開せず、勝手に修復して ownership を推測しない。
 
-最後の admin を鍵 file から削除すると、新しい host route 認証だけが拒否される。起動時に
-決めた managed/sandbox-only mode、listener、reconciliation 動作は変わらない。既存 admin
-connection の host 権限は切断まで残る。
+## 12. Shutdown
 
-`SIGINT`/`SIGTERM` の最初の受信で新規 connection/request を停止し、全 runtime process を
-並列に終了し、最大 5 秒で強制終了して listener と lock を閉じる。二回目の signal は即時
-終了する。metadata/workspace は削除しない。
+最初の SIGINT/SIGTERM は listener を止め、host/sandbox runtime を drain する。二回目の shutdown signal は force-stop pathへ移る。
 
-## 12. Concurrency invariants
+host process も sandbox process も direct child ownership と process-group cleanupを持つ。正常 shutdown は waiter/cleanup completion を待つ。
 
-実装と test は最低限、次の不変条件を守る。
+## 13. Concurrency invariants
 
-1. 一つの SandboxId に durable owner は高々一つである。
-2. Active と Deleting の process admission は同時に成立しない。
-3. 非 owner の結果から ID の存在、owner、state を判別できない。
-4. list は corrupt/partial/deleting entry を返さない。
-5. management path 操作は sandboxes root の外へ出ない。
-6. process handle を失う前に cleanup ownership が別 task へ移る。
-7. bounded queue の上限を超えて SSH/process I/O を蓄積しない。
-8. 異なる ID は独立して進行でき、一つの遅い delete が全体を停止しない。
-9. Arapuca backend instance は process lifetime に一つだけである。
-10. operational error と remote input は daemon-wide panic を起こさない。
+- global connection/channel/process/sandbox caps は atomic に enforce する。
+- one sandbox は複数 runtime leases を持てる。
+- delete は new launch と競合しても最終的に全 lease を停止する。
+- PTY slave/setup descriptors は spawn 後 parent に残さない。
+- concurrent PTYs は controlling terminal、foreground PGID、window size、signals を共有しない。
+- one connection の teardown はその connection の channel mailboxes を確実に閉じる。
 
-複数 lock が必要な操作は、次の取得順序に固定する。
+## 14. Error and panic policy
 
-1. 対象 SandboxId の keyed lifecycle lock
-2. global/per-owner capacity ledger（sandbox count と process reservation）
-3. 対象 ID の runtime process registry shard
+remote input、authorization denial、unsupported request、sandbox policy/preflight failure、I/O failure は operational error であり daemon panic にしない。client へは sensitive path/backend detail を出さず generic failure と protocol status/signalを返す。
 
-逆順取得は禁止する。process completion のように runtime registry から始まる callback が
-lifecycle lock を必要とする場合は、registry から必要な value を取り出して lock を解放してから
-lifecycle lock を取得する。複数 ID の lock を同時保持せず、delete は registry から process
-handle/marker を drain して registry lock を解放してから停止を await する。capacity ledger と
-runtime registry の lock は、SSH I/O、filesystem I/O、process spawn/wait、5 秒 deadline を
-await したまま保持しない。
-
-keyed lifecycle lock を保持した短い in-memory critical section では、上記の順序で capacity
-ledger と runtime registry も一時的に取得し、reservation と `Launching` marker を atomic に
-publish してよい。blocking work を始める前に ledger/registry lock は必ず解放する。
-
-keyed lifecycle lock は同じ ID の durable metadata transaction を直列化するため、その bounded
-storage operation の完了まで単独で保持してよい。この場合、blocking filesystem work 全体を
-専用 blocking task へ渡す。process spawn/wait、channel I/O、5 秒 cleanup、recursive workspace
-delete の間は keyed lock も保持せず、先に Active/Deleting や `Launching` marker を publish して
-他 request が判断できるようにする。reservation を作った関数が、durable commit または runtime
-registry 登録に ownership を移すまで、その解放責任を持つ。
-
-## 13. Error and panic policy
-
-remote input 不正、権限拒否、limit 超過、I/O failure、Arapuca launch failure は通常エラーで
-あり、request/channel/connection の最小範囲に閉じ込める。client には安定した一般的な文言と
-exit status を返し、host path、fingerprint、内部 source chain を返さない。
-
-型と状態機械が保証する内部不変条件の破壊だけを panic 対象とする。invariant panic は location
-と backtrace を log した後、状態不明のまま処理を続けず daemon を abort する。詳細な logging
-契約は [security.md](security.md) と [configuration.md](configuration.md) を参照する。
+panic/abort は内部 invariant 破壊に限定する。
