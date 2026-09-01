@@ -1281,7 +1281,13 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - `scripts/verify-macos-platform` now checks native arm64/fixed macOS major/Rust 1.95, proves `/usr/bin/sandbox-exec` enforcement with separate allow and `/etc` deny smoke profiles, audits out selfexec control paths, and runs the full native SSH/PTTY suite.
   - The macOS 26 arm64 gate exits 0 with 157 unit + 6 CLI + 29 OpenSSH integration tests, release build, and `cargo check --all-targets` passing.
   - Both verification scripts force `umask 077` to match the deployed daemon file-safety context; systemd retains `KillMode=control-group` only as service-manager cleanup and has no controller delegation requirement.
-- [ ] Milestone 8 CI gates.
+- [x] Milestone 8 CI gates.
+  - `.github/workflows/m8-release-gate.yml` now makes Rust 1.95 the required baseline for quality/build jobs, preserves a stable forward-compatibility quality job, and preserves native build coverage for Linux x86_64, Linux aarch64, and macOS arm64.
+  - Linux x86_64/aarch64 are blocking **native confinement** jobs that execute `scripts/verify-linux-platform`; macOS 15/26 arm64 are blocking native Seatbelt jobs that execute `scripts/verify-macos-platform`. Compile-only jobs are kept separate and are not treated as confinement evidence.
+  - CI rejects reintroduced Arapuca/Sandlock/sibling-runner/selfexec/external-sandbox-CLI/cgroup-control production paths before the build/test gates.
+  - PR run `33518661744` at `aff82c4` passed every job: Rust 1.95 + stable quality gates, all three supported-target builds, and all four native platform gates.
+  - GitHub Linux x86_64 and aarch64 runners both reported kernel `6.17.0-1022-azure`, nono `0.74.0`, Landlock ABI V6, network/scoping support enabled, and no seccomp network fallback; both full native OpenSSH/PTTY gates passed.
+  - GitHub macOS arm64 gates passed on macOS `15.7.7` and `26.5.2`; both proved Seatbelt deny/allow enforcement before the full OpenSSH/PTTY suite.
 - [ ] Milestone 9 Fly acceptance.
 - [ ] Milestone 10 docs.
 - [ ] Milestone 11 final audit.
