@@ -3,15 +3,20 @@
 //! The process adapters deliberately keep the PTY master in their own
 //! lifetime.  This module contains only the small amount of OS glue needed to
 //! duplicate that master, apply the SSH-requested terminal state, and expose
-//! nonblocking descriptors to Tokio.
+//! nonblocking descriptors to Tokio, and a small, audited post-fork child
+//! helper that establishes the session and controlling terminal.
+//!
+//! PTY ownership is shbox's: the launchers allocate the pair, apply the
+//! SSH-requested terminal state before spawn, keep only the master plus the
+//! lifecycle duplicates, and close every parent-held slave descriptor after
+//! the child is running.
 
+use russh::Pty;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-
-use russh::Pty;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -368,6 +373,191 @@ impl AsyncWrite for PtyIo {
     }
 }
 
+/// A shbox-owned PTY pair.
+///
+/// `master` is the daemon-side endpoint that lives for the whole session.
+/// `slave` is the parent's reference to the terminal device. Both parent-held
+/// descriptors are close-on-exec; the child receives only explicit duplicates
+/// prepared for its stdio and controlling-terminal setup.
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PtyPair {
+    master: OwnedFd,
+    slave: OwnedFd,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PtyPair {
+    /// Allocate a PTY and fully prepare the terminal state before spawning.
+    pub(crate) fn open(modes: &[(Pty, u32)], rows: u32, cols: u32) -> io::Result<PtyPair> {
+        let pair = nix::pty::openpty(None, None).map_err(|_| io::Error::last_os_error())?;
+        let master: OwnedFd = pair.master;
+        let slave: OwnedFd = pair.slave;
+
+        // Neither parent-held endpoint may leak across exec. In particular,
+        // an inherited master would keep the PTY alive after the daemon drops
+        // its copy, suppressing the EOF/SIGHUP semantics expected by the
+        // session child.
+        set_cloexec(master.as_raw_fd())?;
+        set_cloexec(slave.as_raw_fd())?;
+
+        // The requested session state exists before user code can observe
+        // the terminal. Zero dimensions keep the allocation default.
+        apply_terminal_modes(master.as_raw_fd(), modes)?;
+        apply_window_size(master.as_raw_fd(), rows, cols)?;
+        Ok(PtyPair { master, slave })
+    }
+
+    pub(crate) fn master(&self) -> RawFd {
+        self.master.as_raw_fd()
+    }
+
+    /// Reserve the explicit close-on-exec child setup descriptor.
+    ///
+    /// The child setup path must not rely on undocumented stdio setup
+    /// ordering, so it is handed a dedicated duplicate with a stable number
+    /// instead of guessing which descriptor became fd 0.
+    pub(crate) fn reserve_setup_fd(&self) -> io::Result<OwnedFd> {
+        // SAFETY: fcntl duplicates the owned, open slave descriptor with
+        // close-on-exec applied atomically.
+        let duplicate = unsafe { libc::fcntl(self.slave.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+
+    /// The parent's slave reference for tests: kernel-side probes and stdio
+    /// duplicates for probe children. Production launchers only ever use the
+    /// reserved setup duplicate.
+    #[cfg(test)]
+    pub(crate) fn slave_for_tests(&self) -> RawFd {
+        self.slave.as_raw_fd()
+    }
+
+    /// Consume the pair into the daemon-owned master descriptor. Dropping
+    /// the pair closes the parent's slave reference, which is the documented
+    /// post-spawn step: every child inherits the terminal only through the
+    /// reserved setup descriptor and its own stdio duplicates.
+    pub(crate) fn into_master(self) -> OwnedFd {
+        self.master
+    }
+}
+
+impl std::fmt::Debug for PtyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyPair")
+            .field("master", &self.master.as_raw_fd())
+            .finish_non_exhaustive()
+    }
+}
+
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl reads flags of an owned, valid descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl updates only the close-on-exec bit.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Fixed-size stage tag for a child setup failure, reported through the
+/// launch status pipe without any formatting or allocation.
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildSetupStage {
+    Session,
+    ControllingTerminal,
+}
+
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildSetupError {
+    pub(crate) stage: ChildSetupStage,
+    pub(crate) errno: i32,
+}
+
+/// Establish the child's Unix session and (optionally) its controlling
+/// terminal. Post-fork safe by construction.
+///
+/// Audit of every operation performed here:
+/// - `dup2(setup_fd, 0/1/2)`: fixed-data raw syscall, no allocation.
+/// - `close(setup_fd)`: raw syscall.
+/// - `setsid()`: raw syscall; makes the child session leader and process
+///   group leader. No `setpgid()` follows — `setsid()` already made it the
+///   group leader of its new group.
+/// - `ioctl(fd, TIOCSCTTY, 0)`: raw syscall. As the first session leader to
+///   acquire an unowned terminal, the kernel makes the caller's new process
+///   group the terminal's foreground group; `tcsetpgrp()` would be
+///   redundant, so it is deliberately not called.
+///
+/// Errors are returned as a fixed-size stage/errno pair; nothing here
+/// formats strings, locks, logs, allocates, or touches Tokio.
+///
+/// # Safety
+/// Must run in the post-fork child before `exec`, with `setup_fd` referring
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) unsafe fn child_session_setup(
+    setup_fd: RawFd,
+    acquire_controlling_terminal: bool,
+) -> Result<(), ChildSetupError> {
+    // SAFETY: the closure of each syscall is documented in the function
+    // contract; every call uses fixed data and the caller-owned descriptor.
+    unsafe {
+        for target in [0, 1, 2] {
+            if libc::dup2(setup_fd, target) == -1 {
+                return Err(child_setup_error(ChildSetupStage::Session));
+            }
+        }
+        if libc::close(setup_fd) == -1 && errno() != libc::EBADF {
+            return Err(child_setup_error(ChildSetupStage::Session));
+        }
+        if libc::setsid() == -1 {
+            return Err(child_setup_error(ChildSetupStage::Session));
+        }
+        if acquire_controlling_terminal
+            && libc::ioctl(
+                0,
+                libc::TIOCSCTTY as libc::c_ulong,
+                std::ptr::null_mut::<libc::c_void>(),
+            ) == -1
+        {
+            return Err(child_setup_error(ChildSetupStage::ControllingTerminal));
+        }
+    }
+    Ok(())
+}
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+fn child_setup_error(stage: ChildSetupStage) -> ChildSetupError {
+    ChildSetupError {
+        stage,
+        errno: errno(),
+    }
+}
+
+// Consumed by the Linux/macOS launchers (Milestones 3-4); removed there.
+#[cfg_attr(not(test), allow(dead_code))]
+fn errno() -> i32 {
+    // SAFETY: both libc entry points return the calling thread's errno slot.
+    // Reading the integer is allocation-free and safe in the post-fork child.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location()
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        *libc::__error()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +613,201 @@ mod tests {
         let mut state = unsafe { std::mem::zeroed::<libc::termios>() };
         assert_eq!(unsafe { libc::tcgetattr(slave, &mut state) }, 0);
         assert_eq!(state.c_cc[libc::VINTR] as libc::c_long, expected);
+    }
+
+    /// The shell used by probe children. Every probe execs a real program
+    /// after the audited setup: `Command::spawn` waits for the exec, so a
+    /// blocking pre-exec closure would deadlock the parent.
+    const PROBE_SHELL: &str = "/bin/sh";
+
+    /// Poll a predicate for up to five seconds.
+    fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        predicate()
+    }
+
+    /// Wait for a child with a deadline; kills it on timeout and returns
+    /// `None` so the assertion names the hang, not the test harness.
+    fn wait_with_timeout(
+        child: &mut std::process::Child,
+        secs: u64,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            if let Some(status) = child.try_wait().expect("probe try_wait") {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Fork a real child through the same pre-exec seam the launchers use:
+    /// the audited session setup runs in the child, then the probe shell
+    /// execs with the PTY slave as fd 0/1/2.
+    fn spawn_setup_child(
+        pair: &PtyPair,
+        acquire_controlling_terminal: bool,
+        script: &str,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let setup = pair.reserve_setup_fd().expect("reserve setup fd");
+        let setup_fd = setup.as_raw_fd();
+        let stdin = duplicate_fd(pair.slave_for_tests()).expect("slave stdin dup");
+        let stdout = duplicate_fd(pair.slave_for_tests()).expect("slave stdout dup");
+        let stderr = duplicate_fd(pair.slave_for_tests()).expect("slave stderr dup");
+
+        let mut command = Command::new(PROBE_SHELL);
+        command.arg("-c").arg(script);
+        command.stdin(Stdio::from(stdin));
+        command.stdout(Stdio::from(stdout));
+        command.stderr(Stdio::from(stderr));
+        // SAFETY: the closure runs in the post-fork child before the exec
+        // and only calls the audited, non-blocking session setup helper.
+        unsafe {
+            command.pre_exec(move || {
+                child_session_setup(setup_fd, acquire_controlling_terminal)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
+            });
+        }
+        command.spawn().expect("spawn probe child")
+    }
+
+    #[test]
+    fn pty_child_becomes_session_leader_with_controlling_terminal() {
+        let pair =
+            PtyPair::open(&[(Pty::ECHO, 0), (Pty::ICANON, 0)], 40, 100).expect("owned pty open");
+        let mut child = spawn_setup_child(&pair, true, "sleep 30");
+        let pid = child.id() as libc::pid_t;
+
+        // The exec'd shell is the session leader of a fresh session.
+        assert!(
+            wait_until(|| unsafe { libc::getsid(pid) } == pid),
+            "child must be a session leader"
+        );
+
+        // The PTY is the controlling terminal of that session, and the
+        // child's new group is the terminal's foreground group. TIOCSCTTY
+        // sets the foreground group as the first session leader to acquire
+        // an unowned terminal; tcsetpgrp is deliberately never called.
+        let slave = pair.slave_for_tests();
+        assert!(wait_until(|| unsafe { libc::tcgetsid(slave) } == pid as i32));
+        assert!(wait_until(
+            || unsafe { libc::tcgetpgrp(pair.master()) } == pid
+        ));
+
+        // Window size and terminal modes were applied before the spawn.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(pair.master(), libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!((size.ws_row, size.ws_col), (40, 100));
+        let mut state: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut state) }, 0);
+        assert_eq!(state.c_lflag & libc::ECHO, 0);
+        assert_eq!(state.c_lflag & libc::ICANON, 0);
+
+        child.kill().expect("kill probe child");
+        child.wait().expect("reap probe child");
+    }
+
+    #[test]
+    fn pty_child_without_ctty_acquisition_has_no_controlling_terminal() {
+        let pair = PtyPair::open(&[], 24, 80).expect("owned pty open");
+        let mut child = spawn_setup_child(&pair, false, "sleep 30");
+        let pid = child.id() as libc::pid_t;
+
+        assert!(wait_until(|| unsafe { libc::getsid(pid) } == pid));
+        // The session exists, but the terminal is not attached to that
+        // session. Darwin reports an unattached terminal as 0 while Linux may
+        // report -1/ENOTTY, so assert the semantic invariant rather than a
+        // platform-specific sentinel value.
+        assert_ne!(unsafe { libc::tcgetsid(pair.slave_for_tests()) }, pid);
+        assert_ne!(unsafe { libc::tcgetpgrp(pair.master()) }, pid);
+
+        child.kill().expect("kill probe child");
+        child.wait().expect("reap probe child");
+    }
+
+    #[test]
+    fn pty_child_observes_terminal_devices_and_requested_state() {
+        let pair =
+            PtyPair::open(&[(Pty::ECHO, 0), (Pty::ICANON, 0)], 40, 100).expect("owned pty open");
+        let script = concat!(
+            "[ -t 0 ] || exit 11\n",
+            "[ -t 1 ] || exit 12\n",
+            "[ -t 2 ] || exit 13\n",
+            "echo TTY_OK\n",
+            "stty size\n",
+            "stty -a\n",
+        );
+        let mut child = spawn_setup_child(&pair, true, script);
+
+        // Collect everything the child writes to the slave through the
+        // master until the child exits and the master reports end of stream.
+        let master = duplicate_fd(pair.master()).expect("master dup");
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0u8; 256];
+            // SAFETY: the loop owns the duplicated master descriptor.
+            let master = master;
+            loop {
+                // SAFETY: read into the fixed stack buffer of the owned fd.
+                let count = unsafe {
+                    libc::read(master.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len())
+                };
+                if count <= 0 {
+                    break;
+                }
+                output.extend_from_slice(&chunk[..count as usize]);
+            }
+            output
+        });
+
+        let status = wait_with_timeout(&mut child, 15).expect("probe shell did not exit");
+        assert!(status.success(), "isatty checks failed: {status:?}");
+        let output = reader.join().expect("reader thread");
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("TTY_OK"), "child output: {text:?}");
+        assert!(text.contains("40 100"), "stty size missing: {text:?}");
+        assert!(text.contains("-icanon"), "icanon not cleared: {text:?}");
+        assert!(text.contains("-echo"), "echo not cleared: {text:?}");
+    }
+
+    #[test]
+    fn closing_the_master_terminates_slave_reads() {
+        let pair = PtyPair::open(&[], 24, 80).expect("owned pty open");
+        let script = "read -r line\necho AFTER_READ:$?\n";
+        let mut child = spawn_setup_child(&pair, true, script);
+        use std::os::unix::process::ExitStatusExt;
+
+        // Production launchers consume the pair after spawn so the parent
+        // closes its slave immediately and retains only the daemon-side
+        // master. Let the shell park in read(2), then close that master.
+        let master = pair.into_master();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(master);
+
+        // The blocked slave read must end (EOF on macOS, EIO on Linux, or a
+        // SIGHUP delivery). Ten seconds of silence means the read hung.
+        let status =
+            wait_with_timeout(&mut child, 10).expect("slave read must end when the master closes");
+        assert!(
+            status.code().is_some() || status.signal() == Some(libc::SIGHUP),
+            "unexpected exit status: {status:?}"
+        );
     }
 }

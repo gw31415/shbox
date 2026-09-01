@@ -1254,7 +1254,7 @@ No release is accepted while a PTY cell marked required is failing or skipped.
 - [x] Decision: macOS keeps shbox-owned PTY and Seatbelt/sandbox-exec rather than post-fork nono `sandbox_init()`.
 - [x] Milestone 0 implementation verification in the repository.
 - [x] Milestone 1 common policy extraction.
-- [ ] Milestone 2 shbox-owned PTY implementation.
+- [x] Milestone 2 shbox-owned PTY implementation.
 - [ ] Milestone 3 Linux nono launcher.
 - [ ] Milestone 4 macOS Seatbelt launcher.
 - [ ] Milestone 5 Arapuca/cgroup/limit removal.
