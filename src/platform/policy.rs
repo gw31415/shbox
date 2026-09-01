@@ -377,12 +377,15 @@ fn remove_launch_temp_tree(path: &Path) -> std::io::Result<()> {
 
 /// Validate the remote command payload for `shell -c` execution.
 ///
-/// The contract is unchanged from the previous backend: at most 32 KiB, no
-/// NUL bytes, and UTF-8 (the shell `-c` contract is UTF-8). Shell operations
-/// return `None` and keep the login-shell behavior of the caller.
+/// The payload is an opaque SSH byte string: at most 32 KiB and no NUL
+/// bytes, but not necessarily UTF-8. The exact bytes become the single
+/// `-c` argument and quoting, encoding, and interpretation stay the
+/// selected shell's responsibility. Shell operations return `None` and
+/// keep the login-shell behavior of the caller.
 pub(crate) fn validated_shell_command(
     operation: &LaunchOperation,
-) -> Result<Option<String>, LaunchError> {
+) -> Result<Option<std::ffi::OsString>, LaunchError> {
+    use std::os::unix::ffi::OsStrExt;
     match operation {
         LaunchOperation::Shell => Ok(None),
         LaunchOperation::Exec(bytes) => {
@@ -392,11 +395,21 @@ pub(crate) fn validated_shell_command(
             if bytes.contains(&0) {
                 return Err(LaunchError::new("sandbox command contains NUL"));
             }
-            Ok(Some(String::from_utf8(bytes.clone()).map_err(|_| {
-                LaunchError::new("sandbox command is not valid UTF-8")
-            })?))
+            Ok(Some(std::ffi::OsStr::from_bytes(bytes).to_os_string()))
         }
     }
+}
+
+/// OpenSSH-style login shell name: the `-<basename>` string the caller
+/// installs as `argv[0]` so the shell starts in login mode without any
+/// shell-specific option.
+pub(crate) fn login_shell_argv0(shell: &Path) -> Result<std::ffi::OsString, LaunchError> {
+    let name = shell
+        .file_name()
+        .ok_or_else(|| LaunchError::new("sandbox shell path has no file name"))?;
+    let mut argv0 = std::ffi::OsString::from("-");
+    argv0.push(name);
+    Ok(argv0)
 }
 
 #[cfg(test)]
@@ -628,15 +641,32 @@ mod tests {
     }
 
     #[test]
-    fn command_validation_rejects_oversized_nul_and_non_utf8() {
+    fn command_validation_rejects_oversized_and_nul_but_preserves_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
         assert_eq!(
             validated_shell_command(&LaunchOperation::Shell).expect("shell"),
             None
         );
         let ok = LaunchOperation::Exec(b"echo hi".to_vec());
         assert_eq!(
-            validated_shell_command(&ok).expect("valid command"),
-            Some("echo hi".to_string())
+            validated_shell_command(&ok)
+                .expect("valid command")
+                .expect("exec has a command")
+                .as_os_str()
+                .as_bytes(),
+            b"echo hi"
+        );
+        // SSH exec carries an opaque byte string; non-UTF-8 payloads are
+        // passed through byte-for-byte, never validated or transcoded.
+        let non_utf8 = LaunchOperation::Exec(vec![b'x', 0xff, 0xfe, b'y']);
+        assert_eq!(
+            validated_shell_command(&non_utf8)
+                .expect("raw bytes are valid")
+                .expect("exec has a command")
+                .as_os_str()
+                .as_bytes(),
+            &[b'x', 0xff, 0xfe, b'y']
         );
         let oversized = LaunchOperation::Exec(vec![b'a'; MAX_COMMAND_BYTES + 1]);
         assert_eq!(
@@ -652,12 +682,19 @@ mod tests {
                 .map(|e| e.to_string()),
             Some("sandbox command contains NUL".to_string())
         );
-        let non_utf8 = LaunchOperation::Exec(vec![0xff, 0xfe]);
-        assert_eq!(
-            validated_shell_command(&non_utf8)
-                .err()
-                .map(|e| e.to_string()),
-            Some("sandbox command is not valid UTF-8".to_string())
+    }
+
+    #[test]
+    fn login_shell_argv0_uses_the_leading_dash_basename_form() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let argv0 = login_shell_argv0(Path::new("/bin/zsh")).expect("argv0");
+        assert_eq!(argv0.as_os_str().as_bytes(), b"-zsh");
+        let argv0 = login_shell_argv0(Path::new("/opt/homebrew/bin/fish")).expect("argv0");
+        assert_eq!(argv0.as_os_str().as_bytes(), b"-fish");
+        assert!(
+            login_shell_argv0(Path::new("/")).is_err(),
+            "a path with no file name has no login form"
         );
     }
 }

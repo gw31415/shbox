@@ -29,7 +29,7 @@ use nono::sandbox::{
     SeccompOpts, detect_abi, prepare_seccomp_with_abi,
 };
 
-use super::policy::{LaunchTemp, SandboxLaunchPolicy, validated_shell_command};
+use super::policy::{LaunchTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
 use super::terminal::{ChildSetupStage, PtyIo, PtyPair, child_session_setup, duplicate_fd};
 use super::{
     LaunchError, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessReader,
@@ -208,10 +208,14 @@ impl ProcessLauncher for LinuxLauncher {
         let mut command = Command::new(self.policy.shell());
         match command_arg {
             Some(command_arg) => {
+                // The raw command bytes are the single `-c` argument; this is
+                // not a login shell.
                 command.arg("-c").arg(command_arg);
             }
             None => {
-                command.arg("-l");
+                // Login mode without a shell-specific option: sshd's leading
+                // `-` argv[0] convention, mirroring the host adapter.
+                command.arg0(login_shell_argv0(self.policy.shell())?);
             }
         }
         command.env_clear();
@@ -1115,6 +1119,87 @@ mod tests {
             exit,
             ProcessExit::Code(0),
             "network block probe result: {exit:?}"
+        );
+    }
+
+    /// The exec payload is an opaque byte string: a non-UTF-8 command must
+    /// reach the shell byte-for-byte as the single `-c` argument instead of
+    /// being rejected by a UTF-8 conversion (docs/ssh-protocol.md §5).
+    #[tokio::test]
+    async fn exec_preserves_non_utf8_command_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut command = b"printf %s 'x".to_vec();
+        command.push(0xff);
+        command.push(0xfe);
+        command.extend_from_slice(b"y'");
+        let request = LaunchRequest {
+            sandbox_id: "linux-test".parse().expect("sandbox id"),
+            workspace: workspace.path().to_path_buf(),
+            operation: super::super::LaunchOperation::Exec(command),
+            pty: None,
+        };
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        let mut launched = launcher.launch(request).expect("launch");
+        drop(launched.stdin.take());
+        let mut output = Vec::new();
+        launched
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_end(&mut output)
+            .await
+            .expect("read stdout");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        assert_eq!(output, b"x\xff\xfey", "command bytes must survive exactly");
+    }
+
+    /// A sandbox shell request starts the configured shell in login mode
+    /// through the leading-`-` argv[0], with no shell-specific option
+    /// (docs/ssh-protocol.md §4.1).
+    #[tokio::test]
+    async fn shell_request_starts_a_login_argv0_shell() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let request = LaunchRequest {
+            sandbox_id: "linux-test".parse().expect("sandbox id"),
+            workspace: workspace.path().to_path_buf(),
+            operation: super::super::LaunchOperation::Shell,
+            pty: None,
+        };
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        let mut launched = launcher.launch(request).expect("launch");
+        let mut stdin = launched.stdin.take().expect("stdin");
+        stdin
+            .write_all(b"printf 'argv0=%s\\n' \"$0\"\n")
+            .await
+            .expect("write probe");
+        drop(stdin);
+        let mut output = Vec::new();
+        launched
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_end(&mut output)
+            .await
+            .expect("read stdout");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("argv0=-sh"),
+            "shell must observe login argv[0]: {output:?}"
         );
     }
 }
