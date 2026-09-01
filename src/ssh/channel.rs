@@ -31,6 +31,9 @@ pub(crate) trait ChannelSink: Send + Sync {
     fn data<'a>(&'a self, id: ChannelId, data: Vec<u8>) -> SinkFuture<'a>;
     fn extended_data<'a>(&'a self, id: ChannelId, ext: u32, data: Vec<u8>) -> SinkFuture<'a>;
     fn eof<'a>(&'a self, id: ChannelId) -> SinkFuture<'a>;
+    /// Reply FAILURE to the channel request that started this operation.
+    /// russh only puts the reply on the wire when the client asked for one.
+    fn failure<'a>(&'a self, id: ChannelId) -> SinkFuture<'a>;
     fn exit_status<'a>(&'a self, id: ChannelId, status: u32) -> SinkFuture<'a>;
     fn exit_signal<'a>(
         &'a self,
@@ -52,6 +55,10 @@ impl ChannelSink for Handle {
 
     fn eof<'a>(&'a self, id: ChannelId) -> SinkFuture<'a> {
         Box::pin(async move { self.eof(id).await })
+    }
+
+    fn failure<'a>(&'a self, id: ChannelId) -> SinkFuture<'a> {
+        Box::pin(async move { self.channel_failure(id).await.map_err(|_| ()) })
     }
 
     fn exit_status<'a>(&'a self, id: ChannelId, status: u32) -> SinkFuture<'a> {
@@ -713,14 +720,19 @@ fn normalize_sandbox_exit(
     }
 }
 
-/// A failed channel still completes: generic stderr, EOF, non-zero status,
-/// close, so the client never waits on a channel that quietly stops.
+/// A failed channel still completes: request FAILURE reply, generic stderr,
+/// EOF, exit status, close, so the client never waits on a channel that
+/// quietly stops. The reply is RFC 4254 §5.4's required answer for a
+/// want_reply request that cannot be performed; russh suppresses it when the
+/// client set want_reply=false. Callers must only use this before any
+/// SUCCESS reply was sent.
 pub(crate) async fn finish_failed(id: ChannelId, sink: &dyn ChannelSink) -> ChannelResult {
+    let _ = sink.failure(id).await;
     let _ = sink
         .extended_data(id, 1, b"shbox: request cannot be completed\r\n".to_vec())
         .await;
     let _ = sink.eof(id).await;
-    let _ = sink.exit_status(id, 111).await;
+    let _ = sink.exit_status(id, super::UNAVAILABLE_EXIT).await;
     let _ = sink.close(id).await;
     ChannelResult::Failed
 }
@@ -867,6 +879,7 @@ mod tests {
         Data(Vec<u8>),
         Extended(u32, Vec<u8>),
         Eof,
+        Failure,
         ExitStatus(u32),
         ExitSignal(&'static str, bool),
         Close,
@@ -909,6 +922,11 @@ mod tests {
 
         fn eof<'a>(&'a self, _id: ChannelId) -> SinkFuture<'a> {
             self.record(SinkEvent::Eof);
+            Self::ready()
+        }
+
+        fn failure<'a>(&'a self, _id: ChannelId) -> SinkFuture<'a> {
+            self.record(SinkEvent::Failure);
             Self::ready()
         }
 

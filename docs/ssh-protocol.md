@@ -249,11 +249,11 @@ exit-signal
 channel close
 ```
 
-internal wait/channel failureは255等のgeneric failureへnormalizeし、raw backend errorをclientへ出さない。
+internal wait/channel failureは255のgeneric failureへnormalizeし、raw backend errorをclientへ出さない。
 
 ## 16. Launch failure
 
-requestを実行できない場合、channelをsilent hangさせずgeneric stderr、EOF、non-zero status、closeの順で完了させる。
+requestを実行できない場合、channelをsilent hangさせず、まずrequest自体に `CHANNEL_FAILURE` で応答し(RFC 4254 §5.4、clientが `want_reply=false` の場合はrusshが応答を抑制)、generic stderr、EOF、exit status 255、closeの順で完了させる。
 
 client-visible generic message:
 
