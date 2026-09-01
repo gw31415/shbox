@@ -1,355 +1,280 @@
 # shbox 設定仕様
 
-この文書は shbox v0.1 の TOML 設定と、設定に由来するファイル配置・鍵更新の正本である。外部から見える動作は [product.md](./product.md)、SSH request の詳細は [ssh-protocol.md](./ssh-protocol.md)、OS ごとの適用条件は [platforms.md](./platforms.md) を参照する。
+この文書は v0.1 の公開 TOML schema、CLI override、XDG layout、built-in concurrency cap を定義する。backend 固有 option や sandbox CPU/memory/PID/file quota は公開設定ではない。
 
-## 1. 基本方針
+## 1. 読み込みと lifetime
 
-設定ファイルは任意である。設定ファイルが存在しない場合は、target OS に応じた built-in default で起動する。設定ファイルを使う場合は、`serde` と `toml` による typed parse を行い、未知の field、重複 key、不正な型、不正な値は起動の失敗とする。値を黙って丸めたり、未知の設定を無視したりしない。
+設定は daemon 起動時に一度だけ読み、完全に validation した immutable snapshot として保持する。設定変更を適用するには daemon restart が必要である。SIGHUP は key source の再検証だけを強制し、TOML は再読込しない。
 
-すべての設定は config file に書ける。トップ直下の `listen` と `log_level` には、同じ項目に
-対応する CLI flag（`--listen`、`--log-level`）が上から重なり、指定時は config 値を置き換える。
-CLI はこのトップレベル項目にだけ存在し、`[sandbox]` 以下の項目に対応する flag は意図的に
-作らない。`--network` は存在せず、network policy は `[sandbox] network` だけである。
-これらの operational 設定は process-lifetime であり、config file は daemon 起動時に一度だけ
-読まれる。起動後に config file を書き換えても適用されず、適用には daemon の restart が必要である。
-`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`、必要な場合の `XDG_RUNTIME_DIR` は、
-`xdg` crate の標準的な path 解決だけに使う。shbox の機能設定に `SHBOX_*` や `RUST_LOG` を使わない。
+config file が存在しなければ built-in defaults を使う。存在するが unreadable、unsafe、oversized、invalid TOML の場合は起動失敗であり defaults へ黙って fallback しない。
 
-設定ファイルの最大サイズは 1 MiB である。起動時に読み込めない、parse できない、validation に失敗する設定は、古い設定へ fallback せず明示的に失敗する。config file の再読込は行わない。SIGHUP は鍵 file の再検証だけを強制する（§6）。
+最大 config size は 1 MiB。unknown field はすべて拒否する。
 
-## 2. 完全な v0.1 TOML schema
-
-この例は全 target で使える field を示す。コメントは説明用であり、指定しない
-field は built-in default が適用される。`[sandbox] shell` や `[sandbox] read_paths`
-のような path は、設定ファイルに明示する場合は絶対 path でなければならない。
-文字列配列の項目（`listen`、`[sandbox] read_paths`）は、要素 1 つの配列の代わりに
-単一 string も受け付ける。`listen = "127.0.0.1:2222"` は
-`listen = ["127.0.0.1:2222"]` と同じであり、これ以外の型は parse error になる。
+## 2. 完全な TOML schema
 
 ```toml
-# SSH listener の bind address 配列。省略時は ["0.0.0.0:22"]。
-listen = ["127.0.0.1:2222"]
+# 省略時: ["0.0.0.0:22"]
+listen = ["0.0.0.0:22"]
 
-# daemon log 詳細度。省略時は "info"。
+# error | warn | info | debug | trace
+# 省略時: info
 log_level = "info"
 
 [sandbox]
-# 省略時は daemon OS user の login shell（passwd entry が空なら /bin/sh）。
-# 指定時は絶対 path の executable。
+# 省略時: daemon OS user の login shell。
+# passwd の shell が空なら /bin/sh。
+# 指定時: absolute executable path。
 shell = "/bin/bash"
 
-# sandbox process の network policy。disabled または outbound。省略時は disabled。
+# disabled | outbound
+# 省略時: disabled
 network = "disabled"
 
-# sandbox process に追加する read-only subtree。空配列が default。
-read_paths = []
+# 追加 read-only path。単一 string も一要素配列として受理する。
+# 省略時: []
+read_paths = ["/opt/toolchain"]
 
-# sandbox 全体に注入する環境変数。空 table が default。
 [sandbox.env]
-# LANG = "C.UTF-8"
+# operator が全 sandbox launch に追加する environment。
+# PATH と LANG は必要なら上書きできる。
+PATH = "/usr/local/bin:/usr/bin:/bin"
+LANG = "C.UTF-8"
 ```
 
-`listen` と `log_level` はトップレベルの config 項目であり、同じ項目に対応する CLI flag が
-上から重なる。CLI はこの二つにだけ存在し、`[sandbox]` 以下の項目に対応する flag は作らない。
-例えば次のように起動する。
+この schema 以外の field は v0.1 では存在しない。
 
-```console
-shbox --listen 127.0.0.1:2222 --log-level debug
-```
-
-この file schema 以外の field は v0.1 に存在しない。resource limits/caps や
-`[sandbox]` 項目の CLI flag は存在せず、旧綴り（トップレベルの `sandbox_shell`、
-`read_paths`、`[sandbox_env]`、`network`）も `deny_unknown_fields` により明示的に拒否される。
-`host_key`、`sandbox_root`、`runtime_dir`、`selector`、`uid`、`gid`、`cgroup`、`seccomp`、
-`landlock`、`seatbelt`、`task_id`、`network_proxy_socket` などの内部設定も公開しない。
-
-## 3. Field の意味
+## 3. Top-level fields
 
 ### 3.1 `listen`
 
-SSH listener の bind address 配列で、default は `["0.0.0.0:22"]`。文字列配列項目共通の
-規則に従い、単一 string も受け付ける（`listen = "127.0.0.1:2222"` は
-`listen = ["127.0.0.1:2222"]` と同じ）。CLI `--listen` を一つでも
-指定すると config 値を完全に置き換え、repeat して複数 address を指定できる。複数指定時は
-すべての address を bind できた場合だけ起動を成功とし、一つでも失敗したら全体を失敗させる。
-`2222` などへの自動 fallback はない。IPv6 wildcard は `listen = ["[::]:22"]` または
-`--listen '[::]:22'` のように明示する。空配列、重複、無効な socket address は拒否する。
+`listen` は socket address の一個または配列。default は `0.0.0.0:22`。
 
-listener は process-lifetime の設定であり、起動後には再 bind しない。config file 上で
-`listen` を変えても稼働中の daemon には無効である。変更には daemon の restart が必要である。
+- 空配列は禁止。
+- `host:port` として parse できない値は禁止。
+- duplicate address は禁止。
+- CLI `--listen` が一つでも指定された場合、config の list 全体を置き換える。
 
-### 3.2 鍵ファイルと権限（host 認可鍵・sandbox 許可鍵）
+例:
 
-SSH 公開鍵は TOML 設定ではなく、明確な由来を持つ二つのファイルから読み込む。
-
-1. **Host 認可鍵**: daemon account の `~/.ssh/authorized_keys`
-   ここにある鍵はすべて `Admin` であり、host selector `_` と全 sandbox の操作を許可される。
-2. **Sandbox 許可鍵**: `$XDG_CONFIG_HOME/shbox/allowed_keys`
-   ここだけにある鍵は `Normal` であり、自分が所有する sandbox だけを利用できる。
-3. **両方にある鍵**: 一つの identity として扱い、強い権限である `Admin` を付与する。
-
-`~` は文字列展開ではなく、現在の daemon account の home directory から解決する。`allowed_keys` も `Paths` が導出する固定 path であり、TOML や CLI で変更できない。
-
-受理する行は次の bare OpenSSH Ed25519 形式だけである。
-
-```text
-ssh-ed25519 <base64-public-key> [comment]
+```toml
+listen = ["127.0.0.1:2222", "[::1]:2222"]
 ```
 
-空行と `#` で始まるコメントは無視する。options、証明書、別 algorithm、壊れた base64、同一 source 内の重複 key、未知の line format は source 全体の error とする。1 行の上限は 8 KiB、ファイル全体の上限は 1 MiB。
+### 3.2 `log_level`
 
-各 source は個別には未作成、空、blank/comment のみを許す。ただし二つを合成した結果に有効な鍵が一つもない場合、起動、および鍵 file 変更後の最初の認証要求は拒否され、直前の認証設定が維持される。
+許可値:
 
-存在する key file は daemon user 所有の regular file で、symlink ではなく、group/world writable であってはならない。直近 parent も daemon user 所有の directory で、symlink および group/world writable を拒否する。上位 ancestor にも write permission 検査を適用し、最終 path は `O_NOFOLLOW` で開く。
+```text
+error warn info debug trace
+```
 
-admin key は全 sandbox を可視・操作でき、`_` host selector による host shell/exec/PTY/resize/signal を利用できる。`_` を通常 key で使うことはできない。host file から最後の admin key を削除した場合、次の認証要求から新しい host route 認証だけが拒否され、稼働中の daemon が起動時に決めた managed/sandbox-only mode、listener、reconciliation 動作は変わらない。既存 admin connection の権利は切断まで変わらない。
-### 3.4 `[sandbox] shell`
+CLI `--log-level` が指定された場合は config 値を override する。
 
-省略時は daemon OS user の passwd entry の login shell を使い、その entry が空の場合だけ `/bin/sh` を fallback とする。passwd entry または設定で選ばれた非空 path が存在しない、通常 file でない、実行できない場合は startup error とする。指定値は絶対 path の executable 一つだけであり、shell command、argv、shell fragment は指定しない。
+## 4. `[sandbox]`
 
-interactive shell はこの shell を login mode で起動する。remote `exec` は同じ shell を `-c <command>` で起動するため、remote command の既定を常に `/bin/sh` にするわけではない。host mode には `host_shell` 設定を設けず、daemon OS user の login shell を使う。host mode でも passwd entry が空の場合だけ `/bin/sh` を fallback とし、非空の path が無効なら startup error とする。
+### 4.1 `shell`
 
-### 3.5 `[sandbox] network`
+absolute path だけを受け付ける。NUL を含めない。startup 時に最終 shell を決定し executable であることを確認する。
 
-値は `disabled` または `outbound` のみである。省略時は `disabled`。この項目に対応する CLI flag は存在しない。
+省略時は daemon account の passwd login shell を使い、空 entry の場合だけ `/bin/sh` を使う。
 
-- `disabled`（default）：sandbox からの外部 network を許可しない
-- `outbound`：初期 v0.1 から利用できる unrestricted TCP/UDP/DNS network capability。主用途は outbound 通信
+shell は process-lifetime policy の一部であり、request ごとに選択できない。
 
-shbox は inbound port mapping や SSH forwarding を設定できない。ただし `outbound` は全 OS
-で bind/listen syscall を禁止する egress-only security boundary ではない。外部からの到達制御は
-host firewall の責務である。per-sandbox policy、per-host allowlist は設定できない。host mode は
-この field の対象外であり、daemon の通常の host network namespace を使う。network policy に
-関する Arapuca の profile 名や syscall flag は公開しない。
+### 4.2 `network`
 
-`outbound` を選ぶと syscall/network isolation が `disabled` より弱くなるため、startup に
-一度、明示的な warning を host log に記録する。network mode は process-lifetime であり、
-再読込は行われない。変更には daemon の restart が必要である。
+許可値は二つだけ。
 
-### 3.6 `[sandbox] read_paths`
-
-sandbox process が追加で read-only で参照できる絶対 path の配列である。default は空配列だが、実装は OS と Arapuca の実行に必要な system/runtime/TLS path を内部の curated set として追加する。文字列配列項目共通の規則に従い、単一 string も受け付ける。利用者が指定した path は write permission を付与しない。
-
-各 path は startup 時に存在を確認し、canonical absolute path に解決する。`~`、environment variable、relative path、NUL、重複、存在しない path は拒否する。shbox の state/data/private root、他 sandbox の workspace、管理用 lock/host-key path を追加 read path にすることも拒否する。通常の OS DAC が先に適用され、read path の指定によって権限が昇格することはない。
-
-### 3.7 `[sandbox.env]`
-
-全 sandbox process に共通して渡す追加 environment の table である。client の `env` request や client-side environment は転送しない。値は UTF-8、NUL なし、1 value あたり 4 KiB 以下とする。name は POSIX environment name（`[A-Za-z_][A-Za-z0-9_]*`）でなければならない。
-
-shbox は追加値を適用する前に、次の base environment を構成する。
-
-| name | base value |
+| value | contract |
 |---|---|
-| `HOME` | 対象 sandbox の workspace |
-| `PWD` | 対象 sandbox の workspace。実際の cwd も同じ |
-| `SHELL` | validation 済みの selected sandbox shell |
-| `TMPDIR` | launch ごとの private temporary directory |
-| `PATH` | Linux は `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin`。macOS は先頭に `/opt/homebrew/bin` を加える |
-| `LANG` | `C.UTF-8` |
+| `disabled` | sandbox network access を blocking policy で拒否する。default。 |
+| `outbound` | ordinary network socket use を許す。port allowlist/proxy policy ではない。 |
 
-`PATH` と `LANG` は `sandbox.env` で明示的に上書きできる。それ以外の上表の name と
-PTY request から管理する `TERM` は上書きできない。
+Linux/macOS の enforcement 差は [platforms.md](platforms.md) を参照する。
 
-次の prefix/name は設定 error として拒否する。これは黙って drop する allowlist ではなく、
-config 全体の validation rule である。
+`outbound` は isolation を弱めるため startup log で operator に警告する。外部到達範囲をさらに制限したい場合は host/provider firewall を併用する。
 
-- managed/reserved: `HOME`, `PWD`, `SHELL`, `TMPDIR`, `TERM` と `SHBOX_` prefix
-- launcher/runtime prefixes: `ARAPUCA_`, `LD_`, `DYLD_`, `COR_`, `CORECLR_`,
-  `DOTNET_`, `COMPLUS_`
-- launcher/platform names: `AGENT_NETWORK_PROXY`, `__COMPAT_LAYER`, `COMSPEC`,
-  `PSModulePath`, `PATHEXT`
-- interpreter injection: `BASH_ENV`, `ENV`, `PYTHONPATH`, `PYTHONSTARTUP`,
-  `PYTHONHOME`, `NODE_OPTIONS`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`,
-  `ZDOTDIR`, `IFS`, `PROMPT_COMMAND`
-- runtime/tool injection: `GCONV_PATH`, `HOSTALIASES`, `LOCPATH`, `GETCONF_DIR`,
-  `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `CLASSPATH`, `GOFLAGS`, `GIT_CONFIG_GLOBAL`,
-  `GIT_CONFIG_SYSTEM`, `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXEC_PATH`,
-  `GIT_TEMPLATE_DIR`, `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS`, `GIT_EDITOR`,
-  `GIT_SEQUENCE_EDITOR`, `OPENSSL_CONF`, `EDITOR`, `VISUAL`, `PAGER`, `CARGO_HOME`
-- proxy/certificate injection: `http_proxy`, `HTTP_PROXY`, `https_proxy`, `HTTPS_PROXY`,
-  `ALL_PROXY`, `all_proxy`, `NO_PROXY`, `no_proxy`, `ftp_proxy`, `FTP_PROXY`,
-  `SOCKS_PROXY`, `socks_proxy`, `CGI_HTTP_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`,
-  `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`
+### 4.3 `read_paths`
 
-workspace は sandbox process の HOME と cwd になるが、これは `sandbox.env` で設定するものではない。秘密情報を環境変数へ置くことは推奨しない。host mode はこの table を注入する sandbox mode と異なり、daemon service environment 全体を継承する。
+sandbox process に追加で read-only access を与える absolute path。single string または string array。
 
-### 3.8 組み込み resource limits
+validation:
 
-resource limit は TOML field ではなく、全 daemon が共有する組み込み安全既定値である。値は
-変更できず、0 は該当する limit 無制限を表す。
+- absolute path 必須
+- NUL 禁止
+- startup 時に存在して canonicalize できること
+- duplicate canonical path 禁止
+- shbox config/data/state roots 自身やその subtree を expose しないこと
 
-| field | default | v0.1 の意味 |
-| --- | ---: | --- |
-| `max_memory_mb` | `0` | launch ごとの process group の memory ceiling。Linux は delegated cgroup の hard limit、macOS は RSS monitor による best-effort。 |
-| `cpu_timeout_secs` | `0` | process の累積 CPU time 上限。wall-clock timeout ではない。 |
-| `max_file_size_mb` | `0` | process が作成できる単一 file の上限。 |
-| `max_open_files` | `1024` | process あたりの open file descriptor 上限。 |
+この値は write permission を与えない。workspace/private launch temp の write grant は request-local policy からのみ作る。
 
-macOS は Linux cgroup と同じ hard-limit/quota semantics を約束しない。unsupported な enforcement を有効と表示したり、値を別の limit へ暗黙変換したりしない。wrapper や OS の能力不足で指定 limit を適用できない場合は sandbox launch を fail closed にするか、[platforms.md](./platforms.md) の capability policy に従って明示的に拒否する。
+OS が ordinary command runtime に必要とする system/runtime path は implementation の curated set として別途追加され、public config には列挙しない。
 
-### 3.9 Linux の組み込み limits
+### 4.4 `[sandbox.env]`
 
-Linux target では次の cgroup limits も組み込みで適用する。TOML table として指定することは
-できない。
+全 sandbox launch に追加する `name = "value"` table。
 
-| field | default | 意味 |
-| --- | ---: | --- |
-| `max_cpu_pct` | `0` | cgroup v2 の CPU quota。`0` は quota 無し。 |
-| `max_pids` | `256` | launch ごとの cgroup PID 上限。 |
+name は POSIX identifier:
 
-Linux では Arapuca の cgroup v2 を利用するため、daemon は他 process と共有しない dedicated delegated cgroup scope に配備する。kernel、controller delegation、scope の検証に失敗した場合は sandbox backend を利用不可とし、host process の直接実行へ degrade しない。raw cgroup path、controller、cleanup policy は設定できない。
+```text
+[A-Za-z_][A-Za-z0-9_]*
+```
 
-macOS では Linux-only の cgroup quota/pid semantics は存在せず、platform の組み込み policy
-に従う。resource values は platform 間で暗黙変換しない。
+value は UTF-8 TOML string で、NUL を含めず 4 KiB 以下。
 
-### 3.10 組み込み concurrency caps
+`PATH` と `LANG` は operator override を許可する。一方、shbox が authoritative に設定する名前や injection-sensitive 名は拒否する。
 
-接続や shbox 管理対象の同時実行数を制限する。0 は無制限ではなく、field ごとに 0 を
-禁止する。次の組み込み値を持ち、設定ファイルからも変更できない。
+代表的な managed names:
 
-| field | default | 対象 |
-| --- | ---: | --- |
-| `max_unauthenticated_connections` | `32` | 認証完了前の同時 connection |
-| `max_connections` | `128` | 全 SSH connection |
-| `max_channels_per_connection` | `16` | 一つの connection 内の channel |
-| `max_sandbox_processes` | `128` | 全 sandbox shell/exec process |
-| `max_host_processes` | `16` | host mode process |
-| `max_auth_attempts` | `6` | 一つの connection の認証試行 |
-| `max_sandboxes` | `1024` | 全 sandbox |
-| `max_sandboxes_per_owner` | `128` | 一つの owner fingerprint の sandbox |
-| `handshake_timeout_secs` | `30` | SSH handshake/authentication 完了まで |
+```text
+HOME PWD SHELL TMPDIR TERM
+```
 
-認証済み connection に idle timeout は設けない。上限到達時は新規 request を protocol error または resource exhaustion として拒否し、既存の process を無関係に kill しない。admin-created sandbox も sandbox 数上限へ算入する。
+代表的な拒否カテゴリ:
 
-v0.1 は source IP ごとの rate limiter や ban list を内蔵しない。internet-facing 配備の
-rate limit、deny list、接続元制限は host firewall または上流 network の責務である。
+- dynamic loader / runtime injection
+- interpreter startup hooks
+- proxy/certificate redirection
+- Git tool/askpass/editor injection
+- shell startup/environment hooks
 
-### 3.11 `log_level`
+reserved prefixes:
 
-`error`、`warn`、`info`、`debug`、`trace` のいずれか。default は `info`。CLI `--log-level`
-を指定すると config 値を置き換える。ログは `tracing` の構造化 compact text として
-UTC RFC3339 timestamp 付きで daemon の stderr に出す。log level は process-lifetime で、
-再読込は行われない。変更には daemon の restart が必要である。
-log file、rotation、client が指定する log level、`RUST_LOG` は v0.1 にない。
+```text
+SHBOX_
+LD_
+DYLD_
+COR_
+CORECLR_
+DOTNET_
+COMPLUS_
+```
 
-connection/channel ID、remote address、key fingerprint、role、selector/ID、operation、result、duration、exit status は安全に sanitize して記録できる。command text、terminal I/O、stdin、stdout、stderr、秘密、Arapuca raw audit は記録しない。
+SSH client の `env` request は受理して sandbox environment に加えない。
 
-## 4. 固定 XDG path と file permissions
+## 5. Launch-time authoritative environment
 
-XDG directory の lookup は `xdg::BaseDirectories` に `shbox` prefix を付けて行う。shbox は fallback や environment variable 解釈を再実装しない。v0.1 の正式 target は Unix 系の Linux/macOS であり、`xdg` crate を必須にするため Windows path backend は提供しない。
+各 launch で shbox が次を設定する。
 
-| 用途 | path |
-| --- | --- |
-| config | `$XDG_CONFIG_HOME/shbox/config.toml`（fallback `~/.config/shbox/config.toml`） |
-| sandbox 許可鍵 | `$XDG_CONFIG_HOME/shbox/allowed_keys`（fallback `~/.config/shbox/allowed_keys`） |
-| host 認可鍵 | `~/.ssh/authorized_keys`（daemon account の home directory） |
-| sandbox data | `$XDG_DATA_HOME/shbox/sandboxes/`（fallback `~/.local/share/shbox/sandboxes/`） |
-| host key | `$XDG_STATE_HOME/shbox/host_key`（fallback `~/.local/state/shbox/host_key`） |
-| registry lock | `$XDG_DATA_HOME/shbox/registry.lock`（fallback `~/.local/share/shbox/registry.lock`） |
-| daemon state lock | `$XDG_STATE_HOME/shbox/lock`（fallback `~/.local/state/shbox/lock`） |
-上記の `host_key`、二つの lock、sandbox root は固定 path であり、config field で変更できない。XDG runtime directory は v0.1 の必須 storage ではなく、cache directory も使用しない。sandbox data は runtime に置かない。
+```text
+HOME=<sandbox workspace>
+PWD=<sandbox workspace>
+SHELL=<validated configured/resolved shell>
+TMPDIR=<unique private launch directory>
+```
 
-host key は Ed25519 とし、無い場合だけ初回起動時に atomic create する。mode `0600`、daemon owner 固定であり、破損、wrong owner、group/world writable、保存失敗は startup error である。既存 host key の自動 rotation や OpenSSH daemon key の暗黙流用はしない。
+PTY request 時:
 
-sandbox data root と各 sandbox directory は daemon owner の mode `0700`、metadata は mode `0600` を基本とする。管理対象の path とその親が別 owner、group/world writable、symlink による root 外参照になる場合は拒否する。workspace 内の利用者データに symlink があること自体は許可できるが、delete は sandbox root の外へ追跡しない。
+```text
+TERM=<pty-req term>
+```
 
-daemon は data 側の registry lock と state 側の daemon lock をこの順で non-blocking に取得し、process lifetime 中保持する。どちらか一方でも取得できなければ、既に取得した lock を解放して起動を失敗させる。同じ sandbox data root または同じ state root を共有する第二 daemon は、listen address が異なっても起動できない。lock path は daemon owner の通常 file、mode `0600` とし、symlink や unsafe permission を拒否する。sandbox ごとに別の lifecycle lock を持つため、別 ID の create/delete は並行できる。
+これらは `[sandbox.env]` より authoritative であり shadow できない。
 
-## 5. Startup と mode
+private `TMPDIR` は launch ごとに unique、owner-only directory とし、launch cleanup で recursive に削除する。host-wide `/tmp` を writable sandbox path として自動 grant しない。
 
-起動時は次の順で初期化する。
+## 6. Built-in concurrency caps
 
-1. CLI を parse し、`listen` と `log_level` の上書き要求を保持する
-2. XDG path を解決し、data の registry lock と state の daemon lock を取得する
-3. config（または built-in default）を parse/validate する
-4. `listen` と `log_level` を config 値と CLI 層から確定し、logging を初期化する
-5. host 認可鍵（`~/.ssh/authorized_keys`）と sandbox 許可鍵（`$XDG_CONFIG_HOME/shbox/allowed_keys`）から鍵ストア（`KeyStore`）を構築する。以降、認証要求ごとに両 source の状態を比較し、変化を検出したときだけ全体を再検証する（§6）
-6. host key を初期化する
-7. Arapuca backend を一度だけ生成する
-8. managed mode（初期 Admin 数 > 0）なら listener を bind し、`_` だけを ready にする
-9. metadata を reconcile し、valid な `Active`/`Deleting` state を確認する
-10. sandbox operation を ready にし、sandbox-only mode（初期 Admin 数 == 0）ならここで listener を bind する
+以下は config field ではなく daemon の built-in admission/safety caps である。
 
-Admin key が一つ以上ある managed mode では、host selector `_` を reconciliation より先に利用可能にする。reconcile が完了するまで sandbox operation は `not ready` として拒否する。Admin が無い sandbox-only mode では、reconcile 完了前に listener を公開しない。
+| cap | default |
+|---|---:|
+| unauthenticated connections | 32 |
+| total connections | 128 |
+| channels per connection | 16 |
+| concurrent sandbox processes | 128 |
+| concurrent host-mode processes | 16 |
+| auth attempts per connection | 6 |
+| total sandboxes | 1024 |
+| sandboxes per owner | 128 |
+| SSH handshake timeout | 30 s |
 
-sandbox-only mode は有効な構成だが、port 22 の listener に admin recovery route が無い
-ことを startup log で warning として一度通知する。
+これらは admission/concurrency limit であり、sandbox 内の process に CPU quota、memory ceiling、PID tree quota、file-size/open-file quota を設定する resource-control feature ではない。
 
-Arapuca backend の初期化や sandbox capability の検証に失敗しても daemon は起動できる。managed mode では SSH/host route を利用でき、sandbox-only mode でも reconciliation の完了後は listener を公開する。Linux で外部 `arapuca` wrapper または delegated cgroup が利用できない場合、または対応外 platform の場合、Arapuca が必要な sandbox shell/exec/PTY は fail closed とし、ホスト上で直接 command を実行する fallback はない。macOS arm64 では、別途 `arapuca` を PATH にインストールしていなくても、shbox 自身が rlimit wrapper として動作する。metadata に基づく認可済み `list`/`delete` は reconciliation 後に利用できる。backend は起動時に一度だけ構築し、以降は再構築せず、sandbox process の復旧には daemon restart が必要である。
+## 7. Sandbox resource limits は提供しない
 
-## 6. 鍵の更新と SIGHUP
+v0.1 の shbox sandbox policy には次の per-launch/per-sandbox resource quota はない。
 
-設定は process-lifetime であり、config file・sandbox policy・組み込み caps/limits の再読込は
-一切行わない。これらを変えた場合は daemon を restart する。再読込の対象は鍵 file だけである。
+- CPU percentage/quota
+- memory/RSS ceiling
+- process/PID count quota
+- file-size quota
+- open-file quota
+- workspace disk quota
 
-### 6.1 リクエスト時の自動再検証
+operator が systemd、container runtime、VM/provider、OS account policy などで service-level resource controls を設定することは可能だが、それは shbox public sandbox contract ではない。
 
-鍵 file（`~/.ssh/authorized_keys` と `$XDG_CONFIG_HOME/shbox/allowed_keys`）は、見かけ上は
-認証要求のたびにチェックされる。実際の実装は次のとおりである。
+旧設定名らしき unknown field を互換目的で黙って受理することもしない。`deny_unknown_fields` により明示的な config error になる。
 
-1. 公開鍵認証要求のたびに、両鍵 file の状態を file 単位の identity（device、inode、ctime、
-   size。path が存在しない場合は「欠落」も一つの状態）として比較する。これは 2 回の stat
-   のみを要し、parse は行わない。
-2. identity が起動時または前回検証時と一致すれば、直前の認証設定をそのまま使う。
-3. 一方でも変化があれば、両 source を読み直し、起動時と同一の全検証（file safety、
-   permission、厳格な Ed25519 parse、合成 role 付与）を通した場合だけ一つの immutable
-   snapshot として置き換える。
+## 8. XDG layout
 
-ctime を identity に含めるため、鍵 file 自体の permission のみの変化（content が同じでも
-group/world writable への変更など）も次の認証要求で検出される。ただし identity は鍵 file
-自体の状態だけを見るため、**祖先 directory の permission 変化は検出できない**。その検出は
-SIGHUP による強制再検証（§6.2）で行う。等しい mtime での content 差し替えのような細工は、
-userspace から ctime を巻き戻せないため identity 変化として検出される。
+`xdg` crate の application prefix `shbox` を使う。
 
-### 6.2 失敗時と SIGHUP
+```text
+$XDG_CONFIG_HOME/shbox/config.toml
+$XDG_CONFIG_HOME/shbox/allowed_keys
 
-再検証が permission 違反、parse error、空の合成 key set のいずれかで失敗した場合は、何も
-publish せず直前の認証設定を維持する。既存 connection、既存 process は影響を受けない。失敗時
-にも観測した identity を採用するため、壊れたまま安定した状態では認証要求ごとの再 parse は
-発生せず、次に鍵 file が変わったとき、または SIGHUP が送られたときに再試行される。失敗は
-host log に warn として記録される。SSH client へは通常の認証結果だけを返す。
+$XDG_DATA_HOME/shbox/registry.lock
+$XDG_DATA_HOME/shbox/sandboxes/<id>/
 
-`SIGHUP` は鍵 file の手動再検証 trigger である。daemon は鍵 file の identity を無効化し、
-次の認証要求で identity が変化していなくても両 source を強制的に読み直して全検証する。
-SIGHUP 自体は I/O を行わず、config file も読み直さない。
+$XDG_STATE_HOME/shbox/host_key
+$XDG_STATE_HOME/shbox/lock
+$XDG_STATE_HOME/shbox/runtime/
+```
 
-### 6.3 適用範囲
+通常の XDG fallback は `xdg` crate に従う。
 
-- 変更後の鍵集合は、次の認証要求から適用される。既存 connection の認証済み
-  role/ownership rights、既存 process、既存 PTY は切断・再起動しない。既存 admin
-  connection は、最後の admin key が削除されても切断まで admin のままである。
-- host file から最後の admin key を削除しても、起動時に決めた managed/sandbox-only mode、
-  listener、reconciliation 動作は変わらない。拒否されるのは新しい host route 認証だけである。
-- `listen`、`log_level`、`[sandbox] network`、組み込み caps/limits、host key path、
-  XDG root、固定 selector `_`、metadata version、sandbox policy は process の lifetime 中
-  固定であり、鍵 file の変更や SIGHUP では変わらない。
+### 8.1 Directory safety
 
-## 7. Validation と失敗時の観測
+shbox が write する data/state/runtime directory は:
 
-設定エラーは daemon の起動失敗として、鍵再検証の失敗は host log の warn として operator の
-stderr/log に出す。内部 path、fingerprint、error chain は host log に限り、SSH client へは一般化した安定 error だけを返す。command output と terminal I/O は汚染しない。
+- real directory
+- daemon effective UID 所有
+- group/world writable でない
+- symlink でない
 
-config、authorized_keys、host key、XDG directory の作成・permission・disk full・bind failure、Arapuca capability 不足は operational failure であり panic させない。remote の不正 username、unknown subsystem、unsupported request、disconnect も daemon 全体を panic させない。内部 invariant の破壊だけは location/backtrace をログし daemon を abort する。
+ことを要求する。missing directory は owner-only mode で作成し validation する。
 
-プロトコル入力には次の固定上限を適用する。これらは TOML field ではない。
+config directory は operator-provided input のため shbox は作成しない。存在する場合は同じ safety criteria で validation する。
 
-| 入力 | 上限 |
-| --- | ---: |
-| SSH exec command string | 32 KiB |
-| terminal type (`TERM`) | 256 bytes |
-| subsystem name | 64 bytes |
-| authorized key 1 行 | 8 KiB |
-| authorized key file | 1 MiB |
-| config file | 1 MiB |
-| sandbox metadata | 16 KiB |
+### 8.2 Files
 
-上限を超えた入力は切り詰めず拒否する。bounded buffer と SSH window backpressure を使い、client の送信失敗や channel close では対応する process を回収する。
+host key、lock file、key source、config はそれぞれ専用 validation を持つ。unsafe ownership/mode/symlink は operational startup/auth failure であり、黙って chmod/chown して信頼境界を変えない。
 
-## 8. 関連文書
+## 9. Authentication key sources
 
-- [product.md](./product.md): 外部 API、ownership、host mode、compatibility
-- [security.md](./security.md): 脅威境界、key role、filesystem safety
-- [architecture.md](./architecture.md): config snapshot と module 境界
-- [ssh-protocol.md](./ssh-protocol.md): request/channel semantics
-- [platforms.md](./platforms.md): Linux cgroup、macOS capability、Arapuca revision
-- [testing.md](./testing.md): configuration、鍵更新、permission の acceptance test
+二つの public-key source を使う。
+
+- daemon account の `~/.ssh/authorized_keys`: admin/host-mode source
+- `$XDG_CONFIG_HOME/shbox/allowed_keys`: sandbox-only source
+
+両方に同じ key が存在すれば admin role を得る。key source は maximum 1 MiB、各 line maximum 8 KiB。
+
+accepted key syntax は bare Ed25519 authorized-key line。authorized-key options、certificate、他 algorithm は拒否する。
+
+key sources は authentication request ごとに identity を再確認する。invalid update では previous valid snapshot を保持して fail closed にし、SIGHUP は再検証を強制する。
+
+## 10. Startup behavior
+
+config snapshot と account/shell/key paths の validation 後、backend-neutral launch policy を構築し production launcher を preflight する。
+
+OS confinement prerequisite が利用できない場合、daemon 自体は metadata/host-mode recovery のため起動できるが sandbox launch は `UnavailableLauncher` を通じて fail closed になる。unconfined host execution へ downgrade しない。
+
+## 11. CLI layering
+
+CLI は top-level operational fields だけを override する。
+
+```text
+--listen ADDR       repeatable; config listen を置換
+--log-level LEVEL   config log_level を置換
+```
+
+sandbox shell/network/read paths/environment の CLI option は存在しない。
+
+`--completions` と `--man` は output action であり daemon を起動しない。
+
+## 12. 関連文書
+
+- [architecture.md](architecture.md) — snapshot と launcher boundary
+- [platforms.md](platforms.md) — Linux/macOS policy mapping
+- [security.md](security.md) — environment/path trust boundary
+- [testing.md](testing.md) — schema/property/native tests

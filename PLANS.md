@@ -1289,7 +1289,13 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - GitHub Linux x86_64 and aarch64 runners both reported kernel `6.17.0-1022-azure`, nono `0.74.0`, Landlock ABI V6, network/scoping support enabled, and no seccomp network fallback; both full native OpenSSH/PTTY gates passed.
   - GitHub macOS arm64 gates passed on macOS `15.7.7` and `26.5.2`; both proved Seatbelt deny/allow enforcement before the full OpenSSH/PTTY suite.
 - [ ] Milestone 9 Fly acceptance.
-- [ ] Milestone 10 docs.
+  - Blocked on real target evidence: this checkout has no Fly CLI/token/Machine configuration, and the currently inspected consumer production image still pins an older shbox/runtime stack. Generic Docker or GitHub Linux evidence is not being substituted for the required production Machine/image acceptance.
+- [x] Milestone 10 docs.
+  - Rewrote all nine specification/runbook documents around the sole supported architecture: shbox-owned process/PTY lifecycle, Linux nono 0.74.0/Landlock, and macOS Seatbelt through `/usr/bin/sandbox-exec`.
+  - PTY ownership, controlling terminal, foreground PGID/job control, terminal modes, resize, signals, disconnect cleanup, and the deliberate-detach limitation are documented as first-class behavior rather than backend details.
+  - Linux docs state that sandbox resource quotas and controller delegation are not provided/required; Landlock confinement inheritance is explicitly distinguished from initial process-group cleanup. Network documentation records the portable `outbound` client-connect guarantee and the current Linux/macOS enforcement difference.
+  - Testing/release docs record PR run `33518661744` as the native CI evidence and keep Fly production acceptance explicitly unverified until the exact target image/Machine is tested.
+  - Documentation/local-link/stale-reference audits are clean. Rust 1.95 local gates pass: 157 unit + 6 CLI + 29 OpenSSH integration tests, format, Clippy `-D warnings`, and `cargo check --all-targets`.
 - [ ] Milestone 11 final audit.
 
 ---
