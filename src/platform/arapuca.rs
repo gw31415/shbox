@@ -7,7 +7,9 @@
 //! is a normal fail-closed state for sandbox launches, not a host-process
 //! fallback. macOS arm64 can use shbox's embedded rlimit wrapper.
 
-use std::collections::{BTreeMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 #[cfg(target_os = "linux")]
@@ -24,27 +26,21 @@ use crate::config::{Config, Limits, NetworkMode};
 use crate::sandbox::SandboxId;
 
 use super::{
-    LaunchError, LaunchOperation, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher,
-    ProcessReader, ProcessWriter, PtyIo, RunningProcess, apply_terminal_modes, apply_window_size,
-    duplicate_fd,
+    LaunchError, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessReader,
+    ProcessWriter, PtyIo, RunningProcess, apply_terminal_modes, apply_window_size, duplicate_fd,
 };
 
 const TASK_RANDOM_BYTES: usize = 16;
 const TASK_ID_ATTEMPTS: usize = 32;
-const MAX_COMMAND_BYTES: usize = 32 * 1024;
 
 /// The validated shbox policy captured by the process-lifetime adapter.
 ///
-/// No Arapuca profile fields cross this boundary.  The adapter translates
-/// this domain snapshot afresh for each process so the workspace and task ID
-/// remain request-local while the backend itself stays shared.
+/// The backend-neutral snapshot lives in [`super::policy`]; this wrapper only
+/// translates it into the pinned Arapuca profile for as long as Arapuca
+/// drives production launch.
 #[derive(Clone)]
 pub(crate) struct ArapucaLaunchPolicy {
-    shell: PathBuf,
-    network: NetworkMode,
-    read_paths: Vec<PathBuf>,
-    sandbox_env: BTreeMap<String, String>,
-    limits: Limits,
+    inner: super::policy::SandboxLaunchPolicy,
 }
 
 #[cfg(target_os = "linux")]
@@ -99,55 +95,33 @@ impl Drop for LinuxScope {
 
 impl ArapucaLaunchPolicy {
     /// Combine the file-backed config — including its `[sandbox] network`
-    /// mode, which is process-lifetime — and the built-in limits into one
-    /// immutable launch snapshot.
-    pub(crate) fn from_config(config: &Config, shell: impl Into<PathBuf>) -> Self {
+    /// mode, which is process-lifetime — with the validated shell and the
+    /// shbox runtime temp root into the neutral launch snapshot.
+    pub(crate) fn from_config(
+        config: &Config,
+        shell: impl Into<PathBuf>,
+        temp_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            shell: shell.into(),
-            network: config.network(),
-            read_paths: config.read_paths().to_vec(),
-            sandbox_env: config.sandbox_env().clone(),
-            limits: Limits::default(),
+            inner: super::policy::SandboxLaunchPolicy::from_config(config, shell, temp_root),
         }
     }
 
     fn profile_for(&self, workspace: &Path) -> ::arapuca::Profile {
-        let mut read_paths = ::arapuca::env::default_sandbox_paths().0;
+        // The curated defaults, the validated shell, and the configured read
+        // paths are resolved by the neutral policy module.
+        let read_paths = self.inner.resolved_read_paths();
 
-        // The configured shell is a validated operator input.  Its file and
-        // parent are explicitly readable so a custom shell outside /bin or
-        // /usr/bin remains executable under Landlock/Seatbelt.
-        read_paths.push(self.shell.clone());
-        if let Some(parent) = self.shell.parent() {
-            read_paths.push(parent.to_path_buf());
-        }
-        read_paths.extend(self.read_paths.iter().cloned());
-
-        // Arapuca's helper intentionally has a missing-final-component
-        // fallback.  The shbox contract says optional curated entries are
-        // omitted when absent, so filter before canonicalization.
-        read_paths.retain(|path| path.exists());
-        let mut read_paths = ::arapuca::env::canonicalize_paths(&read_paths);
-        read_paths.sort();
-        read_paths.dedup();
-
-        let workspace = workspace.to_path_buf();
-        let (max_cpu_pct, max_pids) = self
-            .limits
+        let limits = Limits::default();
+        let (max_cpu_pct, max_pids) = limits
             .linux
             .map(|limits| (limits.max_cpu_pct, limits.max_pids))
             .unwrap_or((0, 0));
 
-        // Shell commands commonly discard output through `/dev/null`.  Keep
-        // this single device writable without granting write access to the
-        // rest of `/dev`.
-        let write_paths = if cfg!(target_os = "linux") {
-            vec![workspace, PathBuf::from("/dev/null")]
-        } else {
-            vec![workspace]
-        };
+        let mut write_paths = vec![workspace.to_path_buf()];
+        write_paths.extend(self.inner.curated_write_paths().iter().cloned());
 
-        let seccomp_profile = match self.network {
+        let seccomp_profile = match self.inner.network() {
             NetworkMode::Disabled => ::arapuca::SeccompProfile::Strict,
             NetworkMode::Outbound => ::arapuca::SeccompProfile::Baseline,
         };
@@ -155,13 +129,13 @@ impl ArapucaLaunchPolicy {
             isolation: ::arapuca::Isolation::Process,
             read_paths,
             write_paths,
-            max_memory_mb: self.limits.max_memory_mb,
+            max_memory_mb: limits.max_memory_mb,
             max_cpu_pct,
             max_pids,
             cgroup_policy: ::arapuca::CgroupPolicy::Required,
-            cpu_timeout_secs: self.limits.cpu_timeout_secs,
-            max_file_size_mb: self.limits.max_file_size_mb,
-            max_open_files: self.limits.max_open_files,
+            cpu_timeout_secs: limits.cpu_timeout_secs,
+            max_file_size_mb: limits.max_file_size_mb,
+            max_open_files: limits.max_open_files,
             allow_exec: true,
             use_netns: false,
             use_pidns: false,
@@ -177,26 +151,9 @@ impl ArapucaLaunchPolicy {
     }
 
     fn environment_for(&self, workspace: &Path, term: Option<&str>) -> Vec<(String, String)> {
-        let workspace = workspace.to_string_lossy().into_owned();
-        let shell = self.shell.to_string_lossy().into_owned();
-        let mut env = vec![
-            ("HOME".to_string(), workspace.clone()),
-            ("PWD".to_string(), workspace),
-            ("SHELL".to_string(), shell),
-        ];
-        env.extend(
-            self.sandbox_env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        );
-        if let Some(term) = term {
-            // A pty-req is authoritative for TERM; do not let an operator
-            // sandbox_env entry shadow the terminal type negotiated on the
-            // SSH channel.
-            env.retain(|(name, _)| name != "TERM");
-            env.push(("TERM".to_string(), term.to_string()));
-        }
-        env
+        // Transitional Arapuca launches set no TMPDIR; the temp directory
+        // becomes authoritative when the shbox-owned launchers take over.
+        self.inner.environment_for(workspace, term, None)
     }
 }
 
@@ -419,27 +376,11 @@ impl ProcessLauncher for ArapucaLauncher {
         };
 
         let command = policy
-            .shell
+            .inner
+            .shell()
             .to_str()
             .ok_or_else(|| LaunchError::new("sandbox shell path is not valid UTF-8"))?;
-        let command_arg = match &request.operation {
-            // Arapuca has no argv[0] override, so use the portable shell
-            // login flag for the interactive operation.  Remote commands
-            // remain non-login and receive only the single `-c` payload.
-            LaunchOperation::Shell => None,
-            LaunchOperation::Exec(bytes) => {
-                if bytes.len() > MAX_COMMAND_BYTES {
-                    return Err(LaunchError::new("sandbox command is too large"));
-                }
-                if bytes.contains(&0) {
-                    return Err(LaunchError::new("sandbox command contains NUL"));
-                }
-                Some(
-                    String::from_utf8(bytes.clone())
-                        .map_err(|_| LaunchError::new("sandbox command is not valid UTF-8"))?,
-                )
-            }
-        };
+        let command_arg = super::policy::validated_shell_command(&request.operation)?;
         let args_storage = match command_arg {
             Some(command) => vec!["-c".to_string(), command],
             None => vec!["-l".to_string()],
@@ -1003,7 +944,7 @@ mod tests {
     #[test]
     fn profile_maps_the_shbox_policy_without_exposing_arapuca_options() {
         let config = crate::config::defaults();
-        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh");
+        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh", "/state/runtime");
         let directory = tempfile::tempdir().expect("workspace");
         let profile = policy.profile_for(directory.path());
 
@@ -1030,11 +971,13 @@ mod tests {
         // `network` rides the config snapshot; the defaults carry `disabled`,
         // so this test builds the policy directly to exercise the other mode.
         let policy = ArapucaLaunchPolicy {
-            shell: PathBuf::from("/bin/sh"),
-            network: NetworkMode::Outbound,
-            read_paths: Vec::new(),
-            sandbox_env: BTreeMap::new(),
-            limits: Limits::default(),
+            inner: crate::platform::policy::SandboxLaunchPolicy::from_parts(
+                PathBuf::from("/bin/sh"),
+                NetworkMode::Outbound,
+                Vec::new(),
+                BTreeMap::new(),
+                PathBuf::from("/state/runtime"),
+            ),
         };
         let directory = tempfile::tempdir().expect("workspace");
         let profile = policy.profile_for(directory.path());
@@ -1045,7 +988,7 @@ mod tests {
     #[test]
     fn environment_is_workspace_scoped_and_deterministic() {
         let config = crate::config::defaults();
-        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh");
+        let policy = ArapucaLaunchPolicy::from_config(&config, "/bin/sh", "/state/runtime");
         let directory = tempfile::tempdir().expect("workspace");
         let env = policy.environment_for(directory.path(), None);
         assert_eq!(
@@ -1064,11 +1007,13 @@ mod tests {
         let mut sandbox_env = BTreeMap::new();
         sandbox_env.insert("TERM".to_string(), "operator-term".to_string());
         let policy = ArapucaLaunchPolicy {
-            shell: PathBuf::from("/bin/sh"),
-            network: NetworkMode::Disabled,
-            read_paths: Vec::new(),
-            sandbox_env,
-            limits: Limits::default(),
+            inner: crate::platform::policy::SandboxLaunchPolicy::from_parts(
+                PathBuf::from("/bin/sh"),
+                NetworkMode::Disabled,
+                Vec::new(),
+                sandbox_env,
+                PathBuf::from("/state/runtime"),
+            ),
         };
         let directory = tempfile::tempdir().expect("workspace");
         let env = policy.environment_for(directory.path(), Some("xterm-256color"));

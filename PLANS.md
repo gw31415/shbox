@@ -1252,8 +1252,8 @@ No release is accepted while a PTY cell marked required is failing or skipped.
 - [x] Decision: Rust 1.95 is acceptable and becomes the new MSRV.
 - [x] Decision: Linux uses nono prepared confinement; PTY/process lifecycle stays in shbox.
 - [x] Decision: macOS keeps shbox-owned PTY and Seatbelt/sandbox-exec rather than post-fork nono `sandbox_init()`.
-- [ ] Milestone 0 implementation verification in the repository.
-- [ ] Milestone 1 common policy extraction.
+- [x] Milestone 0 implementation verification in the repository.
+- [x] Milestone 1 common policy extraction.
 - [ ] Milestone 2 shbox-owned PTY implementation.
 - [ ] Milestone 3 Linux nono launcher.
 - [ ] Milestone 4 macOS Seatbelt launcher.

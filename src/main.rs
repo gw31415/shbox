@@ -360,7 +360,11 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
 
     let host_key = hostkey::HostKey::load_or_create(paths.host_key())
         .map_err(|err| fail("loading the host key", err))?;
-    let launch_policy = platform::ArapucaLaunchPolicy::from_config(&app_config, &sandbox_shell);
+    let launch_policy = platform::ArapucaLaunchPolicy::from_config(
+        &app_config,
+        &sandbox_shell,
+        paths.runtime_dir(),
+    );
     let launcher: Arc<dyn platform::ProcessLauncher> = match platform::ArapucaLauncher::new(
         launch_policy,
     ) {

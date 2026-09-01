@@ -16,10 +16,12 @@ use crate::sandbox::SandboxId;
 
 #[cfg(unix)]
 mod arapuca;
-#[cfg(unix)]
-mod terminal;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(unix)]
+mod policy;
+#[cfg(unix)]
+mod terminal;
 
 #[cfg(unix)]
 pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
