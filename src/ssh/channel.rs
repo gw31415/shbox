@@ -431,7 +431,7 @@ pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
                 number,
                 core_dumped,
             }) => ExitStatus::Signal {
-                name: host::name_from_signal(number).unwrap_or("TERM"),
+                name: host::exit_signal_name(number),
                 core_dumped,
             },
             Err(err) => {
@@ -699,7 +699,7 @@ fn normalize_sandbox_exit(
             number,
             core_dumped,
         })) => ExitStatus::Signal {
-            name: host::name_from_signal(number).unwrap_or("TERM"),
+            name: host::exit_signal_name(number),
             core_dumped,
         },
         Ok(Err(error)) => {
@@ -805,6 +805,11 @@ fn spawn_pty_pump(
 }
 
 /// The russh `Sig` enum carries the wire name for exit-signal requests.
+///
+/// The fixed-name arms cover russh's own enum; every other name in the
+/// [`host::name_from_signal`] table is carried as `Sig::Custom`. The `_`
+/// fallback is `Custom`, never a different signal, so the two tables cannot
+/// silently misreport a death as `TERM`.
 fn signal_name_to_sig(name: &'static str) -> russh::Sig {
     match name {
         "ABRT" => russh::Sig::ABRT,
@@ -819,9 +824,7 @@ fn signal_name_to_sig(name: &'static str) -> russh::Sig {
         "SEGV" => russh::Sig::SEGV,
         "TERM" => russh::Sig::TERM,
         "USR1" => russh::Sig::USR1,
-        // russh 0.63.1 represents USR2 as a custom RFC signal name.
-        "USR2" => russh::Sig::Custom("USR2".to_string()),
-        _ => russh::Sig::TERM,
+        _ => russh::Sig::Custom(name.to_string()),
     }
 }
 

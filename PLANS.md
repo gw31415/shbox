@@ -19,9 +19,6 @@ shboxを標準的なOpenSSH `sshd` と同じセッション挙動に揃える。
 - `src/platform/linux.rs:210-215` と `src/platform/macos.rs:141-147` が Shell を `command.arg("-l")` で起動する(#2本体)。host mode (`src/ssh/host.rs:152`) は既に `arg0(-<basename>)`。
 - Linuxはshboxが直接 `execve(shell)` するため `std::os::unix::process::CommandExt::arg0` が使える。macOSは `/usr/bin/sandbox-exec` が子のargv[0]を「渡されたパスそのもの」に設定することを実機で確認済み。`/bin/sh -c 'exec -a <argv0> <shell>'` を挟むとsandbox-exec内側でもargv[0]制御できることを実機で確認済み(execチェーンは同一PID、直接子は設定シェルのまま)。
 - russh 0.63.1 (vendored source確認):
-  - `Session::channel_success/channel_failure` は `channel.wants_reply` を見て、clientが `want_reply=0` なら送信を抑制する。handlerは無条件にreply APIを呼んでよい。
-  - `src/ssh/mod.rs:694` `signal` handlerは既知シグナル転送時に一切応答しない → `want_reply=1` のクライアントがハングする。
-  - mailbox満杯時のsignalはchannel全体をcloseする(`src/ssh/mod.rs:708`)。sshdはsignalで接続を落とさない。
   - 未知のchannel request(例: RFC 4335 `break`)はrusshが自動で `CHANNEL_FAILURE` を返す。未知のglobal request(例: `no-more-sessions@openssh.com`)も自動で `REQUEST_FAILURE` を返す。OpenSSH clientは `no-more-sessions` を `want_reply=0` で送るため、この挙動はクライアントから観測不能でRFC 4254/4335準拠。shbox層での追加handlerは存在しない(russhにhookが無い)ため対応不要。
   - russh clientの `Channel::signal` は `want_reply=0` 固定。replyそのものはテストから観測できないため、統合テストは「signal転送が機能し、channelが継続すること」を検証する(docs §13のreal acceptance要件)。
 - RFC 4254 §6.2は "Zero dimension parameters MUST be ignored" を定める。初回 `pty-req` の 0寸法を24x80へ置換する現行挙動(`src/ssh/host.rs:36`)はRFC準拠の正当な解釈であり、sshdの素通し(0x0適用)との差は**意図的偏差**として維持する。修正はコメントとdocs契約の明記のみ。※本計画以前の調査発言(「RFCに規則が無い」)は誤りだったため訂正。
@@ -34,18 +31,6 @@ shboxを標準的なOpenSSH `sshd` と同じセッション挙動に揃える。
   native gate(Linux実機)はrelease専用(`.github/workflows/release-gate.yml`)。Linux固有の実launchテストは `#[cfg(target_os = "linux")]` で書き、release gateで検証する(本作業マシンはmacOS arm64)。
 
 ## マイルストーン
-
-### M1. SSH signalリクエストの応答とbackpressure安全性
-
-- **Goal**: 既知シグナル転送成功時に `channel_success` を返す。mailbox満杯時はchannelを落とさず `channel_failure` を返す。未知シグナルは現行どおり拒否。
-- **Edits**: `src/ssh/mod.rs` `signal()`。docs/ssh-protocol.md §13に応答契約を追記。
-- **Proof**: `cargo test --locked --all-targets -- --test-threads=1`。`tests/ssh_auth.rs` にrussh clientベースのsignal転送テストを追加(execした `sleep` をsignalで停止させ、exit-signal INTが届き、channelが正常完結すること。未知シグナル名でもchannelが継続すること)。docs §13が要求する「SSH signal request forwarding の real acceptance」をこれで満たす。
-
-### M2. exit-signal名の正確な報告
-
-- **Goal**: 13名のRFC 4254集合外のシグナル死亡が `TERM` と誤報されない。
-- **Edits**: `src/ssh/host.rs` `name_from_signal` を主要POSIX集合へ拡張(TRAP/SYS/VTALRM/PROF/WINCH/XCPU/XFSZ/TSTP/CONT/TTIN/TTOU/URG/CHLD/STOP/IO + cfg付きEMT/STKFLT)。`src/ssh/channel.rs` `signal_name_to_sig` も同集合を `Sig::Custom` で対応。`unwrap_or("TERM")` は到達不能フォールバックとして残しdebug logを足す。リクエスト受理側 `signal_from_name` は13名のまま(docs §13契約)。
-- **Proof**: `supported_signal_names_round_trip` テスト拡張 + 全ゲート。
 
 ### M3. sandbox execの生バイト保持 (Issue #3)
 
@@ -76,8 +61,8 @@ shboxを標準的なOpenSSH `sshd` と同じセッション挙動に揃える。
 
 | 項目 | 分類 |
 |---|---|
-| M1 signal応答 | 未実装(本計画で実装) |
-| M2 exit-signal名 | 未実装 |
+| M1 signal応答 | 実装済み(詳細はgit history) |
+| M2 exit-signal名 | 実装済み(詳細はgit history) |
 | M3 exec生バイト (#3) | 未実装 |
 | M4 login argv[0] (#2) | 未実装 |
 | M5 ゼロ寸法契約 | 未実装(docsのみ) |

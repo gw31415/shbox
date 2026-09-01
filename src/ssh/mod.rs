@@ -700,13 +700,19 @@ impl russh::server::Handler for ConnHandler {
         let name = sig_name(&signal);
         match host::signal_from_name(&name) {
             Some(number) => {
-                if !self
+                if self
                     .conn
                     .registry
                     .try_send(channel, ChannelEvent::Signal(number))
                 {
-                    let _ = session.close(channel);
-                    self.conn.registry.remove(channel);
+                    // russh suppresses this reply when the client sent
+                    // want_reply=false, so replying unconditionally is safe.
+                    let _ = session.channel_success(channel);
+                } else {
+                    // Backpressure must not tear down a session the way a
+                    // data overflow does; signal delivery is best-effort. A
+                    // want_reply client still needs the failure to unblock.
+                    let _ = session.channel_failure(channel);
                 }
                 Ok(())
             }
