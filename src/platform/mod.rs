@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::sandbox::SandboxId;
 
-#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
 mod arapuca;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -23,10 +23,16 @@ mod policy;
 #[cfg(unix)]
 mod terminal;
 
-#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
 pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
+#[cfg(target_os = "linux")]
+pub(crate) use self::linux::LinuxLauncher;
+#[cfg(target_os = "linux")]
+pub(crate) use self::policy::SandboxLaunchPolicy;
+#[cfg(not(target_os = "linux"))]
+pub(crate) use self::terminal::{PtyIo, duplicate_fd};
 #[cfg(unix)]
-pub(crate) use self::terminal::{PtyIo, apply_terminal_modes, apply_window_size, duplicate_fd};
+pub(crate) use self::terminal::{apply_terminal_modes, apply_window_size};
 
 /// Serialize every daemon-owned process spawn with adapter pipe creation.
 ///
@@ -585,6 +591,7 @@ mod tests {
     /// production adapter on top of an unverified abstraction is the risk the
     /// platform gate calls out; this keeps the surface compiling from
     /// Milestone 1 on.
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn pinned_arapuca_public_api_compiles() {
         let profile = ::arapuca::Profile::default();

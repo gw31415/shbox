@@ -1255,7 +1255,10 @@ No release is accepted while a PTY cell marked required is failing or skipped.
 - [x] Milestone 0 implementation verification in the repository.
 - [x] Milestone 1 common policy extraction.
 - [x] Milestone 2 shbox-owned PTY implementation.
-- [ ] Milestone 3 Linux nono launcher.
+- [x] Milestone 3 Linux nono launcher.
+  - Linux arm64 Docker/Rust 1.95: 157/157 unit tests, `cargo check --all-targets`, and Clippy `-D warnings` pass.
+  - macOS arm64/Rust 1.95 regression: 151/151 unit tests, `cargo check --all-targets`, and Clippy `-D warnings` pass.
+  - Linux proof covers filesystem allow/deny, sensitive-read denial, disabled/outbound TCP behavior, PTY/session state, signal forwarding, descendant process-group cleanup, child setup status reporting, and recursive launch-temp cleanup.
 - [ ] Milestone 4 macOS Seatbelt launcher.
 - [ ] Milestone 5 Arapuca/cgroup/limit removal.
 - [ ] Milestone 6 SSH/PTTY integration suite.
