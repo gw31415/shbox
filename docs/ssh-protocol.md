@@ -73,7 +73,15 @@ valid sandbox selectorでshell requestを受けると:
 5. launch成功後にchannel success
 6. bridge task開始
 
-shellはvalidated sandbox shellをlogin shell形式で起動する。
+shellはvalidated sandbox shellをOpenSSH流のlogin shell形式、すなわち:
+
+```text
+executable: <configured-shell>
+argv[0]: -<basename>
+argv[1..]: なし
+```
+
+で起動する。`-l` 等のshell固有optionは付けない。Linuxはshboxが直接execし、macOSはsandbox-execの内側で固定の `/bin/sh` 経由の `exec -a` によりargv[0]を設定する(exec chainは同一PID)。
 
 ### 4.2 Host shell
 
@@ -81,15 +89,15 @@ admin `_` routeではdaemon accountのhost shellを起動する。PTY semantics�
 
 ## 5. Exec request
 
-remote command bytesは最大32 KiB。NULは禁止。
+remote command bytesは最大32 KiB。NULは禁止。UTF-8である要件はない。
 
-sandbox execはUTF-8 commandとしてvalidated shellへ:
+sandbox execはraw command bytesをそのままvalidated shellへ:
 
 ```text
 <shell> -c <command>
 ```
 
-の意味で渡す。
+の単一引数として渡す。分割・再tokenize・解釈・正規化・transcodeは行わない。quoting、redirect、pipeline、builtin、locale/encodingの解釈は選択されたshellの責任である。
 
 host execもbounded commandをhost shell `-c`へ渡す。
 
@@ -125,6 +133,8 @@ PTY requestはshell/exec開始前に受理できる。
 - window revision
 
 pixel dimensionsはv0.1のterminal sizing contractには使わない。
+
+寸法0はRFC 4254 §6.2の "Zero dimension parameters MUST be ignored" に従い無視する。初回 `pty-req` では無視した0寸法に24x80のdefaultを適用し、`window-change` では0寸法を適用せず他軸の値を維持する。OpenSSH sshdがclient指定値(0を含む)を素通しするのに対する、意図的な偏差である。
 
 PTY request後、launch時に shbox が自身でPTY pairをallocateし、terminal modesとinitial window sizeをbridge公開前に適用する。
 
@@ -193,6 +203,8 @@ channel close/transport disconnectはEOFとは別で、managed process teardown�
 ## 13. Signal request
 
 RFC 4254で扱うknown signal nameだけをlibc signalへmappingする。不明signalはforwardしない。
+
+signal requestは転送の成否に応じて `CHANNEL_SUCCESS` / `CHANNEL_FAILURE` で応答する。russhがclient側 `want_reply` を見て応答を抑制するため、handlerは無条件にreply APIを呼ぶ。mailbox満杯でsignalをenqueueできない場合もchannelをterminateせず `CHANNEL_FAILURE` で応答する(signal配送はbest-effortであり、data/EOFのようなbackpressure teardown対象ではない)。
 
 PTY sandbox processではcurrent foreground process groupをtargetにする。これによりshell自身ではなくforeground jobへsignalが届く。
 
