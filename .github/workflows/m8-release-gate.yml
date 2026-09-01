@@ -6,6 +6,7 @@ on:
       - main
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ env:
   RUST_BACKTRACE: '1'
 
 jobs:
-  rust-toolchains:
+  rust-quality:
     name: Rust ${{ matrix.toolchain }} quality gate
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -28,7 +29,7 @@ jobs:
       fail-fast: false
       matrix:
         toolchain:
-          - '1.91.0'
+          - '1.95.0'
           - stable
     steps:
       - name: Check out source
@@ -38,13 +39,32 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - name: Validate gate scripts
+      - name: Validate platform gate scripts
         run: |
           set -euo pipefail
           test -x scripts/verify-linux-platform
           test -x scripts/verify-macos-platform
           bash -n scripts/verify-linux-platform
           bash -n scripts/verify-macos-platform
+      - name: Reject retired production backends and cgroup control paths
+        run: |
+          set -euo pipefail
+          if grep -RInEi 'arapuca|sandlock|shbox-sandbox-runner|linux_runner_protocol' src Cargo.toml Cargo.lock deploy; then
+            echo 'retired sandbox backend/runner reference found in production inputs' >&2
+            exit 1
+          fi
+          if grep -RInE 'ARAPUCA_|NONO_|selfexec' src Cargo.toml deploy; then
+            echo 'retired launcher control/selfexec path found in production inputs' >&2
+            exit 1
+          fi
+          if grep -RInE '/sys/fs/cgroup|cgroup\.procs|cgroup\.subtree_control|Delegate=' src Cargo.toml deploy; then
+            echo 'sandbox cgroup control path found in production inputs' >&2
+            exit 1
+          fi
+          if grep -RInE 'Command::new\([^)]*(nono|arapuca)' src; then
+            echo 'external sandbox CLI invocation found in production source' >&2
+            exit 1
+          fi
       - name: Check the locked dependency graph
         run: cargo metadata --locked --no-deps --format-version 1
       - name: Format
@@ -57,7 +77,7 @@ jobs:
         run: cargo build --locked --all-targets
 
   supported-target-builds:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} on Rust 1.95
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -73,46 +93,71 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install Rust stable
+      - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, reviewed 2026-06-24
         with:
-          toolchain: stable
+          toolchain: '1.95.0'
           targets: ${{ matrix.target }}
       - name: Build supported target
         run: cargo build --locked --target ${{ matrix.target }}
 
-  macos-15-arm64:
-    name: macOS 15 arm64 gate
+  linux-platform:
+    name: Linux ${{ matrix.arch }} native confinement gate
     needs:
-      - rust-toolchains
+      - rust-quality
       - supported-target-builds
-    runs-on: macos-15
-    timeout-minutes: 45
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install Rust stable
+      - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, reviewed 2026-06-24
         with:
-          toolchain: stable
+          toolchain: '1.95.0'
+      - name: Run blocking native nono/Landlock + OpenSSH/PTTY gate
+        run: ./scripts/verify-linux-platform --arch ${{ matrix.arch }}
+
+  macos-15-arm64:
+    name: macOS 15 arm64 native Seatbelt gate
+    needs:
+      - rust-quality
+      - supported-target-builds
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, reviewed 2026-06-24
+        with:
+          toolchain: '1.95.0'
           targets: aarch64-apple-darwin
-      - name: Run the blocking platform gate
+      - name: Run blocking native Seatbelt + OpenSSH/PTTY gate
         run: ./scripts/verify-macos-platform --os 15
 
   macos-26-arm64:
-    name: macOS 26 arm64 gate
+    name: macOS 26 arm64 native Seatbelt gate
     needs:
-      - rust-toolchains
+      - rust-quality
       - supported-target-builds
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install Rust stable
+      - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, reviewed 2026-06-24
         with:
-          toolchain: stable
+          toolchain: '1.95.0'
           targets: aarch64-apple-darwin
-      - name: Run the blocking platform gate
+      - name: Run blocking native Seatbelt + OpenSSH/PTTY gate
         run: ./scripts/verify-macos-platform --os 26
