@@ -8,6 +8,12 @@ shboxのrelease可否は、compile成功ではなくnative platform gateとprodu
 
 Fly production acceptanceはまだ別項目として未完了である。GitHub-hosted Linux gateの成功をFly Machine/imageの実証に読み替えてはならない。
 
+## 2. CI execution policy
+
+重いnative matrixは通常のbranch push/PRでは自動実行しない。自動triggerは `v*` version tag pushだけとし、必要なpreflightだけ `workflow_dispatch` で明示実行する。
+
+これによりLinux x86_64/aarch64とmacOS 15/26のnative gateを開発中の各pushで消費せず、release candidate revisionに対して一度だけblocking validationを行う。
+
 ## 2. Current CI evidence
 
 | Gate | Status | Evidence |

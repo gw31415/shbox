@@ -1,34 +1,12 @@
 name: Release gate
 
 on:
+  # Full native validation is intentionally release-only because the
+  # Linux/macOS matrix is expensive. A version tag is the automatic release
+  # gate; workflow_dispatch remains available for deliberate preflight runs.
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-    # Rust ゲートが依存する入力のみで起動する。tag push では paths は評価されないため
-    # v* タグは常に実行される。
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'proptest-regressions/**'
-      - 'scripts/verify-linux-platform'
-      - 'scripts/verify-macos-platform'
-      - 'deploy/**'
-      - '.github/workflows/release-gate.yml'
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'proptest-regressions/**'
-      - 'scripts/verify-linux-platform'
-      - 'scripts/verify-macos-platform'
-      - 'deploy/**'
-      - '.github/workflows/release-gate.yml'
   workflow_dispatch:
 
 permissions:
