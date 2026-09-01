@@ -213,6 +213,13 @@ impl ConnHandler {
         session: &mut Session,
         result: Result<Vec<u8>, crate::sandbox::manager::Error>,
     ) -> Result<(), crate::server::HandlerError> {
+        // RFC 4254 §5.4: a want_reply subsystem request MUST be answered
+        // before the outcome streams; russh suppresses the reply when the
+        // client set want_reply=false.
+        let _ = match &result {
+            Ok(_) => session.channel_success(channel),
+            Err(_) => session.channel_failure(channel),
+        };
         match result {
             Ok(output) => {
                 if !output.is_empty() {
@@ -359,7 +366,12 @@ impl ConnHandler {
         let Some(window_revision) =
             channel::synchronize_host_window(&self.conn.registry, channel, &mut process)
         else {
+            // A failed resize ioctl means the PTY is unusable; complete the
+            // channel with the generic failure instead of leaving the client
+            // waiting on a request that was never acknowledged.
             channel::terminate_host_process(process, waiter).await;
+            let handle = session.handle();
+            let _ = channel::finish_failed(channel, &handle).await;
             self.conn.registry.remove(channel);
             return Ok(());
         };
@@ -835,5 +847,6 @@ const MAX_TERM_BYTES: usize = 256;
 const MAX_SUBSYSTEM_BYTES: usize = 64;
 /// Generic stderr line used for unavailable operations.
 const UNAVAILABLE_MESSAGE: &str = "shbox: request cannot be completed";
-/// Generic non-zero exit status for unavailable operations.
-const UNAVAILABLE_EXIT: u32 = 111;
+/// Generic non-zero exit status for unavailable operations, matching the
+/// 255 sshd reports when it cannot run the requested program.
+pub(crate) const UNAVAILABLE_EXIT: u32 = 255;

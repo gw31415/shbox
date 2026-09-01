@@ -2,14 +2,6 @@
 
 ブランチ: `stdssh-parity`(main `6ae9d29` から分岐)。Draft PR: `main` 向けに作成する。
 
-## 残作業
-
-### R1. Linux native gateでの実launch検証
-
-- **内容**: M3/M4で追加した `exec_preserves_non_utf8_command_bytes` と `shell_request_starts_a_login_argv0_shell`(`src/platform/linux.rs`、`#[cfg(target_os = "linux")]`)はmacOSでは実行できない。release gate(`.github/workflows/release-gate.yml`)はrelease専用のため、`workflow_dispatch` での事前実行かタグリリース時に結果を確認する。
-- **期待値**: 両テストとも `/bin/sh` がlogin argv[0](`-sh`)で起動し、非UTF-8バイト列(`x ff fe y`)がバイト等価でstdoutへ返る。nono profileは `/bin` をExecutableRuntimeとして許可するため追加のpath許可は不要なはず。`/etc/profile` はcurated外のためlogin shellに読めないが、shellは黙ってスキップするため `$0` 観測には影響しない。
-- **失敗時**: Linuxのargv[0]パスは `Command::arg0` の直接execでありmacOS実機で検証済みの `$0` プローブと同一の観測系。失敗時はnono prepared policyのexec許可と `arg0` とpre_execの併用可否を `scripts/verify-linux-platform` で切り分ける。
-
 ## 完了済み(詳細はgit history)
 
 - M1 signal応答 + mailbox満杯時teardown廃止 (`fix(ssh): answer signal requests...`)
@@ -18,8 +10,11 @@
 - M4 sandbox shell login argv[0](#2)
 - M5 PTYゼロ寸法契約の明記(RFC 4254 §6.2準拠の意図的偏差として記録)
 - M6 break/global request — deviated(対応不要): 未知channel requestはrusshが `CHANNEL_FAILURE`、未知global requestは `REQUEST_FAILURE` を自動返信しRFC準拠。OpenSSH clientはこれらを観測しない。
+- M7 RFC再監査 + exit 255統一: launch失敗時にrequest自体へ `CHANNEL_FAILURE` を応答(RFC 4254 §5.4)、host窓同期失敗時のsilent hang廃止(docs §16)、generic exit statusを111からsshdと同じ255へ統一。
+- R1 Linux aarch64検証: Docker Desktop VM(arm64 Linux)で `cargo clippy` + `cargo test --test-threads=1` を実行し全件合格。正式リリースゲート(`release-gate.yml`)の結果が最終証跡。
 
 ## 記録として残す判断
 
-- 起動失敗時のexit 111(docs §16)は意図的設計。sshdの255とは意図的に異なる。
 - 初回pty-reqの0寸法は24x80代替、window-changeの0寸法は他軸維持。RFC 4254 §6.2 "Zero dimension parameters MUST be ignored" に基づくsshdとの意図的偏差。
+- **russh 0.63.1 upstream既知クオーク**: 未知global request(例: OpenSSH clientがauth直後に `want_reply=0` で送る `no-more-sessions@openssh.com`)に対し、`want_reply=0` でも無条件に `REQUEST_FAILURE` を返す(RFC 4254 §4の "MUST NOT send response" 違反)。shbox層にはglobal requestの汎用hookが存在せず修正不可。OpenSSH clientはunsolicitedな `REQUEST_FAILURE` を無視するため実害なし — vendored source(`ServerSession::request_failure` はwants_replyを検査しない、`channel_success/failure` は検査する)で確認済み。
+- 起動失敗時のgeneric exit statusは255(docs §16)。かつての111は廃止済み。

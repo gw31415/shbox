@@ -906,7 +906,7 @@ fn sandbox_request_accepted(result: &SshResult, expected_stdout: &str) -> bool {
     if native_sandbox_supported() {
         result.ok() && result.stdout == expected_stdout
     } else {
-        result.status == 111
+        result.status == 255
             && result.stdout.is_empty()
             && result.stderr.contains("request cannot be completed")
     }
@@ -1093,7 +1093,7 @@ fn sandbox_requests_execute_or_fail_closed() {
         assert_eq!(result.status, 0, "real sandbox launch failed: {result:?}");
         assert_eq!(result.stdout, "nope");
     } else {
-        assert_eq!(result.status, 111, "sandbox must fail closed: {result:?}");
+        assert_eq!(result.status, 255, "sandbox must fail closed: {result:?}");
         assert!(result.stderr.contains("request cannot be completed"));
         assert!(!result.stdout.contains("nope"));
     }
@@ -1112,7 +1112,7 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
         assert!(claim.ok(), "real sandbox launch failed: {claim:?}");
         assert_eq!(claim.stdout, "ignored");
     } else {
-        assert_eq!(claim.status, 111, "sandbox must fail closed: {claim:?}");
+        assert_eq!(claim.status, 255, "sandbox must fail closed: {claim:?}");
         assert!(claim.stderr.contains("request cannot be completed"));
     }
 
