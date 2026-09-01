@@ -40,6 +40,7 @@ pub struct Paths {
     state_dir: PathBuf,
     host_key: PathBuf,
     state_lock: PathBuf,
+    runtime_dir: PathBuf,
 }
 
 impl Paths {
@@ -71,6 +72,7 @@ impl Paths {
             registry_lock: data_dir.join("registry.lock"),
             host_key: state_dir.join("host_key"),
             state_lock: state_dir.join("lock"),
+            runtime_dir: state_dir.join("runtime"),
             config_dir,
             data_dir,
             state_dir,
@@ -92,6 +94,7 @@ impl Paths {
         ensure_dir(&self.data_dir)?;
         ensure_dir(&self.sandboxes_root)?;
         ensure_dir(&self.state_dir)?;
+        ensure_dir(&self.runtime_dir)?;
         Ok(())
     }
 
@@ -133,6 +136,11 @@ impl Paths {
 
     pub fn state_lock(&self) -> &Path {
         &self.state_lock
+    }
+
+    /// Root of per-launch private temp directories used as sandbox `TMPDIR`.
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
     }
 
     /// True when `path` is `root` or located inside `root`.

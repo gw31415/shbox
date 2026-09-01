@@ -12,9 +12,9 @@
 
 #[cfg(test)]
 mod nono_api_probe {
+    use nono::CapabilitySet;
     use nono::capability::{AccessMode, IpcMode, NetworkMode, SignalMode};
     use nono::sandbox::{RawSandboxStage, SeccompOpts, detect_abi, prepare_seccomp_with_abi};
-    use nono::CapabilitySet;
 
     /// Compile-time spike for every nono API the Linux launcher relies on,
     /// pinned at `nono = "=0.74.0"`. Preparation only opens path descriptors
