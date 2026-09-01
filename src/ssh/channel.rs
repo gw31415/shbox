@@ -161,6 +161,13 @@ impl ChannelRegistry {
         self.channels.lock().expect("channel registry").remove(&id);
     }
 
+    /// Drop every channel state and, critically, every mailbox sender.
+    /// Connection teardown uses this to wake bridge tasks even when those
+    /// tasks still hold an Arc<ConnState> for final runtime cleanup.
+    pub fn clear(&self) {
+        self.channels.lock().expect("channel registry").clear();
+    }
+
     /// Atomically mark a channel as running and take its event receiver.
     ///
     /// Keeping these two changes under one lock prevents a second terminal
@@ -948,6 +955,23 @@ mod tests {
         registry.remove(first);
         registry.open(second);
         assert_eq!(registry.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn clearing_registry_wakes_started_channel_receiver() {
+        let registry = ChannelRegistry::new();
+        let id = channel_id(9);
+        registry.open(id);
+        let mut receiver = registry.start(id).expect("started receiver");
+        registry.clear();
+        assert_eq!(registry.count(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("receiver wake")
+                .is_none(),
+            "clearing the connection registry must drop the mailbox sender"
+        );
     }
 
     #[test]

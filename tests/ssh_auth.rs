@@ -360,6 +360,31 @@ impl TestDaemon {
         rows: u16,
         cols: u16,
     ) -> OpenSshPty {
+        self.spawn_ssh_pty_inner(key, username, Some(command), rows, cols, false)
+    }
+
+    /// Spawn a genuine SSH shell request instead of an exec request. The local
+    /// terminal starts in sane canonical mode so OpenSSH forwards ordinary
+    /// job-control characters (VINTR/VSUSP) in the initial `pty-req`.
+    fn spawn_ssh_interactive_pty(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        rows: u16,
+        cols: u16,
+    ) -> OpenSshPty {
+        self.spawn_ssh_pty_inner(key, username, None, rows, cols, true)
+    }
+
+    fn spawn_ssh_pty_inner(
+        &self,
+        key: &KeyPair,
+        username: &str,
+        remote_command: Option<&str>,
+        rows: u16,
+        cols: u16,
+        interactive: bool,
+    ) -> OpenSshPty {
         let size = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -369,12 +394,16 @@ impl TestDaemon {
         let pair = nix::pty::openpty(Some(&size), None).expect("open local pty");
         let master: File = pair.master.into();
         let slave: File = pair.slave.into();
-        configure_local_pty(slave.as_raw_fd());
+        if interactive {
+            configure_interactive_local_pty(slave.as_raw_fd());
+        } else {
+            configure_local_pty(slave.as_raw_fd());
+        }
         let stdout = slave.try_clone().expect("clone local pty stdout");
         let stderr = slave.try_clone().expect("clone local pty stderr");
 
-        let child = Command::new("ssh")
-            .arg("-F")
+        let mut ssh = Command::new("ssh");
+        ssh.arg("-F")
             .arg(&self.ssh_config)
             .arg("-i")
             .arg(&key.private)
@@ -382,8 +411,11 @@ impl TestDaemon {
             .arg(self.port.to_string())
             .arg("-tt")
             .args(["-o", "EscapeChar=none"])
-            .arg(format!("{username}@127.0.0.1"))
-            .arg(command)
+            .arg(format!("{username}@127.0.0.1"));
+        if let Some(remote_command) = remote_command {
+            ssh.arg(remote_command);
+        }
+        let child = ssh
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave))
             .stdout(Stdio::from(stdout))
@@ -571,6 +603,17 @@ impl OpenSshPty {
         assert_eq!(result, 0, "send SIGWINCH to OpenSSH client");
     }
 
+    fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn kill_client(&mut self) {
+        if self.is_running() {
+            self.child.kill().expect("kill OpenSSH client");
+        }
+        let _ = self.child.wait();
+    }
+
     fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
@@ -616,6 +659,18 @@ fn configure_local_pty(fd: std::os::fd::RawFd) {
     );
 }
 
+fn configure_interactive_local_pty(fd: std::os::fd::RawFd) {
+    let mut state = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: fd is the local PTY slave owned by the harness.
+    assert_eq!(unsafe { libc::tcgetattr(fd, &mut state) }, 0);
+    state.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
+    state.c_cc[libc::VINTR] = 0x03;
+    state.c_cc[libc::VSUSP] = 0x1a;
+    state.c_cc[libc::VEOF] = 0x04;
+    // SAFETY: state came from this PTY and remains initialized.
+    assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &state) }, 0);
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -630,6 +685,161 @@ fn between_markers<'a>(output: &'a [u8], start: &[u8], end: &[u8]) -> &'a [u8] {
     let content = &output[start_index + start.len()..];
     let end = find_subslice(content, end).expect("end marker");
     &content[..end]
+}
+
+#[derive(Debug)]
+struct TtyProbe {
+    tty_bits: String,
+    tty_device: u64,
+    sid: i64,
+    terminal_sid: i64,
+    process_group: i64,
+    foreground_group: i64,
+}
+
+fn build_tty_probe(workspace: &Path) -> PathBuf {
+    let source = workspace.join("m6-tty-probe.c");
+    let binary = workspace.join("m6-tty-probe");
+    std::fs::write(
+        &source,
+        r#"#define _XOPEN_SOURCE 700
+#include <stdio.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/stat.h>
+
+int main(void) {
+    pid_t sid = getsid(0);
+    pid_t terminal_sid = tcgetsid(STDIN_FILENO);
+    pid_t process_group = getpgrp();
+    pid_t foreground_group = tcgetpgrp(STDIN_FILENO);
+    struct stat terminal_stat;
+    if (fstat(STDIN_FILENO, &terminal_stat) != 0) return 2;
+    printf("__M6_TTY_PROBE__ %d%d%d %llu %ld %ld %ld %ld\n",
+           isatty(STDIN_FILENO), isatty(STDOUT_FILENO), isatty(STDERR_FILENO),
+           (unsigned long long)terminal_stat.st_rdev, (long)sid, (long)terminal_sid,
+           (long)process_group, (long)foreground_group);
+    fflush(stdout);
+    return 0;
+}
+"#,
+    )
+    .expect("write tty probe source");
+    let status = Command::new("cc")
+        .arg("-O2")
+        .arg("-Wall")
+        .arg("-Wextra")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .status()
+        .expect("C compiler runs for tty probe");
+    assert!(status.success(), "compile tty probe: {status}");
+    binary
+}
+
+fn parse_tty_probe(output: &[u8]) -> TtyProbe {
+    let text = String::from_utf8_lossy(output);
+    let line = text
+        .lines()
+        .find(|line| line.contains("__M6_TTY_PROBE__"))
+        .unwrap_or_else(|| panic!("tty probe marker missing: {text:?}"));
+    let fields = line
+        .split("__M6_TTY_PROBE__")
+        .nth(1)
+        .expect("tty probe payload")
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 6, "tty probe fields: {line:?}");
+    TtyProbe {
+        tty_bits: fields[0].to_string(),
+        tty_device: fields[1].parse().expect("tty probe device"),
+        sid: fields[2].parse().expect("tty probe sid"),
+        terminal_sid: fields[3].parse().expect("tty probe terminal sid"),
+        process_group: fields[4].parse().expect("tty probe process group"),
+        foreground_group: fields[5].parse().expect("tty probe foreground group"),
+    }
+}
+
+fn wait_for_pid_gone(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: signal zero performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DaemonFdSnapshot {
+    total: usize,
+    slave_ttys: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_fd_snapshot(pid: u32) -> DaemonFdSnapshot {
+    let directory =
+        std::fs::read_dir(format!("/proc/{pid}/fd")).expect("daemon /proc fd directory");
+    let mut targets = Vec::new();
+    for entry in directory {
+        let entry = entry.expect("daemon fd entry");
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            targets.push(target.to_string_lossy().into_owned());
+        }
+    }
+    let mut slave_ttys = targets
+        .iter()
+        .filter(|target| target.starts_with("/dev/pts/") && target.as_str() != "/dev/pts/ptmx")
+        .cloned()
+        .collect::<Vec<_>>();
+    slave_ttys.sort();
+    DaemonFdSnapshot {
+        total: targets.len(),
+        slave_ttys,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_fd_snapshot(pid: u32) -> DaemonFdSnapshot {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-Fn"])
+        .output()
+        .expect("lsof daemon descriptors");
+    assert!(output.status.success(), "lsof failed: {output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut descriptors = Vec::<Option<String>>::new();
+    let mut current: Option<usize> = None;
+    for line in text.lines() {
+        if let Some(field) = line.strip_prefix('f') {
+            current = field
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+                .then(|| {
+                    descriptors.push(None);
+                    descriptors.len() - 1
+                });
+        } else if let (Some(index), Some(name)) = (current, line.strip_prefix('n')) {
+            descriptors[index] = Some(name.to_string());
+        }
+    }
+    let mut slave_ttys = descriptors
+        .iter()
+        .filter_map(|target| target.as_ref())
+        .filter(|target| target.starts_with("/dev/ttys"))
+        .cloned()
+        .collect::<Vec<_>>();
+    slave_ttys.sort();
+    DaemonFdSnapshot {
+        total: descriptors.len(),
+        slave_ttys,
+    }
 }
 
 const RELOAD_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -669,16 +879,31 @@ fn run_ssh_command(
         .expect("ssh runs")
 }
 
-/// Linux and macOS both use their native production sandbox launcher in the
-/// ordinary OpenSSH harness. Unsupported targets keep the fail-closed branch.
-fn native_sandbox_integration_expected() -> bool {
+/// Linux and macOS have a native production sandbox launcher. Unsupported
+/// targets retain the fail-closed path used by generic protocol tests.
+fn native_sandbox_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// Blocking real-platform sandbox/PTTY acceptance is explicit. Platform gate
+/// scripts set this variable so a missing capability cannot be mistaken for a
+/// skipped success path.
+fn sandbox_integration_enabled() -> bool {
+    let enabled = std::env::var_os("SHBOX_RUN_SANDBOX_INTEGRATION").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    if enabled {
+        assert!(
+            native_sandbox_supported(),
+            "SHBOX_RUN_SANDBOX_INTEGRATION=1 requires a supported native sandbox platform"
+        );
+    }
+    enabled
 }
 
 /// Supported platforms execute the real sandbox path. Unsupported targets may
 /// authenticate successfully but must fail the sandbox request generically.
 fn sandbox_request_accepted(result: &SshResult, expected_stdout: &str) -> bool {
-    if native_sandbox_integration_expected() {
+    if native_sandbox_supported() {
         result.ok() && result.stdout == expected_stdout
     } else {
         result.status == 111
@@ -864,7 +1089,7 @@ fn unregistered_key_and_non_publickey_methods_are_refused() {
 fn sandbox_requests_execute_or_fail_closed() {
     let daemon = TestDaemon::start(&["admin"]);
     let result = daemon.ssh(&daemon.normal_key, "dev", "printf nope", &["-T"]);
-    if native_sandbox_integration_expected() {
+    if native_sandbox_supported() {
         assert_eq!(result.status, 0, "real sandbox launch failed: {result:?}");
         assert_eq!(result.stdout, "nope");
     } else {
@@ -883,7 +1108,7 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
     // The request exercises lazy first-owner claim. The real-platform suite
     // opts in explicitly; the default path proves unavailable is fail-closed.
     let claim = daemon.ssh(&daemon.normal_key, "dev", "printf ignored", &["-T"]);
-    if native_sandbox_integration_expected() {
+    if native_sandbox_supported() {
         assert!(claim.ok(), "real sandbox launch failed: {claim:?}");
         assert_eq!(claim.stdout, "ignored");
     } else {
@@ -921,7 +1146,7 @@ fn sandbox_list_and_delete_are_wired_to_the_manager() {
 /// non-zero shell exit status through the OpenSSH client.
 #[test]
 fn sandbox_non_pty_exec_reports_streams_and_status() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -941,7 +1166,7 @@ fn sandbox_non_pty_exec_reports_streams_and_status() {
 /// raw byte input, and applies a later OpenSSH window-change request.
 #[test]
 fn sandbox_pty_applies_modes_and_resize() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -1024,11 +1249,159 @@ fn sandbox_pty_applies_modes_and_resize() {
     );
 }
 
+/// The real OpenSSH PTY owns all three standard descriptors, creates a fresh
+/// session, acquires the requested controlling terminal, and exposes the
+/// foreground process group through the terminal itself.
+#[test]
+fn sandbox_pty_has_controlling_terminal_and_foreground_group() {
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let id = "m6-tty-identity";
+    let claim = daemon.ssh(&daemon.normal_key, id, "printf claim", &["-T"]);
+    assert!(claim.ok(), "create probe workspace: {claim:?}");
+    let workspace = daemon.sandbox_workspace(id);
+    let probe = build_tty_probe(&workspace);
+    assert_eq!(probe, workspace.join("m6-tty-probe"));
+
+    let daemon_sid =
+        unsafe { libc::getsid(i32::try_from(daemon.child.id()).expect("daemon pid fits pid_t")) };
+    assert!(daemon_sid > 0, "daemon session id must be observable");
+
+    let mut session = daemon.spawn_ssh_pty(&daemon.normal_key, id, "./m6-tty-probe", 33, 109);
+    let mut combined = session.read_until(b"__M6_TTY_PROBE__", Duration::from_secs(5));
+    let tail = session.read_until(b"\n", Duration::from_secs(5));
+    combined.extend_from_slice(&tail);
+    let probe = parse_tty_probe(&combined);
+    assert_eq!(probe.tty_bits, "111", "fd 0/1/2 must all be TTYs");
+    assert_ne!(
+        probe.sid,
+        i64::from(daemon_sid),
+        "sandbox reused daemon session"
+    );
+    assert_eq!(
+        probe.sid, probe.terminal_sid,
+        "controlling terminal session"
+    );
+    assert_eq!(
+        probe.process_group, probe.foreground_group,
+        "probe process group must own the terminal foreground"
+    );
+    assert!(session.wait_for_exit(Duration::from_secs(5)).success());
+}
+
+/// A genuine SSH shell request must support ordinary interactive job control,
+/// not merely look interactive because stdout is attached to a PTY.
+#[test]
+fn sandbox_interactive_pty_supports_job_control_and_mode_restore() {
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start_with_config(&["admin"], "[sandbox]\nshell = \"/bin/bash\"\n");
+    let mut session =
+        daemon.spawn_ssh_interactive_pty(&daemon.normal_key, "m6-interactive", 29, 103);
+
+    // Make the prompt deterministic, then prove command -> prompt exchange on
+    // a shell request (no remote exec command was supplied to OpenSSH).
+    session.send(b"PS1='__M6_'PROMPT'__ '\n");
+    session.read_until(b"__M6_PROMPT__ ", Duration::from_secs(5));
+    session.send(b"printf '__M6_%s__\\n' SHELL_READY\n");
+    session.read_until(b"__M6_SHELL_READY__", Duration::from_secs(5));
+    session.read_until(b"__M6_PROMPT__ ", Duration::from_secs(5));
+    session.send(b"stty -a; printf '__M6_%s__\\n' STTY_END\n");
+    let initial_modes = session.read_until(b"__M6_STTY_END__", Duration::from_secs(5));
+    let initial_modes_text = String::from_utf8_lossy(&initial_modes).to_lowercase();
+    assert!(
+        initial_modes_text.contains("susp = ^z"),
+        "remote PTY did not receive VSUSP=^Z: {initial_modes_text}"
+    );
+
+    // A foreground job receives terminal VINTR while the shell survives and
+    // accepts the next command.
+    session.send(b"sleep 30\n");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(&[0x03]);
+    session.send(b"printf '__M6_%s__\\n' AFTER_INT\n");
+    session.read_until(b"__M6_AFTER_INT__", Duration::from_secs(5));
+
+    // VSUSP must stop the foreground job and return control to bash. `jobs`
+    // then exposes the stopped job rather than losing it in the launcher.
+    session.send(b"sleep 30\n");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(&[0x1a]);
+    session.send(b"jobs; printf '__M6_%s__\\n' JOBS_END\n");
+    let jobs = session.read_until(b"__M6_JOBS_END__", Duration::from_secs(5));
+    let jobs_text = String::from_utf8_lossy(&jobs).to_lowercase();
+    assert!(
+        jobs_text.contains("sleep 30"),
+        "stopped job missing: {jobs_text}"
+    );
+    assert!(
+        jobs_text.contains("stopped") || jobs_text.contains("suspended"),
+        "foreground job was not stopped: {jobs_text}"
+    );
+
+    // `bg` and `fg` must preserve the same job-control relationship. Resume in
+    // background, verify it is running, return it to foreground, then interrupt.
+    session.send(b"bg; jobs; printf '__M6_%s__\\n' BG_END\n");
+    let background = session.read_until(b"__M6_BG_END__", Duration::from_secs(5));
+    let background_text = String::from_utf8_lossy(&background).to_lowercase();
+    assert!(
+        background_text.contains("running"),
+        "bg did not resume job: {background_text}"
+    );
+    session.send(b"fg\n");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(&[0x03]);
+    session.send(b"printf '__M6_%s__\\n' AFTER_FG\n");
+    session.read_until(b"__M6_AFTER_FG__", Duration::from_secs(5));
+
+    // A nested foreground process group receives the terminal-generated INT;
+    // the outer interactive shell remains alive afterward.
+    session.send(
+        b"/bin/sh -c 'trap \"printf \"__M6_%s__\" NESTED_INT; exit 31\" INT; printf \"__M6_%s__\" NESTED_READY; while :; do sleep 1; done'\n",
+    );
+    session.read_until(b"__M6_NESTED_READY__", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(100));
+    session.send(&[0x03]);
+    session.read_until(b"__M6_NESTED_INT__", Duration::from_secs(5));
+    session.send(b"printf '__M6_%s__\\n' OUTER_ALIVE\n");
+    session.read_until(b"__M6_OUTER_ALIVE__", Duration::from_secs(5));
+
+    // A small raw-mode fixture changes the remote terminal and restores the
+    // exact termios encoding before returning to the shell.
+    session.send(
+        b"saved=$(stty -g); stty raw -echo; raw=$(stty -g); stty \"$saved\"; after=$(stty -g); if [ \"$saved\" = \"$after\" ] && [ \"$raw\" != \"$after\" ]; then printf '__M6_%s__\\n' RAW_RESTORED; else printf '__M6_%s__\\n' RAW_BAD; fi\n",
+    );
+    let raw = session.read_until(b"__M6_RAW_RESTORED__", Duration::from_secs(5));
+    assert!(
+        !String::from_utf8_lossy(&raw).contains("__M6_RAW_BAD__"),
+        "raw mode was not restored"
+    );
+
+    session.send(b"jobs -p; printf '__M6_%s__\\n' FINAL_JOBS_END\n");
+    let final_jobs = session.read_until(b"__M6_FINAL_JOBS_END__", Duration::from_secs(5));
+    let final_jobs_text = String::from_utf8_lossy(&final_jobs);
+    assert!(
+        !final_jobs_text
+            .lines()
+            .any(|line| line.trim().parse::<u32>().is_ok()),
+        "interactive shell retained a job: {final_jobs_text:?}"
+    );
+    session.read_until(b"__M6_PROMPT__ ", Duration::from_secs(5));
+    session.send(b"printf '__M6_%s__\\n' EXITING; exit 0\n");
+    session.read_until(b"__M6_EXITING__", Duration::from_secs(5));
+    assert!(session.wait_for_exit(Duration::from_secs(5)).success());
+}
+
 /// The real launch maps HOME/PWD to the durable workspace, injects only the
 /// configured sandbox environment, and keeps a client env request out.
 #[test]
 fn sandbox_maps_environment_and_workspace() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -1073,7 +1446,7 @@ fn sandbox_maps_environment_and_workspace() {
 /// PTY EOF does not inject a VEOF byte into the sandbox child.
 #[test]
 fn sandbox_eof_behavior_is_transport_correct() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -1171,7 +1544,7 @@ fn sandbox_eof_behavior_is_transport_correct() {
 /// the real PTY exec as the command's handled interrupt exit.
 #[test]
 fn sandbox_pty_forwards_terminal_signal() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -1198,7 +1571,7 @@ fn sandbox_pty_forwards_terminal_signal() {
 /// descendant from the sandbox runtime before the daemon exits.
 #[test]
 fn sandbox_shutdown_cleans_up_descendants() {
-    if !native_sandbox_integration_expected() {
+    if !sandbox_integration_enabled() {
         return;
     }
 
@@ -1268,6 +1641,166 @@ fn sandbox_shutdown_cleans_up_descendants() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Killing the OpenSSH client closes the channel/connection. shbox must then
+/// tear down and reap the managed PTY shell rather than leaving a detached
+/// session behind. PTY EOF remains non-synthetic; channel close uses the
+/// documented TERM -> KILL cleanup path.
+#[test]
+fn sandbox_pty_disconnect_reaps_managed_shell() {
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start_with_config(&["admin"], "[sandbox]\nshell = \"/bin/bash\"\n");
+    let id = "m6-disconnect";
+    let pid_path = daemon.sandbox_workspace(id).join("m6-disconnect.pid");
+    let mut session = daemon.spawn_ssh_pty(
+        &daemon.normal_key,
+        id,
+        r#"printf '%s' "$$" > "$HOME/m6-disconnect.pid"; printf __M6_DISCONNECT_READY__; while :; do sleep 1; done"#,
+        24,
+        80,
+    );
+    session.read_until(b"__M6_DISCONNECT_READY__", Duration::from_secs(5));
+    let pid = retry_until("sandbox PTY pid file", || {
+        std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+    });
+    session.kill_client();
+    if !wait_for_pid_gone(pid, Duration::from_secs(12)) {
+        let ps = Command::new("ps")
+            .args([
+                "-o",
+                "pid,ppid,pgid,sid,state,etime,command",
+                "-p",
+                &pid.to_string(),
+            ])
+            .output()
+            .expect("ps remote shell");
+        panic!(
+            "sandbox PTY shell {pid} survived SSH disconnect: {}",
+            String::from_utf8_lossy(&ps.stdout)
+        );
+    }
+}
+
+/// PTY allocation must not leak the slave into the daemon, and repeated real
+/// OpenSSH PTY sessions must return the daemon descriptor table to baseline.
+#[test]
+fn repeated_sandbox_ptys_do_not_leak_slave_or_daemon_fds() {
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let warmup = daemon.ssh(&daemon.normal_key, "m6-fd", "printf warm", &["-tt"]);
+    assert!(warmup.ok(), "PTY warmup failed: {warmup:?}");
+    let baseline = daemon_fd_snapshot(daemon.child.id());
+    assert!(
+        baseline.slave_ttys.is_empty(),
+        "daemon baseline unexpectedly owns PTY slaves: {baseline:?}"
+    );
+
+    let mut live = daemon.spawn_ssh_pty(
+        &daemon.normal_key,
+        "m6-fd",
+        "printf __M6_FD_READY__; sleep 30",
+        24,
+        80,
+    );
+    live.read_until(b"__M6_FD_READY__", Duration::from_secs(5));
+    let during = daemon_fd_snapshot(daemon.child.id());
+    assert!(
+        during.slave_ttys.is_empty(),
+        "daemon retained a PTY slave after launch: {during:?}"
+    );
+    live.kill_client();
+
+    for index in 0..16 {
+        let result = daemon.ssh(
+            &daemon.normal_key,
+            "m6-fd",
+            &format!("printf pty-{index}"),
+            &["-tt"],
+        );
+        assert!(result.ok(), "PTY iteration {index} failed: {result:?}");
+    }
+
+    let settled = retry_until("daemon PTY fd table returned to baseline", || {
+        let snapshot = daemon_fd_snapshot(daemon.child.id());
+        (snapshot.total <= baseline.total && snapshot.slave_ttys == baseline.slave_ttys)
+            .then_some(snapshot)
+    });
+    assert!(
+        settled.total <= baseline.total,
+        "daemon fd count grew: baseline={baseline:?} settled={settled:?}"
+    );
+}
+
+/// Concurrent PTY channels must own distinct terminals. A resize and terminal
+/// signal applied to one session must neither resize nor terminate the other.
+#[test]
+fn concurrent_sandbox_ptys_isolate_terminal_state_and_signals() {
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let daemon = TestDaemon::start_with_config(&["admin"], "[sandbox]\nshell = \"/bin/bash\"\n");
+    for id in ["m6-concurrent-a", "m6-concurrent-b"] {
+        let claim = daemon.ssh(&daemon.normal_key, id, "printf claim", &["-T"]);
+        assert!(claim.ok(), "create concurrent probe workspace: {claim:?}");
+        build_tty_probe(&daemon.sandbox_workspace(id));
+    }
+    let command_a = r#"./m6-tty-probe; exec /bin/sh -c 'trap "printf __M6_A_WINCH__" WINCH; trap "printf __M6_A_INT__; exit 41" INT; printf __M6_A_READY__; while :; do if IFS= read -r line; then case "$line" in size) printf __M6_A_SIZE__; stty size; printf __M6_A_SIZE_END__;; alive) printf __M6_A_ALIVE__;; esac; fi; done'"#;
+    let command_b = r#"./m6-tty-probe; exec /bin/sh -c 'trap "printf __M6_B_WINCH__" WINCH; trap "printf __M6_B_INT__; exit 42" INT; printf __M6_B_READY__; while :; do if IFS= read -r line; then case "$line" in size) printf __M6_B_SIZE__; stty size; printf __M6_B_SIZE_END__;; alive) printf __M6_B_ALIVE__;; esac; fi; done'"#;
+    let mut first = daemon.spawn_ssh_pty(&daemon.normal_key, "m6-concurrent-a", command_a, 24, 80);
+    let mut second = daemon.spawn_ssh_pty(&daemon.normal_key, "m6-concurrent-b", command_b, 24, 80);
+    let first_ready = first.read_until(b"__M6_A_READY__", Duration::from_secs(5));
+    let second_ready = second.read_until(b"__M6_B_READY__", Duration::from_secs(5));
+    let first_probe = parse_tty_probe(&first_ready);
+    let second_probe = parse_tty_probe(&second_ready);
+    assert_eq!(first_probe.tty_bits, "111");
+    assert_eq!(second_probe.tty_bits, "111");
+    assert_ne!(
+        first_probe.tty_device, second_probe.tty_device,
+        "concurrent sessions shared a controlling TTY device"
+    );
+    assert_ne!(
+        first_probe.sid, second_probe.sid,
+        "concurrent sessions shared a SID"
+    );
+
+    first.resize(37, 111);
+    first.read_until(b"__M6_A_WINCH__", Duration::from_secs(5));
+    second.send(b"size\n");
+    let second_size = second.read_until(b"__M6_B_SIZE_END__", Duration::from_secs(5));
+    let second_size = String::from_utf8_lossy(between_markers(
+        &second_size,
+        b"__M6_B_SIZE__",
+        b"__M6_B_SIZE_END__",
+    ));
+    assert!(
+        second_size.contains("24 80"),
+        "first session resize leaked into second: {second_size:?}"
+    );
+
+    first.send(&[0x03]);
+    first.read_until(b"__M6_A_INT__", Duration::from_secs(5));
+    assert_eq!(
+        first.wait_for_exit(Duration::from_secs(5)).code(),
+        Some(41),
+        "first terminal signal did not reach its process group"
+    );
+    assert!(
+        second.is_running(),
+        "first terminal signal killed second SSH session"
+    );
+    second.send(b"alive\n");
+    second.read_until(b"__M6_B_ALIVE__", Duration::from_secs(5));
+    second.kill_client();
 }
 
 /// Client `env` requests are rejected but never kill the connection; an
