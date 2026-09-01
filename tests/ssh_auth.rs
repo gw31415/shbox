@@ -2304,3 +2304,113 @@ fn daemon_crash_does_not_orphan_an_active_host_process() {
     }
     let _ = std::fs::remove_file(pid_path);
 }
+
+/// SSH `signal` requests reach the managed process group and never take the
+/// channel or connection down by themselves (docs/ssh-protocol.md §13). The
+/// OpenSSH CLI cannot issue a `signal` request, so this drives the daemon
+/// with the same russh protocol stack the server uses.
+#[tokio::test]
+async fn ssh_signal_requests_forward_and_keep_the_channel_alive() {
+    use std::sync::Arc as StdArc;
+
+    use russh::client::{self, Handle};
+    use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
+    use russh::{ChannelMsg, Disconnect, Sig};
+
+    struct TrustAll;
+    impl client::Handler for TrustAll {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    let daemon = TestDaemon::start(&["admin"]);
+    let secret =
+        StdArc::new(load_secret_key(&daemon.admin_key.private, None).expect("load admin key"));
+    let config = StdArc::new(client::Config::default());
+    let mut handle: Handle<TrustAll> = client::connect(
+        config,
+        (std::net::IpAddr::from([127, 0, 0, 1]), daemon.port),
+        TrustAll,
+    )
+    .await
+    .expect("russh client connect");
+    let auth = handle
+        .authenticate_publickey(
+            "_",
+            PrivateKeyWithHashAlg::new(StdArc::clone(&secret), None),
+        )
+        .await
+        .expect("auth round trip");
+    assert!(
+        matches!(auth, russh::client::AuthResult::Success),
+        "admin key must authenticate: {auth:?}"
+    );
+
+    let mut channel = handle.channel_open_session().await.expect("open session");
+    channel.exec(true, "sleep 30").await.expect("exec sent");
+    match channel.wait().await.expect("exec reply") {
+        ChannelMsg::Success => {}
+        other => panic!("exec was not acknowledged: {other:?}"),
+    }
+
+    // An unrecognized signal name is refused without touching the channel,
+    // and a known signal reaches the process group: `sleep` dies by SIGINT
+    // and the bridge reports exit-signal INT followed by an orderly close.
+    channel
+        .signal(Sig::Custom("NOSUCH".to_string()))
+        .await
+        .expect("unknown signal sent");
+    channel.signal(Sig::INT).await.expect("signal sent");
+    let mut saw_exit_signal = false;
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait())
+            .await
+            .expect("channel completion timeout")
+            .expect("channel message");
+        match message {
+            ChannelMsg::ExitSignal { signal_name, .. } => {
+                assert_eq!(
+                    format!("{signal_name:?}"),
+                    "INT",
+                    "sleep must die by SIGINT"
+                );
+                saw_exit_signal = true;
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                panic!("signaled death must not report exit-status {exit_status}");
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    assert!(saw_exit_signal, "exit-signal INT must precede close");
+
+    // The connection itself is unaffected: a fresh channel still runs.
+    let mut followup = handle.channel_open_session().await.expect("second session");
+    followup
+        .exec(false, "printf alive")
+        .await
+        .expect("second exec sent");
+    followup.eof().await.expect("client eof");
+    let mut saw_output = false;
+    while let Ok(Some(message)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), followup.wait()).await
+    {
+        match message {
+            ChannelMsg::Data { data } if data.as_ref() == b"alive" => saw_output = true,
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    assert!(saw_output, "second channel must run after signal teardown");
+
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "done", "en")
+        .await;
+}

@@ -33,8 +33,11 @@ fn dimension_or_default(value: u32) -> libc::c_ushort {
 }
 
 impl PtyRequest {
-    /// Initial window size with the RFC 4254 zero-dimension rule: a zero
-    /// dimension falls back to the 24x80 default instead of a 0x0 terminal.
+    /// Initial window size under the RFC 4254 §6.2 rule that zero
+    /// dimension parameters MUST be ignored: shbox ignores a zero by
+    /// substituting the 24x80 default instead of creating a 0x0 terminal.
+    /// This is a deliberate deviation from sshd, which passes client
+    /// dimensions through verbatim.
     pub fn window_size(&self) -> libc::winsize {
         libc::winsize {
             ws_row: if self.rows == 0 {
@@ -580,6 +583,16 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
+/// Exit-signal wire name for a wait status, logging any number outside the
+/// known tables instead of silently misreporting it as another signal. The
+/// realistic remainder is Linux realtime signals.
+pub fn exit_signal_name(number: i32) -> &'static str {
+    name_from_signal(number).unwrap_or_else(|| {
+        tracing::warn!("child died by unmapped signal {number}; reporting TERM");
+        "TERM"
+    })
+}
+
 /// Map an SSH signal name to the libc signal number. Only the RFC 4254 set
 /// the spec accepts is allowed; everything else is rejected by the caller.
 pub fn signal_from_name(name: &str) -> Option<i32> {
@@ -603,6 +616,11 @@ pub fn signal_from_name(name: &str) -> Option<i32> {
 }
 
 /// Map a libc signal number back to the SSH signal name for exit-signal.
+///
+/// The RFC 4254 request set above is the minimum; a process may also die by
+/// any other standard signal (a `SIGSYS` confinement violation, for example),
+/// and sshd reports the real name, so this table covers the full portable
+/// POSIX set plus the platform extras.
 pub fn name_from_signal(number: i32) -> Option<&'static str> {
     match number {
         libc::SIGABRT => Some("ABRT"),
@@ -618,6 +636,25 @@ pub fn name_from_signal(number: i32) -> Option<&'static str> {
         libc::SIGTERM => Some("TERM"),
         libc::SIGUSR1 => Some("USR1"),
         libc::SIGUSR2 => Some("USR2"),
+        libc::SIGCHLD => Some("CHLD"),
+        libc::SIGCONT => Some("CONT"),
+        libc::SIGIO => Some("IO"),
+        libc::SIGPROF => Some("PROF"),
+        libc::SIGSTOP => Some("STOP"),
+        libc::SIGSYS => Some("SYS"),
+        libc::SIGTRAP => Some("TRAP"),
+        libc::SIGTSTP => Some("TSTP"),
+        libc::SIGTTIN => Some("TTIN"),
+        libc::SIGTTOU => Some("TTOU"),
+        libc::SIGURG => Some("URG"),
+        libc::SIGVTALRM => Some("VTALRM"),
+        libc::SIGWINCH => Some("WINCH"),
+        libc::SIGXCPU => Some("XCPU"),
+        libc::SIGXFSZ => Some("XFSZ"),
+        #[cfg(target_os = "macos")]
+        libc::SIGEMT => Some("EMT"),
+        #[cfg(target_os = "linux")]
+        libc::SIGSTKFLT => Some("STKFLT"),
         _ => None,
     }
 }
@@ -658,10 +695,54 @@ mod tests {
             ("TERM", libc::SIGTERM),
             ("USR1", libc::SIGUSR1),
             ("USR2", libc::SIGUSR2),
+            // The extended exit-reporting set: a process may die by any
+            // standard signal, and the wire name must match reality.
+            ("SYS", libc::SIGSYS),
+            ("TRAP", libc::SIGTRAP),
+            ("WINCH", libc::SIGWINCH),
+            ("XCPU", libc::SIGXCPU),
+            ("XFSZ", libc::SIGXFSZ),
+            ("TSTP", libc::SIGTSTP),
+            ("CONT", libc::SIGCONT),
+            ("STOP", libc::SIGSTOP),
+            ("CHLD", libc::SIGCHLD),
+            ("TTIN", libc::SIGTTIN),
+            ("TTOU", libc::SIGTTOU),
+            ("URG", libc::SIGURG),
+            ("VTALRM", libc::SIGVTALRM),
+            ("PROF", libc::SIGPROF),
+            ("IO", libc::SIGIO),
         ] {
-            assert_eq!(signal_from_name(name), Some(number));
             assert_eq!(name_from_signal(number), Some(name));
+            if in_rfc_request_set(name) {
+                assert_eq!(signal_from_name(name), Some(number));
+            } else {
+                assert_eq!(
+                    signal_from_name(name),
+                    None,
+                    "the request set stays RFC 4254"
+                );
+            }
         }
         assert_eq!(signal_from_name("SIGTERM"), None);
+    }
+
+    fn in_rfc_request_set(name: &str) -> bool {
+        matches!(
+            name,
+            "ABRT"
+                | "ALRM"
+                | "FPE"
+                | "HUP"
+                | "ILL"
+                | "INT"
+                | "KILL"
+                | "PIPE"
+                | "QUIT"
+                | "SEGV"
+                | "TERM"
+                | "USR1"
+                | "USR2"
+        )
     }
 }
