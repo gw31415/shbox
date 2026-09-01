@@ -230,9 +230,11 @@ pipeをPTYの代用にしてはならない。
 
 ## 9. CI migration guards
 
+release workflowは `v*` tag push時（または明示的なmanual dispatch時）だけ実行する。通常のbranch push/PRでは重いnative matrixを起動しない。
+
 release workflowはproduction inputsに、廃止済みsandbox backend、sibling launcher helper、launcher-control environment path、external sandbox CLI invocation、sandbox用control-group filesystem write pathが再導入された場合に失敗する。
 
-このguardはbehavior testの代用ではなく、architecture regressionを早期検出するための追加条件である。
+このguardはbehavior testの代用ではなく、release時にarchitecture regressionを拒否する追加条件である。開発中の検出はlocal checksを使い、必要な場合だけmanual dispatchする。
 
 ## 10. 現在のCI証拠
 
