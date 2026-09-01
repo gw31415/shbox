@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
-# M8 blocking macOS platform gate.
+# Blocking fixed-version macOS sandbox/PTTY platform gate.
 #
-# This gate is intentionally fail-closed. It accepts only the explicitly
-# requested OS major version on native arm64, and requires the deprecated
-# Seatbelt executable plus an Arapuca wrapper built from the pinned revision.
+# shbox owns process/PTY lifecycle and invokes Apple's sandbox-exec with a
+# parent-built Seatbelt profile. No external wrapper or selfexec mode exists.
 
 set -euo pipefail
+umask 077
 
-readonly ARAPUCA_REVISION="c94802c4d8b6b880334c0d643b16b7326ec7f039"
-readonly ARAPUCA_VERSION="0.2.7"
-readonly ARAPUCA_GIT_URL="https://github.com/LeGambiArt/arapuca"
+readonly RUST_MINOR="1.95"
 
 die() {
-  printf 'M8 macOS gate: %s\n' "$*" >&2
+  printf 'macOS platform gate: %s\n' "$*" >&2
   exit 1
 }
 
 usage() {
-  cat >&2 <<'EOF'
+  cat >&2 <<'USAGE'
 usage: scripts/verify-macos-platform --os 15|26
 
-The gate requires the exact requested macOS major version, native arm64, a
-non-root account, /usr/bin/sandbox-exec, and builds the Arapuca wrapper from
-the pinned revision before running the suite.
-EOF
+Runs the real shbox Seatbelt + OpenSSH/PTTY gate on native arm64. The exact
+macOS major is mandatory because sandbox-exec is deprecated and support is
+established only by an explicit fixed-version passing run.
+USAGE
   exit 2
 }
 
@@ -42,12 +40,9 @@ while (($# > 0)); do
     -h|--help)
       usage
       ;;
-    *)
-      usage
-      ;;
+    *) usage ;;
   esac
 done
-
 case "$expected_os" in
   15|26) ;;
   *) usage ;;
@@ -59,26 +54,22 @@ cd -- "$repo_root"
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
 }
-
-for command_name in awk cargo grep id mktemp rustc sh ssh ssh-keygen sw_vers uname; do
+for command_name in cargo cc grep id rustc ssh ssh-keygen sw_vers uname; do
   require_command "$command_name"
 done
+if rustc "+$RUST_MINOR" --version >/dev/null 2>&1 && cargo "+$RUST_MINOR" --version >/dev/null 2>&1; then
+  rustc_gate() { rustc "+$RUST_MINOR" "$@"; }
+  cargo_gate() { cargo "+$RUST_MINOR" "$@"; }
+else
+  rustc_gate() { rustc "$@"; }
+  cargo_gate() { cargo "$@"; }
+fi
 
-toml_pin="arapuca = { git = \"$ARAPUCA_GIT_URL\", rev = \"$ARAPUCA_REVISION\" }"
-grep -Fqx "$toml_pin" Cargo.toml || die "Cargo.toml does not pin Arapuca revision $ARAPUCA_REVISION"
-lock_source="source = \"git+$ARAPUCA_GIT_URL?rev=$ARAPUCA_REVISION#$ARAPUCA_REVISION\""
-awk -v expected_version='version = "0.2.7"' -v expected_source="$lock_source" '
-  $0 == "[[package]]" { inside = 0 }
-  $0 == "name = \"arapuca\"" { inside = 1; seen = 1; next }
-  inside && $0 == expected_version { version = 1 }
-  inside && $0 == expected_source { source = 1 }
-  END { exit !(seen && version && source) }
-' Cargo.lock || die "Cargo.lock does not contain Arapuca 0.2.7 at revision $ARAPUCA_REVISION"
+[[ -x /bin/bash ]] || die "blocking interactive PTY suite requires /bin/bash"
 
 [[ "$(uname -s)" == 'Darwin' ]] || die "runner OS is not macOS"
 actual_machine="$(uname -m)"
 [[ "$actual_machine" == 'arm64' ]] || die "runner architecture is $actual_machine, expected native arm64"
-
 actual_os="$(sw_vers -productVersion)"
 actual_major="${actual_os%%.*}"
 [[ "$actual_major" == "$expected_os" ]] || die "runner is macOS $actual_os, expected fixed macOS $expected_os"
@@ -87,43 +78,46 @@ uid="$(id -u)"
 [[ "$uid" != '0' ]] || die "the platform gate must run as a non-root account"
 runner_user="$(id -un)"
 if [[ -n "${SHBOX_EXPECTED_USER:-}" && "$runner_user" != "$SHBOX_EXPECTED_USER" ]]; then
-  die "runner account is $runner_user, expected dedicated account $SHBOX_EXPECTED_USER"
+  die "runner account is $runner_user, expected $SHBOX_EXPECTED_USER"
 fi
 
-# Apple has deprecated sandbox-exec/Seatbelt. Its continued availability is a
-# prerequisite of this pinned Arapuca backend, so disappearance is blocking.
-printf 'M8 macOS gate: WARNING: /usr/bin/sandbox-exec (Seatbelt) is deprecated by Apple; this is a fixed-version gate only.\n' >&2
-seatbelt='/usr/bin/sandbox-exec'
-[[ -x "$seatbelt" ]] || die "deprecated Seatbelt prerequisite is missing: $seatbelt"
-"$seatbelt" -n no-network /usr/bin/true >/dev/null 2>&1 || \
-  die "deprecated Seatbelt prerequisite cannot execute a no-network probe"
-
-wrapper_root="$(mktemp -d -t shbox-arapuca.XXXXXX)" || die "cannot create a private Arapuca build directory"
-trap 'rm -rf -- "$wrapper_root"' EXIT
-cargo install --locked --git "$ARAPUCA_GIT_URL" --rev "$ARAPUCA_REVISION" arapuca \
-  --bin arapuca --root "$wrapper_root" || die "cannot build Arapuca at the pinned revision"
-wrapper_path="$wrapper_root/bin/arapuca"
-[[ -f "$wrapper_path" && -x "$wrapper_path" ]] || die "pinned Arapuca wrapper was not installed"
-export PATH="$wrapper_root/bin:$PATH"
-wrapper_version="$("$wrapper_path" --version 2>&1)" || die "Arapuca wrapper cannot report its version"
-[[ "$wrapper_version" == *"arapuca $ARAPUCA_VERSION"* ]] || \
-  die "Arapuca wrapper reports an unexpected version: $wrapper_version"
-
+rustc_version="$(rustc_gate --version)"
+[[ "$rustc_version" == "rustc $RUST_MINOR."* ]] || die "Rust $RUST_MINOR is required, got: $rustc_version"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" Cargo.toml || die "Cargo.toml rust-version is not $RUST_MINOR"
 target='aarch64-apple-darwin'
-rustc_host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
+rustc_host="$(rustc_gate -vV | awk '$1 == "host:" { print $2 }')"
 [[ "$rustc_host" == "$target" ]] || die "rustc host is $rustc_host, expected native target $target"
 
-printf 'M8 macOS gate: macOS %s, %s, user %s (uid %s)\n' "$actual_os" "$actual_machine" "$runner_user" "$uid"
-printf 'M8 macOS gate: Seatbelt probe passed; deprecated dependency is present\n'
-printf 'M8 macOS gate: rustc -vV\n'
-rustc -vV
-printf 'M8 macOS gate: OpenSSH version\n'
+# There is no wrapper/selfexec compatibility path in the production source.
+if grep -RnE 'ARAPUCA_|NONO_|selfexec' src Cargo.toml >/dev/null 2>&1; then
+  die "production source still contains a launcher-control/selfexec path"
+fi
+
+seatbelt='/usr/bin/sandbox-exec'
+[[ -x "$seatbelt" ]] || die "Seatbelt prerequisite is missing: $seatbelt"
+printf 'macOS platform gate: WARNING: sandbox-exec is deprecated; this gate proves only fixed macOS %s.\n' "$expected_os" >&2
+
+# Tiny policy smoke: an allow-default profile must execute, while an explicit
+# deny for the /etc subtree must actually block a read. This proves sandbox-exec is
+# not merely present but enforcing the supplied profile.
+allow_profile='(version 1)(allow default)'
+deny_profile='(version 1)(allow default)(deny file-read* (subpath \"/etc\"))'
+"$seatbelt" -p "$allow_profile" /usr/bin/true >/dev/null 2>&1 || \
+  die "Seatbelt allow smoke failed"
+if "$seatbelt" -p "$deny_profile" /bin/cat /etc/hosts >/dev/null 2>&1; then
+  die "Seatbelt deny smoke did not block /etc/hosts"
+fi
+
+printf 'macOS platform gate: macOS=%s arch=%s user=%s uid=%s\n' \
+  "$actual_os" "$actual_machine" "$runner_user" "$uid"
+printf 'macOS platform gate: %s; Seatbelt deny/allow smoke passed\n' "$rustc_version"
+printf 'macOS platform gate: OpenSSH version\n'
 ssh -V 2>&1
-printf 'M8 macOS gate: Arapuca %s wrapper %s (declared revision %s)\n' "$ARAPUCA_VERSION" "$wrapper_path" "$ARAPUCA_REVISION"
-printf 'M8 macOS gate: running locked native build and real OpenSSH suite\n'
 
-cargo metadata --locked --no-deps --format-version 1 >/dev/null
-cargo build --locked --release --target "$target"
-SHBOX_RUN_ARAPUCA_INTEGRATION=1 cargo test --locked --target "$target" --test ssh_auth -- --test-threads=1
+cargo_gate metadata --locked --no-deps --format-version 1 >/dev/null
+cargo_gate build --locked --release --target "$target"
+printf 'macOS platform gate: full native Seatbelt + OpenSSH/PTTY acceptance\n'
+SHBOX_RUN_SANDBOX_INTEGRATION=1 cargo_gate test --locked --target "$target" -- --test-threads=1
+cargo_gate check --locked --all-targets --target "$target"
 
-printf 'M8 macOS gate: PASS for macOS %s arm64\n' "$expected_os"
+printf 'macOS platform gate: PASS for macOS %s arm64\n' "$expected_os"

@@ -12,6 +12,8 @@ WorkingDirectory=/var/lib/shbox
 ExecStart=/usr/local/bin/shbox --listen 0.0.0.0:22 --log-level info
 Restart=on-failure
 RestartSec=2s
+# KillMode=control-group is a systemd service-manager cleanup choice only.
+# shbox itself neither requires delegated controllers nor writes cgroupfs.
 KillMode=control-group
 TimeoutStopSec=10s
 UMask=0077
