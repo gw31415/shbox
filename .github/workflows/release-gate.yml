@@ -1,4 +1,4 @@
-name: M8 release gate
+name: Release gate
 
 on:
   push:
@@ -17,7 +17,7 @@ on:
       - 'scripts/verify-linux-platform'
       - 'scripts/verify-macos-platform'
       - 'deploy/**'
-      - '.github/workflows/m8-release-gate.yml'
+      - '.github/workflows/release-gate.yml'
   pull_request:
     paths:
       - 'src/**'
@@ -28,14 +28,14 @@ on:
       - 'scripts/verify-linux-platform'
       - 'scripts/verify-macos-platform'
       - 'deploy/**'
-      - '.github/workflows/m8-release-gate.yml'
+      - '.github/workflows/release-gate.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: m8-release-gate-${{ github.ref }}
+  group: release-gate-${{ github.ref }}
   cancel-in-progress: false
 
 env:

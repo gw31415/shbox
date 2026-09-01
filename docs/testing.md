@@ -236,7 +236,7 @@ release workflowはproduction inputsに、廃止済みsandbox backend、sibling 
 
 ## 10. 現在のCI証拠
 
-PR run `33518661744`、commit `aff82c4` でM8 release gateは全job成功した。
+PR run `33518661744`、commit `aff82c4` でnative release gateは全job成功した。
 
 - Rust 1.95 quality gate: success
 - stable quality gate: success
