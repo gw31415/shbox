@@ -2,7 +2,7 @@
 name = "shbox"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 description = "Foreground SSH daemon that maps OpenSSH clients onto persistent Arapuca sandbox workspaces"
 publish = false
 
@@ -22,6 +22,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "registry", "time"] }
 usage-rs = { package = "usage-rs", version = "=6.5.0", features = ["completions"] }
 usage-lib = "=6.5.0"
 xdg = "=3.0.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nono = { version = "=0.74.0", default-features = false }
 
 [dev-dependencies]
 proptest = "1"

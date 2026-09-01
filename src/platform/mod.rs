@@ -18,6 +18,8 @@ use crate::sandbox::SandboxId;
 mod arapuca;
 #[cfg(unix)]
 mod terminal;
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(unix)]
 pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
