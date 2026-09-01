@@ -27,9 +27,6 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::os::unix::process::CommandExt;
-
 use tracing::{debug, error, info, warn};
 
 /// Foreground SSH daemon mapping authenticated keys onto persistent sandbox
@@ -186,11 +183,6 @@ fn emit(action: OutputAction) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if embedded_arapuca_wrapper_invocation() {
-        return run_embedded_arapuca_wrapper();
-    }
-
     let args = Args::parse();
     match args.output_action() {
         Ok(Some(action)) => return emit(action),
@@ -214,57 +206,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// macOS does not need Arapuca's Linux Landlock/seccomp wrapper, but it still
-/// needs the wrapper boundary for per-process rlimits. Reuse the daemon
-/// executable for that small boundary when a standalone `arapuca` binary is
-/// not installed. The environment sentinel is set only by Arapuca's own
-/// launch path; ordinary `shbox` invocations continue through the CLI parser.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn embedded_arapuca_wrapper_invocation() -> bool {
-    std::env::var_os("ARAPUCA_WRAPPER").as_deref() == Some(std::ffi::OsStr::new("1"))
-        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--"))
-}
-
-/// Apply the rlimits prepared by Arapuca and replace this process with the
-/// Seatbelt command. This mirrors the standalone Arapuca wrapper contract:
-/// ARAPUCA_* control variables are consumed here and never reach the
-/// sandboxed command.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn run_embedded_arapuca_wrapper() -> ExitCode {
-    let mut args = std::env::args_os();
-    let _executable = args.next();
-    let separator = args.next();
-    let Some(command) = args.next() else {
-        eprintln!("shbox: embedded arapuca wrapper: missing command after --");
-        return ExitCode::FAILURE;
-    };
-    if separator.as_deref() != Some(std::ffi::OsStr::new("--")) {
-        eprintln!("shbox: embedded arapuca wrapper: invalid invocation");
-        return ExitCode::FAILURE;
-    }
-
-    if let Err(error) = ::arapuca::rlimit::apply_from_env() {
-        eprintln!("shbox: embedded arapuca wrapper: {error}");
-        return ExitCode::FAILURE;
-    }
-
-    let mut child = std::process::Command::new(command);
-    child.args(args);
-    child.env_clear();
-    for (name, value) in std::env::vars_os() {
-        let is_arapuca_control = name
-            .to_str()
-            .is_some_and(|name| name.starts_with("ARAPUCA_"));
-        if !is_arapuca_control {
-            child.env(name, value);
-        }
-    }
-
-    let error = child.exec();
-    eprintln!("shbox: embedded arapuca wrapper: exec failed: {error}");
-    ExitCode::FAILURE
 }
 
 /// A bootstrap failure with the startup step that produced it.
@@ -378,14 +319,14 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
             }
         }
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     let launcher: Arc<dyn platform::ProcessLauncher> = {
-        let launch_policy = platform::ArapucaLaunchPolicy::from_config(
+        let launch_policy = platform::SandboxLaunchPolicy::from_config(
             &app_config,
             &sandbox_shell,
             paths.runtime_dir(),
         );
-        match platform::ArapucaLauncher::new(launch_policy) {
+        match platform::MacosLauncher::new(launch_policy) {
             Ok(launcher) => {
                 info!("sandbox process adapter initialized");
                 Arc::new(launcher)
@@ -396,6 +337,8 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
             }
         }
     };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let launcher: Arc<dyn platform::ProcessLauncher> = Arc::new(platform::UnavailableLauncher);
     let managed_mode = auth_store.admin_count() > 0;
     let sandbox_manager = Arc::new(
         if managed_mode {

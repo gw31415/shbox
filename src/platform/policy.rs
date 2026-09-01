@@ -78,21 +78,44 @@ pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[
     ("/dev/tty", ReadPathClass::TerminalDevice),
 ];
 
-/// macOS has no curated default read grants: the generated Seatbelt profile
-/// enumerates the system paths the shell needs, and the profile is validated
-/// in the macOS backend tests.
-#[cfg(not(target_os = "linux"))]
+/// Curated macOS runtime paths inherited from the audited Seatbelt backend.
+///
+/// These are read-only system/runtime dependencies, not host data grants.
+/// Optional entries are filtered when absent. `/private/etc` is never granted
+/// wholesale: only resolver/time/TLS inputs are named.
+#[cfg(target_os = "macos")]
+pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[
+    ("/usr", ReadPathClass::ExecutableRuntime),
+    ("/bin", ReadPathClass::ExecutableRuntime),
+    ("/sbin", ReadPathClass::ExecutableRuntime),
+    ("/System", ReadPathClass::ExecutableRuntime),
+    ("/Library/Frameworks", ReadPathClass::ExecutableRuntime),
+    (
+        "/Library/Apple/System/Library",
+        ReadPathClass::ExecutableRuntime,
+    ),
+    ("/opt/homebrew", ReadPathClass::ExecutableRuntime),
+    ("/private/var/select", ReadPathClass::SystemData),
+    ("/private/var/db/timezone", ReadPathClass::SystemData),
+    ("/private/etc/hosts", ReadPathClass::SystemData),
+    ("/private/etc/resolv.conf", ReadPathClass::SystemData),
+    ("/private/etc/localtime", ReadPathClass::SystemData),
+    ("/private/etc/ssl", ReadPathClass::SystemData),
+    ("/dev/zero", ReadPathClass::SystemData),
+    ("/dev/urandom", ReadPathClass::SystemData),
+    ("/dev/random", ReadPathClass::SystemData),
+    ("/dev/fd", ReadPathClass::SystemData),
+];
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[];
 
-/// The curated writable device paths for Linux.
-///
-/// Shell commands commonly discard output through `/dev/null`. Keep this
-/// single device writable without granting write access to the rest of
-/// `/dev`. macOS handles `/dev/null` inside its Seatbelt profile instead.
-#[cfg(target_os = "linux")]
+/// Curated writable device paths. Shell commands may discard output through
+/// `/dev/null`; no broader `/dev` write grant is part of the policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const CURATED_WRITE_PATHS: &[&str] = &["/dev/null"];
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const CURATED_WRITE_PATHS: &[&str] = &[];
 
 /// The immutable, process-lifetime launch policy snapshot.
@@ -429,9 +452,54 @@ mod tests {
         assert_eq!(CURATED_WRITE_PATHS, &["/dev/null"]);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn curated_paths_are_empty_off_linux() {
+    fn curated_macos_paths_are_frozen_and_narrow() {
+        let expected = [
+            ("/usr", ReadPathClass::ExecutableRuntime),
+            ("/bin", ReadPathClass::ExecutableRuntime),
+            ("/sbin", ReadPathClass::ExecutableRuntime),
+            ("/System", ReadPathClass::ExecutableRuntime),
+            ("/Library/Frameworks", ReadPathClass::ExecutableRuntime),
+            (
+                "/Library/Apple/System/Library",
+                ReadPathClass::ExecutableRuntime,
+            ),
+            ("/opt/homebrew", ReadPathClass::ExecutableRuntime),
+            ("/private/var/select", ReadPathClass::SystemData),
+            ("/private/var/db/timezone", ReadPathClass::SystemData),
+            ("/private/etc/hosts", ReadPathClass::SystemData),
+            ("/private/etc/resolv.conf", ReadPathClass::SystemData),
+            ("/private/etc/localtime", ReadPathClass::SystemData),
+            ("/private/etc/ssl", ReadPathClass::SystemData),
+            ("/dev/zero", ReadPathClass::SystemData),
+            ("/dev/urandom", ReadPathClass::SystemData),
+            ("/dev/random", ReadPathClass::SystemData),
+            ("/dev/fd", ReadPathClass::SystemData),
+        ];
+        assert_eq!(CURATED_READ_PATHS, &expected[..]);
+        assert_eq!(CURATED_WRITE_PATHS, &["/dev/null"]);
+        for broad in [
+            "/",
+            "/Users",
+            "/private",
+            "/private/etc",
+            "/var",
+            "/tmp",
+            "/dev",
+        ] {
+            assert!(
+                !CURATED_READ_PATHS
+                    .iter()
+                    .any(|(granted, _)| *granted == broad),
+                "{broad} must not be broadly granted"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn curated_paths_are_empty_on_unsupported_platforms() {
         assert!(CURATED_READ_PATHS.is_empty());
         assert!(CURATED_WRITE_PATHS.is_empty());
     }

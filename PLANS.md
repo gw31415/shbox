@@ -1259,7 +1259,11 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - Linux arm64 Docker/Rust 1.95: 157/157 unit tests, `cargo check --all-targets`, and Clippy `-D warnings` pass.
   - macOS arm64/Rust 1.95 regression: 151/151 unit tests, `cargo check --all-targets`, and Clippy `-D warnings` pass.
   - Linux proof covers filesystem allow/deny, sensitive-read denial, disabled/outbound TCP behavior, PTY/session state, signal forwarding, descendant process-group cleanup, child setup status reporting, and recursive launch-temp cleanup.
-- [ ] Milestone 4 macOS Seatbelt launcher.
+- [x] Milestone 4 macOS Seatbelt launcher.
+  - macOS 26.6.2 arm64/Rust 1.95 native: 157/157 unit tests, `cargo check --all-targets`, and Clippy `-D warnings` pass.
+  - Native proof covers deny-by-default filesystem isolation, disabled/client-only outbound TCP, PTY/session state, signal forwarding, TERM/KILL cleanup, daemon shutdown, and recursive launch-temp cleanup.
+  - Linux arm64 Docker/Rust 1.95 regression remains green at 157/157 plus check/Clippy.
+  - macOS 15 remains a blocking release-matrix run under Milestones 7-8; it is not available on the current macOS 26 host.
 - [ ] Milestone 5 Arapuca/cgroup/limit removal.
 - [ ] Milestone 6 SSH/PTTY integration suite.
 - [ ] Milestone 7 deploy/platform scripts.

@@ -1,11 +1,9 @@
 //! Private process-launch seam.
 //!
-//! The production adapter wraps the pinned Arapuca revision
-//! `c94802c4d8b6b880334c0d643b16b7326ec7f039` (package version 0.2.7). Tests
-//! get a deterministic fake launcher with barriers and failure injection;
-//! nothing here is a configurable backend, and no Arapuca type leaks into the
-//! configuration or SSH surfaces. The dependency is pinned in `Cargo.toml` so
-//! `Cargo.lock` records the exact revision from the first commit on.
+//! Production owns process/PTY lifecycle directly: Linux applies nono prepared
+//! confinement and macOS execs the system Seatbelt wrapper with a parent-built
+//! profile. Tests use a deterministic fake launcher; backend details never leak
+//! into configuration or SSH surfaces.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -14,23 +12,21 @@ use std::time::Duration;
 
 use crate::sandbox::SandboxId;
 
-#[cfg(not(target_os = "linux"))]
-mod arapuca;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(unix)]
 mod policy;
 #[cfg(unix)]
 mod terminal;
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) use self::arapuca::{ArapucaLaunchPolicy, ArapucaLauncher};
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::LinuxLauncher;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+pub(crate) use self::macos::MacosLauncher;
+#[cfg(unix)]
 pub(crate) use self::policy::SandboxLaunchPolicy;
-#[cfg(not(target_os = "linux"))]
-pub(crate) use self::terminal::{PtyIo, duplicate_fd};
 #[cfg(unix)]
 pub(crate) use self::terminal::{apply_terminal_modes, apply_window_size};
 
@@ -48,9 +44,9 @@ pub(crate) fn process_spawn_lock() -> &'static Mutex<()> {
     &PROCESS_SPAWN_LOCK
 }
 
-/// The operation a sandbox process must perform.  This is deliberately a
-/// protocol-neutral value: the SSH layer never passes an Arapuca type across
-/// the manager boundary.
+/// The operation a sandbox process must perform. This is deliberately a
+/// protocol-neutral value: the SSH layer never passes backend-specific state
+/// across the manager boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchOperation {
     Shell,

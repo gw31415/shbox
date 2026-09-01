@@ -1009,11 +1009,15 @@ impl std::error::Error for Error {
 mod tests {
     use super::*;
     use crate::auth::KeyFingerprint;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::config::NetworkMode;
     use crate::platform::FakeLauncher;
     #[cfg(target_os = "linux")]
-    use crate::platform::{LinuxLauncher, SandboxLaunchPolicy};
+    use crate::platform::LinuxLauncher;
+    #[cfg(target_os = "macos")]
+    use crate::platform::MacosLauncher;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::platform::SandboxLaunchPolicy;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::thread;
@@ -1571,6 +1575,43 @@ mod tests {
                 None,
             )
             .expect("real linux launch");
+        let control = Arc::clone(&managed.process.control);
+        assert_eq!(manager.runtime_count(), 1);
+
+        manager.shutdown_runtime();
+
+        assert!(control.wait_for_cleanup(Duration::from_secs(1)));
+        assert_eq!(manager.runtime_count(), 0);
+        drop(managed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shutdown_runtime_terminates_real_macos_launcher() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let policy = SandboxLaunchPolicy::from_parts(
+            PathBuf::from("/bin/sh"),
+            NetworkMode::Disabled,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            paths.runtime_dir().to_path_buf(),
+        );
+        let launcher = MacosLauncher::new(policy).expect("macos launcher");
+        let manager =
+            SandboxManager::open_with_launcher(&paths, Caps::default(), Arc::new(launcher))
+                .expect("manager");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let managed = manager
+            .launch_handle(
+                &handle,
+                platform::LaunchOperation::Exec(b"exec /bin/sleep 30".to_vec()),
+                None,
+            )
+            .expect("real macos launch");
         let control = Arc::clone(&managed.process.control);
         assert_eq!(manager.runtime_count(), 1);
 
