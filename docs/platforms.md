@@ -158,7 +158,7 @@ Linux CIでは両architectureともnetwork/scoping capability=true、seccomp net
 
 ### 4.1 Production-provider acceptance
 
-generic hosted Linux gateはLinux implementationのnative proofだが、特定provider kernel/imageのproduction acceptanceとは別である。Fly.ioを正式targetとする場合は、そのproduction Machine/image configuration上で [release.md](release.md) のprovider acceptanceを別途通す。
+generic hosted Linux gateはLinux implementationのnative proofだが、特定provider kernel/imageのproduction acceptanceとは別である。Fly.ioを正式targetとする場合は、そのproduction Machine/image configuration上で [release.md](release.md) のprovider acceptanceを別途通す。2026-09-02の実測でFly Machinesのゲストカーネル（`6.12.105-fly`）はLandlockを提供しないことが確認されたため、Fly Machinesは現時点で正式targetになれない（[release.md](release.md) §9）。
 
 ## 5. Deployment prerequisites
 

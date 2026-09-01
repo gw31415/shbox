@@ -6,7 +6,7 @@ shboxのrelease可否は、compile成功ではなくnative platform gateとprodu
 
 現在の正式CI証拠はPR run `33518661744`、commit `aff82c4` である。このrunではRust 1.95/stable quality、supported-target build、Linux native confinement、macOS native Seatbeltの全jobがsuccessになった。
 
-Fly production acceptanceはまだ別項目として未完了である。GitHub-hosted Linux gateの成功をFly Machine/imageの実証に読み替えてはならない。
+Fly Machinesでのproduction acceptanceは2026-09-02に実施したが、ゲストカーネルがLandlockを提供しないため成立しなかった（§9）。GitHub-hosted Linux gateの成功をFly Machine/imageの実証に読み替えてはならない。
 
 ## 2. CI execution policy
 
@@ -27,7 +27,7 @@ Fly production acceptanceはまだ別項目として未完了である。GitHub-
 | Linux aarch64 native confinement | PASS | kernel `6.17.0-1022-azure`, Landlock V6 |
 | macOS 15 arm64 native Seatbelt | PASS | macOS `15.7.7` |
 | macOS 26 arm64 native Seatbelt | PASS | macOS `26.5.2` |
-| Fly production target | NOT YET VERIFIED | exact production image/Machine evidence required |
+| Fly production target | BLOCKED | Fly Machines guest kernel provides no Landlock; see §9 |
 
 Linux native jobs reported:
 
@@ -187,13 +187,20 @@ runtime proof:
 
 このacceptanceはfilesystem/network grantを文書化されたpolicyより広げて通してはならない。
 
-## 9. Current Fly status
+## 9. Fly status: BLOCKED (attempted 2026-09-02, failed)
 
-現時点では、このrepositoryから利用できるFly credential/CLI/Machine configurationがなく、productionと同一imageのacceptance artifactも記録されていない。そのためFly tupleは **NOT YET VERIFIED** とする。
+Fly Machines上でproduction acceptanceを試みたが、成功しなかった。Fly Machinesはこのプロジェクトの正式production targetではない。
 
-また、consumer側production imageがこのbranchのnative confinement実装をpinした証拠がない状態では、別のLinux container testをFly acceptanceとして扱わない。
+実施内容: このrepositoryの受入用container（`cargo build --locked --release`によるrevision `d86b3eb`、Rust 1.95.0、locked `Cargo.lock`、nono `0.74.0`、Debian 12 runtime、非root uid 1000）をapp `shbox-fly-acceptance`（region nrt、`shared-cpu-1x` 256MB、x86_64）へdeployし、同一Machine/image構成で検証した。
 
-この状態はCI native Linux supportとは区別する。CIはLinux backendの実動証拠を提供するが、Fly固有のkernel/image/runtime topologyまで保証しない。
+結果:
+
+- ゲストカーネルは `6.12.105-fly`。`landlock_create_ruleset` が `ENOSYS` を返す（`Seccomp: 0`でフィルタによる隠蔽ではない）。Landlock LSMが無効なため `production_launcher` preflightは失敗し、sandbox launchはすべてfail-closedになった。設計どおりfallbackやpolicy拡張は行わず、この事実を記録として確定させた。
+- 実測できた項目: 非root startup、admin keyによる正規OpenSSH認証（host mode `_`）、cgroup controller fileを一切使わない起動パス。sandbox launchを要するproof item（PTY suite、永続化、network mode検証等）は実行不能。
+- 非特権コンテキストでの実測: `unshare(CLONE_NEWUSER)` とseccomp filterは利用可能、`chroot` と単独のmount nsは不可。usernsベースのsandboxは技術的には成立しうるが、nono/Landlockとは別の新backend実装であり、現行releaseの範囲外。
+- 公開networkの制約: Flyのshared IPv4はraw TCP（SSH）をedgeで切断するため、公開SSHにはdedicated IPv4が必要。検証はprivate network（`fly proxy`）で実施した。
+
+結論: Fly MachinesではLandlockベースのshboxは動作しない。Landlock対応カーネルを持つprovider targetでのacceptanceが、このgateの成立条件である。受入用container一式（Dockerfile、`deploy/fly/`、`fly.toml`）とplanはこの判断とともにrepositoryから削除した。
 
 ## 10. Deploy hardening
 
