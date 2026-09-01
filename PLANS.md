@@ -1269,7 +1269,12 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - Cargo manifest/lock contain no Arapuca dependency; production bootstrap selects Linux nono or macOS Seatbelt through `platform::production_launcher`.
   - macOS arm64/Rust 1.95: 156 unit + 6 CLI + 24 OpenSSH integration tests pass, plus check/Clippy `-D warnings`.
   - Linux arm64 Docker/Rust 1.95: 157 unit + 6 CLI + 25 OpenSSH integration tests pass, plus check/Clippy `-D warnings`.
-- [ ] Milestone 6 SSH/PTTY integration suite.
+- [x] Milestone 6 SSH/PTTY integration suite.
+  - Backend-neutral OpenSSH acceptance is explicitly enabled with `SHBOX_RUN_SANDBOX_INTEGRATION=1`; no Arapuca-specific test names or controls remain in `tests/ssh_auth.rs`.
+  - Blocking PTY coverage now proves fd 0/1/2 TTY identity, fresh session/controlling terminal/foreground PGID, interactive shell prompt exchange, initial modes/size and resize, Ctrl-C/Ctrl-Z/jobs/fg/bg, nested foreground signaling, raw-mode restore, disconnect cleanup, slave/fd leak absence, and concurrent terminal/signal/resize isolation.
+  - The disconnect test exposed a real transport-teardown cycle: bridge tasks retained `Arc<ConnState>`, whose registry sender kept their event receiver alive. `ConnHandler::drop` now clears channel mailboxes; a unit regression proves receivers wake when the connection registry is cleared.
+  - macOS arm64/Rust 1.95 with `SHBOX_RUN_SANDBOX_INTEGRATION=1`: 157 unit + 6 CLI + 29 OpenSSH integration tests pass, plus `cargo check --all-targets` and Clippy `-D warnings`.
+  - Linux arm64 Docker/Rust 1.95 with `SHBOX_RUN_SANDBOX_INTEGRATION=1`: 158 unit + 6 CLI + 30 OpenSSH integration tests pass, plus `cargo check --all-targets` and Clippy `-D warnings`.
 - [ ] Milestone 7 deploy/platform scripts.
 - [ ] Milestone 8 CI gates.
 - [ ] Milestone 9 Fly acceptance.

@@ -78,6 +78,16 @@ enum RouteRejection {
     InvalidSelector,
 }
 
+impl Drop for ConnHandler {
+    fn drop(&mut self) {
+        // Bridge tasks retain Arc<ConnState> until their process cleanup is
+        // complete. Explicitly clear channel mailboxes when the transport
+        // handler goes away so those receivers observe disconnect instead of
+        // keeping managed processes alive through the retained Arc.
+        self.conn.registry.clear();
+    }
+}
+
 impl ConnHandler {
     pub fn new(shared: Shared, conn: Arc<ConnState>) -> ConnHandler {
         ConnHandler {
