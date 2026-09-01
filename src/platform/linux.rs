@@ -117,7 +117,7 @@ impl LinuxLauncher {
             .set_network_mode(match self.policy.network() {
                 NetworkMode::Disabled => NonoNetworkMode::Blocked,
                 // Preserve the existing shbox `outbound` contract: the
-                // Arapuca Baseline profile allowed ordinary client and bind
+                // The public `outbound` contract allows ordinary client and bind
                 // sockets while blocking escape-critical syscalls. Nono's
                 // closest filesystem/network mapping is therefore AllowAll;
                 // adding a port allowlist here would silently narrow the

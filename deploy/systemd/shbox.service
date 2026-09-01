@@ -5,8 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-# This must be a dedicated, unprivileged account. Do not run unrelated
-# processes in this service's delegated cgroup.
+# This must be a dedicated, unprivileged account.
 User=shbox
 Group=shbox
 WorkingDirectory=/var/lib/shbox
@@ -16,10 +15,6 @@ RestartSec=2s
 KillMode=control-group
 TimeoutStopSec=10s
 UMask=0077
-
-# shbox creates a private child below this delegated service scope. All four
-# controllers are required by the Linux Arapuca adapter.
-Delegate=cpu cpuset memory pids
 
 # Permit a non-root daemon to bind port 22. Remove this if an unprivileged
 # listener plus an operator-managed port forward is used instead.

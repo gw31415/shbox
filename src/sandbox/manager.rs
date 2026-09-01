@@ -510,7 +510,7 @@ impl SandboxManager {
 
         // A process that ignores TERM gets a second, explicit force pass. The
         // first deadline is the graceful contract; the second wait is only to
-        // observe Arapuca's reap/cleanup barrier after SIGKILL.
+        // observe the launcher reap/cleanup barrier after SIGKILL.
         let processes = {
             let ledger = self.ledger.lock().expect("sandbox ledger");
             ledger

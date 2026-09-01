@@ -2,7 +2,7 @@
 //!
 //! Metadata is the ownership and lifecycle source of truth.  It deliberately
 //! contains no process or platform fields, so a restart can validate the
-//! record without reconstructing an Arapuca object.
+//! record without reconstructing any runtime process object.
 
 use std::fmt;
 
