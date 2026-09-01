@@ -801,7 +801,15 @@ mod tests {
         let abi = detect_abi().expect("landlock ABI detection");
         let prepared = prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::network_fallback())
             .expect("policy preparation");
-        let _fallback = prepared.fallback();
+        if std::env::var_os("SHBOX_PLATFORM_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "shbox Linux sandbox: nono=0.74.0 landlock_abi={} network={} scoping={} seccomp_fallback={:?}",
+                abi.version_string(),
+                abi.has_network(),
+                abi.has_scoping(),
+                prepared.fallback()
+            );
+        }
 
         let stage = RawSandboxStage::CreateRuleset;
         match stage {

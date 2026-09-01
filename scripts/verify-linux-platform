@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
-# M8 blocking Linux platform gate.
+# Blocking native Linux sandbox/PTTY platform gate.
 #
-# This gate is intentionally fail-closed. It must be run on the native target
-# under a non-root account with a delegated cgroup v2 parent. The gate builds
-# the Arapuca wrapper from the pinned revision before running the suite.
+# shbox owns process/PTY lifecycle and uses nono's prepared Landlock/seccomp
+# policy as its Linux confinement layer. This gate deliberately requires no
+# cgroup delegation and never writes cgroupfs.
 
 set -euo pipefail
+umask 077
 
-readonly ARAPUCA_REVISION="c94802c4d8b6b880334c0d643b16b7326ec7f039"
-readonly ARAPUCA_VERSION="0.2.7"
-readonly ARAPUCA_GIT_URL="https://github.com/LeGambiArt/arapuca"
+readonly NONO_VERSION="0.74.0"
+readonly RUST_MINOR="1.95"
 
 die() {
-  printf 'M8 Linux gate: %s\n' "$*" >&2
+  printf 'Linux platform gate: %s\n' "$*" >&2
   exit 1
 }
 
 usage() {
-  cat >&2 <<'EOF'
+  cat >&2 <<'USAGE'
 usage: scripts/verify-linux-platform --arch x86_64|aarch64 [--target TARGET]
 
-The gate requires a native Linux runner, a non-root account, a delegated
-cgroup v2 parent, and builds the Arapuca wrapper from the pinned revision
-before running the suite.
-EOF
+Runs the native shbox Linux gate as the current non-root account. The gate
+requires Rust 1.95, OpenSSH, a C compiler for the PTY identity fixture, and a
+kernel on which the pinned nono policy can prepare and enforce Landlock.
+No cgroup delegation, Arapuca wrapper, runner binary, or nono CLI is used.
+USAGE
   exit 2
 }
 
@@ -67,14 +68,10 @@ case "$expected_arch" in
     expected_machine='aarch64'
     default_target='aarch64-unknown-linux-gnu'
     ;;
-  *)
-    usage
-    ;;
+  *) usage ;;
 esac
 
-if [[ -z "$target" ]]; then
-  target="$default_target"
-fi
+target="${target:-$default_target}"
 [[ "$target" == "$default_target" ]] || die "target $target does not match native $expected_arch gate"
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -84,141 +81,73 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
 }
 
-for command_name in awk cargo cat grep id mktemp rustc sh ssh ssh-keygen uname; do
+for command_name in awk cargo cc grep id rustc ssh ssh-keygen uname; do
   require_command "$command_name"
 done
+if rustc "+$RUST_MINOR" --version >/dev/null 2>&1 && cargo "+$RUST_MINOR" --version >/dev/null 2>&1; then
+  rustc_gate() { rustc "+$RUST_MINOR" "$@"; }
+  cargo_gate() { cargo "+$RUST_MINOR" "$@"; }
+else
+  rustc_gate() { rustc "$@"; }
+  cargo_gate() { cargo "$@"; }
+fi
 
-toml_pin="arapuca = { git = \"$ARAPUCA_GIT_URL\", rev = \"$ARAPUCA_REVISION\" }"
-grep -Fqx "$toml_pin" Cargo.toml || die "Cargo.toml does not pin Arapuca revision $ARAPUCA_REVISION"
-lock_source="source = \"git+$ARAPUCA_GIT_URL?rev=$ARAPUCA_REVISION#$ARAPUCA_REVISION\""
-awk -v expected_version='version = "0.2.7"' -v expected_source="$lock_source" '
-  $0 == "[[package]]" { inside = 0 }
-  $0 == "name = \"arapuca\"" { inside = 1; seen = 1; next }
-  inside && $0 == expected_version { version = 1 }
-  inside && $0 == expected_source { source = 1 }
-  END { exit !(seen && version && source) }
-' Cargo.lock || die "Cargo.lock does not contain Arapuca 0.2.7 at revision $ARAPUCA_REVISION"
+[[ -x /bin/bash ]] || die "blocking interactive PTY suite requires /bin/bash"
 
 [[ "$(uname -s)" == 'Linux' ]] || die "runner OS is not Linux"
 actual_machine="$(uname -m)"
 [[ "$actual_machine" == "$expected_machine" ]] || die "runner architecture is $actual_machine, expected $expected_machine"
 
-for command_name in cut mkdir rmdir; do
-  require_command "$command_name"
-done
-
 uid="$(id -u)"
 [[ "$uid" != '0' ]] || die "the platform gate must run as a non-root account"
 runner_user="$(id -un)"
 if [[ -n "${SHBOX_EXPECTED_USER:-}" && "$runner_user" != "$SHBOX_EXPECTED_USER" ]]; then
-  die "runner account is $runner_user, expected dedicated account $SHBOX_EXPECTED_USER"
+  die "runner account is $runner_user, expected $SHBOX_EXPECTED_USER"
 fi
 
-kernel_release="$(uname -r)"
-kernel_major="${kernel_release%%.*}"
-kernel_tail="${kernel_release#*.}"
-kernel_minor="${kernel_tail%%.*}"
-[[ "$kernel_major" =~ ^[0-9]+$ && "$kernel_minor" =~ ^[0-9]+$ ]] || die "cannot parse Linux kernel release: $kernel_release"
-if ((kernel_major < 5 || (kernel_major == 5 && kernel_minor < 13))); then
-  die "Linux kernel $kernel_release is older than the required 5.13"
-fi
+rustc_version="$(rustc_gate --version)"
+[[ "$rustc_version" == "rustc $RUST_MINOR."* ]] || die "Rust $RUST_MINOR is required, got: $rustc_version"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" Cargo.toml || die "Cargo.toml rust-version is not $RUST_MINOR"
+grep -Fqx "nono = { version = \"=$NONO_VERSION\", default-features = false }" Cargo.toml || \
+  die "Cargo.toml does not pin nono $NONO_VERSION"
+awk -v expected="version = \"$NONO_VERSION\"" '
+  $0 == "[[package]]" { inside = 0 }
+  $0 == "name = \"nono\"" { inside = 1; seen = 1; next }
+  inside && $0 == expected { version = 1 }
+  END { exit !(seen && version) }
+' Cargo.lock || die "Cargo.lock does not contain nono $NONO_VERSION"
 
-cgroup_mount='/sys/fs/cgroup'
-[[ -r "$cgroup_mount/cgroup.controllers" ]] || die "cgroups v2 is not mounted at $cgroup_mount"
-[[ -r "$cgroup_mount/cgroup.subtree_control" ]] || die "cgroups v2 subtree control is unavailable"
-
-cgroup_relative="$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)"
-[[ -n "$cgroup_relative" && "$cgroup_relative" != '/' ]] || die "the gate is running in the cgroup root, not a delegated service scope"
-[[ "$cgroup_relative" != *'..'* ]] || die "the current cgroup path is invalid"
-delegated_relative="${cgroup_relative%/*}"
-[[ -n "$delegated_relative" && "$delegated_relative" != "$cgroup_relative" ]] || \
-  die "the current cgroup has no delegated parent scope"
-current_relative="${cgroup_relative#/}"
-delegated_relative="${delegated_relative#/}"
-current_cgroup="$cgroup_mount/$current_relative"
-cgroup_path="$cgroup_mount/$delegated_relative"
-[[ -d "$current_cgroup" ]] || die "current cgroup does not resolve below $cgroup_mount"
-[[ -d "$cgroup_path" ]] || die "delegated cgroup does not resolve below $cgroup_mount"
-
-required_controllers=(cpu cpuset memory pids)
-for controller in "${required_controllers[@]}"; do
-  grep -Eq "(^|[[:space:]])${controller}($|[[:space:]])" "$cgroup_path/cgroup.controllers" || \
-    die "controller $controller is not delegated by $cgroup_path"
-  grep -Eq "(^|[[:space:]])${controller}($|[[:space:]])" "$cgroup_path/cgroup.subtree_control" || \
-    die "controller $controller is not enabled in $cgroup_path/cgroup.subtree_control"
-done
-[[ -w "$cgroup_path/cgroup.procs" ]] || die "the delegated cgroup does not permit process migration"
-
-# Exercise the same child-cgroup operation used by shbox without moving the
-# gate shell itself. The helper is the only process intentionally placed in
-# this child; it must leave the child empty so cleanup never kills an unknown
-# process. This is a capability check, not a best-effort probe.
-private_cgroup="$cgroup_path/shbox-m8-${PPID}-$$-${RANDOM}"
-private_name="${private_cgroup##*/}"
-private_relative="/$delegated_relative/$private_name"
-mkdir -- "$private_cgroup" || die "cannot create a private delegated cgroup child"
-
-cleanup_private_cgroup() {
-  if [[ -d "$private_cgroup" ]]; then
-    if [[ -s "$private_cgroup/cgroup.procs" ]]; then
-      printf 'M8 Linux gate: refusing to remove non-empty test cgroup %s\n' "$private_cgroup" >&2
-      return 1
-    fi
-    rmdir -- "$private_cgroup" || return 1
-  fi
-}
-trap cleanup_private_cgroup EXIT
-
-if ! sh -c '
-  set -eu
-  child=$1
-  expected=$2
-  printf "%s\n" "$$" > "$child/cgroup.procs"
-  current=$(grep "^0::" /proc/self/cgroup | cut -d: -f3)
-  [ "$current" = "$expected" ]
-  for controller in cpu cpuset memory pids; do
-    grep -Eq "(^|[[:space:]])${controller}($|[[:space:]])" "$child/cgroup.controllers"
-  done
-  grep -qx "$$" "$child/cgroup.procs"
-' sh "$private_cgroup" "$private_relative"; then
-  die "cannot move a helper into and inspect a private delegated cgroup child"
-fi
-
-cleanup_private_cgroup || die "private delegated cgroup child did not become empty"
-trap - EXIT
-private_cgroup=''
-
-wrapper_root="$(mktemp -d -t shbox-arapuca.XXXXXX)" || die "cannot create a private Arapuca build directory"
-trap 'rm -rf -- "$wrapper_root"' EXIT
-cargo install --locked --git "$ARAPUCA_GIT_URL" --rev "$ARAPUCA_REVISION" arapuca \
-  --bin arapuca --root "$wrapper_root" || die "cannot build Arapuca at the pinned revision"
-wrapper_path="$wrapper_root/bin/arapuca"
-[[ -f "$wrapper_path" && -x "$wrapper_path" ]] || die "pinned Arapuca wrapper was not installed"
-export PATH="$wrapper_root/bin:$PATH"
-wrapper_version="$("$wrapper_path" --version 2>&1)" || die "Arapuca wrapper cannot report its version"
-[[ "$wrapper_version" == *"arapuca $ARAPUCA_VERSION"* ]] || \
-  die "Arapuca wrapper reports an unexpected version: $wrapper_version"
-
-rustc_host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
+rustc_host="$(rustc_gate -vV | awk '$1 == "host:" { print $2 }')"
 [[ "$rustc_host" == "$target" ]] || die "rustc host is $rustc_host, expected native target $target"
+kernel_release="$(uname -r)"
 
-printf 'M8 Linux gate: %s %s, kernel %s, user %s (uid %s)\n' "$actual_machine" "$target" "$kernel_release" "$runner_user" "$uid"
-printf 'M8 Linux gate: process cgroup %s, delegated parent %s with controllers cpu cpuset memory pids\n' "$current_cgroup" "$cgroup_path"
-printf 'M8 Linux gate: /proc/self/cgroup\n'
-cat /proc/self/cgroup
-printf 'M8 Linux gate: cgroup.controllers\n'
-cat "$cgroup_path/cgroup.controllers"
-printf 'M8 Linux gate: cgroup.subtree_control\n'
-cat "$cgroup_path/cgroup.subtree_control"
-printf 'M8 Linux gate: rustc -vV\n'
-rustc -vV
-printf 'M8 Linux gate: OpenSSH version\n'
+printf 'Linux platform gate: arch=%s target=%s kernel=%s user=%s uid=%s\n' \
+  "$actual_machine" "$target" "$kernel_release" "$runner_user" "$uid"
+printf 'Linux platform gate: %s; nono=%s\n' "$rustc_version" "$NONO_VERSION"
+printf 'Linux platform gate: OpenSSH version\n'
 ssh -V 2>&1
-printf 'M8 Linux gate: Arapuca %s wrapper %s (declared revision %s)\n' "$ARAPUCA_VERSION" "$wrapper_path" "$ARAPUCA_REVISION"
-printf 'M8 Linux gate: running locked native build and real OpenSSH suite\n'
+if [[ -r /proc/self/cgroup ]]; then
+  printf 'Linux platform gate: optional /proc/self/cgroup diagnostic (not a prerequisite)\n'
+  cat /proc/self/cgroup
+fi
 
-cargo metadata --locked --no-deps --format-version 1 >/dev/null
-cargo build --locked --release --target "$target"
-SHBOX_RUN_ARAPUCA_INTEGRATION=1 cargo test --locked --target "$target" --test ssh_auth -- --test-threads=1
+# Exercise the exact prepared nono API and print the detected Landlock ABI and
+# scoping/network capability before the larger suite. This is a real kernel
+# probe; failure is blocking.
+printf 'Linux platform gate: nono/Landlock capability probe\n'
+SHBOX_PLATFORM_DIAGNOSTICS=1 cargo_gate test --locked --target "$target" --bin shbox \
+  platform::linux::tests::pinned_nono_api_prepares_a_restricted_policy \
+  -- --exact --nocapture --test-threads=1
 
-printf 'M8 Linux gate: PASS for native %s\n' "$expected_arch"
+printf 'Linux platform gate: locked native release build\n'
+cargo_gate metadata --locked --no-deps --format-version 1 >/dev/null
+cargo_gate build --locked --release --target "$target"
+
+# This one command covers unit/compile behavior, real OpenSSH non-PTY and PTY
+# sessions, filesystem/network denials, and normal/forced cleanup. The test
+# harness starts the actual shbox daemon under this same unprivileged account.
+printf 'Linux platform gate: full native sandbox + OpenSSH/PTTY acceptance\n'
+SHBOX_RUN_SANDBOX_INTEGRATION=1 cargo_gate test --locked --target "$target" -- --test-threads=1
+cargo_gate check --locked --all-targets --target "$target"
+
+printf 'Linux platform gate: PASS for native %s\n' "$expected_arch"

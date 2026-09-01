@@ -1275,7 +1275,12 @@ No release is accepted while a PTY cell marked required is failing or skipped.
   - The disconnect test exposed a real transport-teardown cycle: bridge tasks retained `Arc<ConnState>`, whose registry sender kept their event receiver alive. `ConnHandler::drop` now clears channel mailboxes; a unit regression proves receivers wake when the connection registry is cleared.
   - macOS arm64/Rust 1.95 with `SHBOX_RUN_SANDBOX_INTEGRATION=1`: 157 unit + 6 CLI + 29 OpenSSH integration tests pass, plus `cargo check --all-targets` and Clippy `-D warnings`.
   - Linux arm64 Docker/Rust 1.95 with `SHBOX_RUN_SANDBOX_INTEGRATION=1`: 158 unit + 6 CLI + 30 OpenSSH integration tests pass, plus `cargo check --all-targets` and Clippy `-D warnings`.
-- [ ] Milestone 7 deploy/platform scripts.
+- [x] Milestone 7 deploy/platform scripts.
+  - `scripts/verify-linux-platform` now runs only shbox with Rust 1.95 and pinned nono 0.74.0, prints the real kernel/Landlock capability probe, requires no delegated cgroup controllers, and never writes cgroupfs.
+  - The Linux gate was exercised as a non-root user on native Linux arm64 in Docker with an init reaper (container-harness detail, not a shbox/cgroup prerequisite): Landlock ABI V6 with network/scoping support, 158 unit + 6 CLI + 30 OpenSSH integration tests, release build, and `cargo check --all-targets` all pass.
+  - `scripts/verify-macos-platform` now checks native arm64/fixed macOS major/Rust 1.95, proves `/usr/bin/sandbox-exec` enforcement with separate allow and `/etc` deny smoke profiles, audits out selfexec control paths, and runs the full native SSH/PTTY suite.
+  - The macOS 26 arm64 gate exits 0 with 157 unit + 6 CLI + 29 OpenSSH integration tests, release build, and `cargo check --all-targets` passing.
+  - Both verification scripts force `umask 077` to match the deployed daemon file-safety context; systemd retains `KillMode=control-group` only as service-manager cleanup and has no controller delegation requirement.
 - [ ] Milestone 8 CI gates.
 - [ ] Milestone 9 Fly acceptance.
 - [ ] Milestone 10 docs.
