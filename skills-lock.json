@@ -13,6 +13,12 @@
       "skillPath": "skills/engineering/ask-matt/SKILL.md",
       "computedHash": "0cd14026efa0330083cbc7adf590976c162b60e02f696a8dcce96f0b4dab8a72"
     },
+    "async-rust": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/async-rust/SKILL.md",
+      "computedHash": "1c064cc19451960ef0c47fd76eda76b387b0064fb441b19a686c03820df3aa95"
+    },
     "claude-handoff": {
       "source": "mattpocock/skills",
       "sourceType": "github",
@@ -73,6 +79,12 @@
       "skillPath": "skills/productivity/handoff/SKILL.md",
       "computedHash": "20e5f4afdef502637510bc5c64d27645d3c85c88df9cb006824bbb0980166319"
     },
+    "idiomatic-rust": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/idiomatic-rust/SKILL.md",
+      "computedHash": "85d4ffd13568d7ffe5099e666a9ec7ec388fc476d0d78b8a8221e72aaa632d5f"
+    },
     "implement": {
       "source": "mattpocock/skills",
       "sourceType": "github",
@@ -115,6 +127,54 @@
       "skillPath": "skills/misc/migrate-to-shoehorn/SKILL.md",
       "computedHash": "6397731ced114f3657aa88b55ed13d1344a56d77ca449c568e3200c21740fa99"
     },
+    "ownership-not-clone": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/ownership-not-clone/SKILL.md",
+      "computedHash": "c526762c09d5613b84401050af8df3409b6306af289c24b18da81d74b8e7a215"
+    },
+    "port-from-c": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-c/SKILL.md",
+      "computedHash": "2ec922c5b11e617732f7e433aca53216c005bf6710bf0429533624863cbd5d21"
+    },
+    "port-from-cpp": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-cpp/SKILL.md",
+      "computedHash": "2e5bacecb3ec573149b1aed8f4567f85ecb5507f9edfe58225921e42ab38f44b"
+    },
+    "port-from-go": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-go/SKILL.md",
+      "computedHash": "d9723e6a8b65e10254747c69c278fad26da9895f64f8f68f4454a420ec22893b"
+    },
+    "port-from-java": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-java/SKILL.md",
+      "computedHash": "8d3cc20e913883b123d8fd6e149fe0a37f0004a9318e89d09c34ad291b6f42cc"
+    },
+    "port-from-python": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-python/SKILL.md",
+      "computedHash": "83e0c4e5d970ae932882a84991fee330f787221a94a4fb4865f54eba07209b7f"
+    },
+    "port-from-typescript": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-from-typescript/SKILL.md",
+      "computedHash": "60835dec3d149954820b46481c7ad18da5498b5b2999bf310f9a856076d24bd3"
+    },
+    "port-to-rust": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/porting/port-to-rust/SKILL.md",
+      "computedHash": "b38124cdc3149f918766c4179614cacee1aeb29e36b3ddf6e3cc0a4c5c3c9839"
+    },
     "project-start": {
       "source": "gw31415/project-continuity",
       "sourceType": "github",
@@ -151,6 +211,84 @@
       "skillPath": "skills/rolling-plan/SKILL.md",
       "computedHash": "7979b4f8636857e8e8ed7beaedfb7ed434e44d5091a9574c3a3bebc61c85815b"
     },
+    "rust-api-design": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-api-design/SKILL.md",
+      "computedHash": "b023e6798de9f2400e926b8d282bf5d1724167c268758f7a530347d349944898"
+    },
+    "rust-code-review": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/workflow/rust-code-review/SKILL.md",
+      "computedHash": "d8c8f97eaf1a87c135b29447b330d146bb377337740629f76165c3e56866ca33"
+    },
+    "rust-concurrency": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-concurrency/SKILL.md",
+      "computedHash": "3d599b8f185ffaf2e038a433b9ee1220ac5453373c04107ac70d7dbd262962e9"
+    },
+    "rust-docs": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-docs/SKILL.md",
+      "computedHash": "28b0cc341e4840898f72e3ac5cf18ceef01d41a275ed82361d6f3292b5924a2a"
+    },
+    "rust-errors": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-errors/SKILL.md",
+      "computedHash": "717f6b4436d514607207e0bea6a34b9e2c6019c20a44af8efb6c0b04e905314f"
+    },
+    "rust-ffi": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/rust-ffi/SKILL.md",
+      "computedHash": "68f47308ad79be35766cec9235275995794292391ff967c1c645567898007f1c"
+    },
+    "rust-macros": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/rust-macros/SKILL.md",
+      "computedHash": "ed5dce1052aa92ad232aa9ffe0511df66a8c92275fd2bb4e11349ddd0e668318"
+    },
+    "rust-observability": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-observability/SKILL.md",
+      "computedHash": "070851f09d56b710588596e6b28500b75d9bd6966b45a860e1d9fa99d8f25018"
+    },
+    "rust-performance": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/rust-performance/SKILL.md",
+      "computedHash": "cc236644202b168829432813cc168fea2b7dac9f6b432a38fd12991c462fe690"
+    },
+    "rust-serde": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/rust-serde/SKILL.md",
+      "computedHash": "7a7249b2b90286acfc2b47950dd6d4731faad6cbbefcb44ab9c2cf928c400c53"
+    },
+    "rust-skills-map": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/workflow/rust-skills-map/SKILL.md",
+      "computedHash": "b11029de553235101ecde06a165e64010f03e10f0641f220b4b4a0f3e54c87d9"
+    },
+    "rust-supply-chain": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/rust-supply-chain/SKILL.md",
+      "computedHash": "29f9b26dc207e9e32c606a1cf4bcd37cd32ea89120c43b9736c21767872edd86"
+    },
+    "rust-testing": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/workflow/rust-testing/SKILL.md",
+      "computedHash": "d1899d824b7752fe02f93a5a37a798e8acc891e9d950722643a403d79b6133fa"
+    },
     "scaffold-exercises": {
       "source": "mattpocock/skills",
       "sourceType": "github",
@@ -168,6 +306,24 @@
       "sourceType": "github",
       "skillPath": "skills/misc/setup-pre-commit/SKILL.md",
       "computedHash": "7fc7b680161a5cb834b165e36efc2378ff63a1f80df0a9efd18448d366bea98a"
+    },
+    "setup-rust-ci": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/setup-rust-ci/SKILL.md",
+      "computedHash": "8e2e999172037ceb3feab42c0c0338c73239ef8411135ad2498b2b5539d907f9"
+    },
+    "setup-rust-pre-commit": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/misc/setup-rust-pre-commit/SKILL.md",
+      "computedHash": "79b515e57cfd57372e6128ff9c3c30e1abfc7a3655c986981230e45dcdf755f1"
+    },
+    "setup-rust-skills": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/workflow/setup-rust-skills/SKILL.md",
+      "computedHash": "663a2487913e32d9a4b9e6312b1eb46529c30251330609fcad7ada279967ddf6"
     },
     "setup-ts-deep-modules": {
       "source": "mattpocock/skills",
@@ -210,6 +366,18 @@
       "sourceType": "github",
       "skillPath": "skills/engineering/triage/SKILL.md",
       "computedHash": "b954d74c219c805bf353d6642251a713c9b2e9cfdb11babfe588bcfe7dfd16d5"
+    },
+    "type-driven-design": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/type-driven-design/SKILL.md",
+      "computedHash": "3685824c55fd001e22114264c0ca5c2f74867619c00112a2477db765248f30a0"
+    },
+    "unsafe-rust": {
+      "source": "rewrite-rs/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust/unsafe-rust/SKILL.md",
+      "computedHash": "eed82724ef6d2674f3cf820002ed970f75cac63e318522b1332cb452caa664a0"
     },
     "wait-what": {
       "source": "mattpocock/skills",
