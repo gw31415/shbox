@@ -99,6 +99,15 @@ impl HostProcessControl {
     pub fn force_terminate(&self) -> bool {
         signal_process_group(self.pid, libc::SIGKILL)
     }
+
+    /// A control for registry/lifecycle tests that never signals: the pid is
+    /// chosen so a stray signal would hit a non-existent group.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> HostProcessControl {
+        HostProcessControl {
+            pid: libc::pid_t::MAX - 1,
+        }
+    }
 }
 
 /// Owns the child and reports its exit exactly once.
@@ -224,7 +233,9 @@ impl HostProcess {
                 .map_err(SpawnError::Pty)?;
         }
 
-        let pid = child.child().id().unwrap_or(0) as libc::pid_t;
+        // tokio::process::Child::id() is None once reaped; the setup guard
+        // keeps the child alive here, so 0 cannot reach kill().
+        let pid = child.child().id().unwrap_or_default() as libc::pid_t;
         let (master_read, master_write, master_lifecycle) = match pty_master {
             Some(master) => {
                 let write_dup = master.try_clone().map_err(SpawnError::Pty)?;
@@ -534,25 +545,47 @@ pub async fn write_all_fd(
 
 /// Read once from an `AsyncFd`-wrapped file into `buffer`, awaiting
 /// readability first. Returns `Ok(0)` at end of stream.
+/// Read once from the PTY master into the spare capacity of `buffer`,
+/// advancing its length by the number of bytes read. Callers pass an empty
+/// `Vec` with reserved capacity so the filled buffer can be handed off
+/// without a copy or a re-zeroing fill.
 pub async fn read_some_fd(
     fd: &mut tokio::io::unix::AsyncFd<std::fs::File>,
-    buffer: &mut [u8],
+    buffer: &mut Vec<u8>,
 ) -> io::Result<usize> {
     loop {
         let mut guard = fd.readable().await?;
-        match guard.try_io(|inner| {
-            // SAFETY: plain read(2) on an owned fd with a valid buffer.
-            let result =
-                unsafe { libc::read(inner.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        let count = match guard.try_io(|inner| {
+            let spare = buffer.capacity() - buffer.len();
+            if spare == 0 {
+                return Ok(0);
+            }
+            // SAFETY: plain read(2) on an owned fd writing into the Vec's
+            // spare capacity: `as_mut_ptr()` is valid for `capacity()` bytes,
+            // the region starts `len()` bytes in and covers only spare
+            // capacity, and read(2) writes only within the buffer it is
+            // given. The length is advanced below by exactly the byte count
+            // the kernel reports writing.
+            let result = unsafe {
+                libc::read(
+                    inner.as_raw_fd(),
+                    buffer.as_mut_ptr().add(buffer.len()).cast(),
+                    spare,
+                )
+            };
             if result < 0 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(result as usize)
             }
         }) {
-            Ok(result) => return result,
+            Ok(result) => result?,
             Err(_would_block) => continue,
-        }
+        };
+        // SAFETY: the kernel initialized exactly `count` bytes within spare
+        // capacity.
+        unsafe { buffer.set_len(buffer.len() + count) };
+        return Ok(count);
     }
 }
 
@@ -563,6 +596,9 @@ pub enum SpawnError {
     Pty(io::Error),
     CommandTooLarge(usize),
     CommandContainsNul,
+    /// The spawn task itself failed (panicked) rather than the spawn call
+    /// reporting an OS-level error.
+    Task(String),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -577,6 +613,7 @@ impl std::fmt::Display for SpawnError {
                 )
             }
             SpawnError::CommandContainsNul => write!(f, "command payload contains NUL"),
+            SpawnError::Task(message) => write!(f, "host process task failed: {message}"),
         }
     }
 }

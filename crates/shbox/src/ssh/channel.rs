@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use russh::ChannelId;
 use russh::server::Handle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,9 +28,11 @@ type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
 /// Small output sink used by the generic sandbox bridge.  Keeping this
 /// boundary independent of russh makes stream ordering and cleanup tests
 /// deterministic without exposing a fake transport to production code.
+/// Payloads are owned `Bytes` so a chunk crosses the queue and the russh
+/// send path without another copy.
 pub(crate) trait ChannelSink: Send + Sync {
-    fn data<'a>(&'a self, id: ChannelId, data: Vec<u8>) -> SinkFuture<'a>;
-    fn extended_data<'a>(&'a self, id: ChannelId, ext: u32, data: Vec<u8>) -> SinkFuture<'a>;
+    fn data<'a>(&'a self, id: ChannelId, data: Bytes) -> SinkFuture<'a>;
+    fn extended_data<'a>(&'a self, id: ChannelId, ext: u32, data: Bytes) -> SinkFuture<'a>;
     fn eof<'a>(&'a self, id: ChannelId) -> SinkFuture<'a>;
     /// Reply FAILURE to the channel request that started this operation.
     /// russh only puts the reply on the wire when the client asked for one.
@@ -45,11 +48,11 @@ pub(crate) trait ChannelSink: Send + Sync {
 }
 
 impl ChannelSink for Handle {
-    fn data<'a>(&'a self, id: ChannelId, data: Vec<u8>) -> SinkFuture<'a> {
+    fn data<'a>(&'a self, id: ChannelId, data: Bytes) -> SinkFuture<'a> {
         Box::pin(async move { self.data(id, data).await.map_err(|_| ()) })
     }
 
-    fn extended_data<'a>(&'a self, id: ChannelId, ext: u32, data: Vec<u8>) -> SinkFuture<'a> {
+    fn extended_data<'a>(&'a self, id: ChannelId, ext: u32, data: Bytes) -> SinkFuture<'a> {
         Box::pin(async move { self.extended_data(id, ext, data).await.map_err(|_| ()) })
     }
 
@@ -106,7 +109,6 @@ pub(crate) struct ChannelState {
     /// Set once shell/exec/subsystem started; further terminal operations on
     /// the same channel are refused.
     pub started: bool,
-    pub eof_from_client: bool,
     /// Client-event mailbox, created at channel open. The receiver is taken
     /// by the bridge task when an operation starts.
     mailbox: Option<mpsc::Sender<ChannelEvent>>,
@@ -191,9 +193,10 @@ impl ChannelRegistry {
     }
 
     /// Return the currently requested PTY, if the channel still exists.
-    pub fn pty(&self, id: ChannelId) -> Option<host::PtyRequest> {
-        self.with_state(id, |state| state.pty.clone())
-            .unwrap_or(None)
+    /// Whether the channel carries a PTY, without cloning the request.
+    pub fn has_pty(&self, id: ChannelId) -> bool {
+        self.with_state(id, |state| state.pty.is_some())
+            .unwrap_or(false)
     }
 
     /// Return the PTY request and its desired-window revision as one snapshot.
@@ -270,8 +273,6 @@ pub(crate) enum ExitStatus {
     },
 }
 
-/// Size of one output chunk handed to the SSH channel.
-const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
 /// Number of buffered output chunks per channel (bounded memory).
 const OUTPUT_QUEUE_CHUNKS: usize = 8;
 /// Grace period between SIGTERM and SIGKILL on teardown.
@@ -287,14 +288,17 @@ pub(crate) async fn spawn_host_process(
     tokio::task::spawn_blocking(move || {
         // Keep host fork/exec serialized with the sandbox adapter's
         // non-atomic macOS pipe-CLOEXEC setup. Otherwise a host child could
-        // inherit an endpoint between pipe() and fcntl(FD_CLOEXEC).
+        // inherit an endpoint between pipe() and fcntl(FD_CLOEXEC). A
+        // poisoned lock still holds no state (it guards nothing), so
+        // recovery is safe; a panic inside `spawn` surfaces as a join error
+        // and fails this request instead of killing the connection task.
         let _spawn_guard = crate::platform::process_spawn_lock()
             .lock()
-            .expect("process spawn lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         host::HostProcess::spawn(&request)
     })
     .await
-    .expect("spawn_blocking join")
+    .map_err(|join_error| host::SpawnError::Task(join_error.to_string()))?
 }
 
 /// Wait for an adapter's reap/cleanup owner after an abnormal channel
@@ -344,42 +348,21 @@ pub(crate) async fn terminate_host_process(
     }
 }
 
-/// Re-apply the latest channel window before a sandbox bridge is published.
-/// A resize can arrive while the blocking adapter launch is in progress; the
-/// loop observes the state revision after each ioctl and repeats until stable.
-pub(crate) fn synchronize_sandbox_window(
+/// Re-apply the latest channel window before a bridge is published. A resize
+/// can arrive while the blocking adapter launch is in progress; the loop
+/// observes the state revision after each resize and repeats until stable.
+/// `resize` is the adapter-specific apply step (platform control or host
+/// process); `false` means the adapter rejected the resize.
+pub(crate) fn synchronize_window(
     registry: &ChannelRegistry,
     id: ChannelId,
-    control: &dyn platform::RunningProcess,
+    mut resize: impl FnMut(u32, u32) -> bool,
 ) -> Option<u64> {
     let Some((mut pty, mut revision)) = registry.pty_snapshot(id) else {
         return Some(0);
     };
     loop {
-        if !control.resize(pty.rows, pty.cols) {
-            return None;
-        }
-        let (latest, latest_revision) = registry.pty_snapshot(id)?;
-        if latest_revision == revision {
-            return Some(revision);
-        }
-        pty = latest;
-        revision = latest_revision;
-    }
-}
-
-/// The host adapter has the same launch race, but owns a mutable process
-/// rather than a platform control trait object.
-pub(crate) fn synchronize_host_window(
-    registry: &ChannelRegistry,
-    id: ChannelId,
-    process: &mut host::HostProcess,
-) -> Option<u64> {
-    let Some((mut pty, mut revision)) = registry.pty_snapshot(id) else {
-        return Some(0);
-    };
-    loop {
-        if !process.resize(pty.rows, pty.cols) {
+        if !resize(pty.rows, pty.cols) {
             return None;
         }
         let (latest, latest_revision) = registry.pty_snapshot(id)?;
@@ -430,7 +413,10 @@ pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
     }
     drop(output_tx);
 
-    let (exit_tx, mut exit_rx) = mpsc::channel::<ExitStatus>(1);
+    // Exactly one reply is ever produced; a oneshot says so in types, unlike
+    // a many-producer channel whose `None` conflates "dropped" with a value.
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let mut exit_rx = Some(exit_rx);
     let mut waiter_task = tokio::task::spawn(async move {
         let exit = match waiter.exit().await {
             Ok(host::Exit::Code(code)) => ExitStatus::Code(code.clamp(0, i32::MAX) as u32),
@@ -442,11 +428,11 @@ pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
                 core_dumped,
             },
             Err(err) => {
-                tracing::warn!("host process wait failed: {err}");
+                tracing::warn!(error = %err, "host process wait failed");
                 ExitStatus::Code(255)
             }
         };
-        let _ = exit_tx.send(exit).await;
+        let _ = exit_tx.send(exit);
     });
 
     let mut client_eof = false;
@@ -506,7 +492,15 @@ pub(crate) async fn run_host_process(run: HostProcessRun) -> ChannelResult {
                     None => output_done = true,
                 }
             }
-            status = exit_rx.recv(), if exit_status.is_none() => {
+            status = async {
+                exit_rx
+                    .as_mut()
+                    .expect("receiver present until first exit")
+                    .await
+            },
+            if exit_status.is_none() => {
+                // A dropped sender (waiter task aborted/panicked) still means
+                // "no exit to report"; keep the 255 fallback.
                 exit_status = Some(status.unwrap_or(ExitStatus::Code(255)));
             }
         }
@@ -729,7 +723,11 @@ fn normalize_sandbox_exit(
 pub(crate) async fn finish_failed(id: ChannelId, sink: &dyn ChannelSink) -> ChannelResult {
     let _ = sink.failure(id).await;
     let _ = sink
-        .extended_data(id, 1, b"shbox: request cannot be completed\r\n".to_vec())
+        .extended_data(
+            id,
+            1,
+            Bytes::from_static(b"shbox: request cannot be completed\r\n"),
+        )
         .await;
     let _ = sink.eof(id).await;
     let _ = sink.exit_status(id, super::UNAVAILABLE_EXIT).await;
@@ -739,9 +737,30 @@ pub(crate) async fn finish_failed(id: ChannelId, sink: &dyn ChannelSink) -> Chan
 
 #[derive(Debug)]
 struct OutputChunk {
-    data: Vec<u8>,
+    data: Bytes,
     ext: Option<u32>,
     failed: bool,
+}
+
+/// Size of one output read handed to the SSH channel. Bulk reads at or above
+/// half this size hand the whole buffer to the queue without a copy; smaller
+/// reads copy into a right-sized `Bytes`, which is cheaper than faulting in
+/// a fresh 32 KiB buffer per tiny chunk.
+const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
+const PUMP_HANDOFF_MIN_BYTES: usize = OUTPUT_CHUNK_BYTES / 2;
+
+/// Take `count` read bytes out of a pump buffer that is empty again on
+/// return: bulk reads hand the whole allocation to the queue zero-copy and
+/// continue with a fresh buffer, small reads copy out and clear in place.
+fn output_chunk_data(buffer: &mut Vec<u8>, count: usize) -> Bytes {
+    if count >= PUMP_HANDOFF_MIN_BYTES {
+        let taken = std::mem::replace(buffer, Vec::with_capacity(OUTPUT_CHUNK_BYTES));
+        Bytes::from(taken)
+    } else {
+        let data = Bytes::copy_from_slice(&buffer[..count]);
+        buffer.clear();
+        data
+    }
 }
 
 /// Read one child pipe to EOF and forward bounded chunks.
@@ -751,14 +770,16 @@ fn spawn_pipe_pump(
     tx: mpsc::Sender<OutputChunk>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
-        let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
+        let mut buffer = Vec::with_capacity(OUTPUT_CHUNK_BYTES);
         loop {
-            match reader.read(&mut buffer).await {
+            // `read_buf` fills the Vec's spare capacity, so the bulk path can
+            // hand the buffer itself to the queue instead of copying out of it.
+            match reader.read_buf(&mut buffer).await {
                 Ok(0) => break,
                 Err(_) => {
                     let _ = tx
                         .send(OutputChunk {
-                            data: Vec::new(),
+                            data: Bytes::new(),
                             ext,
                             failed: true,
                         })
@@ -766,8 +787,9 @@ fn spawn_pipe_pump(
                     break;
                 }
                 Ok(count) => {
+                    let data = output_chunk_data(&mut buffer, count);
                     let chunk = OutputChunk {
-                        data: buffer[..count].to_vec(),
+                        data,
                         ext,
                         failed: false,
                     };
@@ -786,7 +808,7 @@ fn spawn_pty_pump(
     tx: mpsc::Sender<OutputChunk>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
-        let mut buffer = vec![0u8; OUTPUT_CHUNK_BYTES];
+        let mut buffer = Vec::with_capacity(OUTPUT_CHUNK_BYTES);
         loop {
             match host::read_some_fd(&mut master, &mut buffer).await {
                 Ok(0) => break,
@@ -794,7 +816,7 @@ fn spawn_pty_pump(
                 Err(_) => {
                     let _ = tx
                         .send(OutputChunk {
-                            data: Vec::new(),
+                            data: Bytes::new(),
                             ext: None,
                             failed: true,
                         })
@@ -802,8 +824,9 @@ fn spawn_pty_pump(
                     break;
                 }
                 Ok(count) => {
+                    let data = output_chunk_data(&mut buffer, count);
                     let chunk = OutputChunk {
-                        data: buffer[..count].to_vec(),
+                        data,
                         ext: None,
                         failed: false,
                     };
@@ -876,8 +899,8 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SinkEvent {
-        Data(Vec<u8>),
-        Extended(u32, Vec<u8>),
+        Data(Bytes),
+        Extended(u32, Bytes),
         Eof,
         Failure,
         ExitStatus(u32),
@@ -906,7 +929,7 @@ mod tests {
     }
 
     impl ChannelSink for RecordingSink {
-        fn data<'a>(&'a self, _id: ChannelId, data: Vec<u8>) -> SinkFuture<'a> {
+        fn data<'a>(&'a self, _id: ChannelId, data: Bytes) -> SinkFuture<'a> {
             self.record(SinkEvent::Data(data));
             if self.fail_data.load(Ordering::Acquire) {
                 Box::pin(async { Err(()) })
@@ -915,7 +938,7 @@ mod tests {
             }
         }
 
-        fn extended_data<'a>(&'a self, _id: ChannelId, ext: u32, data: Vec<u8>) -> SinkFuture<'a> {
+        fn extended_data<'a>(&'a self, _id: ChannelId, ext: u32, data: Bytes) -> SinkFuture<'a> {
             self.record(SinkEvent::Extended(ext, data));
             Self::ready()
         }
@@ -1080,8 +1103,8 @@ mod tests {
         assert_eq!(bridge.await.expect("bridge join"), ChannelResult::Completed);
 
         let events = sink.events();
-        assert!(events.contains(&SinkEvent::Data(b"out".to_vec())));
-        assert!(events.contains(&SinkEvent::Extended(1, b"err".to_vec())));
+        assert!(events.contains(&SinkEvent::Data(Bytes::from_static(b"out"))));
+        assert!(events.contains(&SinkEvent::Extended(1, Bytes::from_static(b"err"))));
         assert_eq!(
             &events[events.len() - 3..],
             [SinkEvent::Eof, SinkEvent::ExitStatus(7), SinkEvent::Close,]
@@ -1119,7 +1142,7 @@ mod tests {
         .await;
         assert_eq!(bridge.await.expect("bridge join"), ChannelResult::Completed);
         let events = sink.events();
-        assert!(events.contains(&SinkEvent::Data(b"terminal".to_vec())));
+        assert!(events.contains(&SinkEvent::Data(Bytes::from_static(b"terminal"))));
         assert!(
             !events
                 .iter()
@@ -1195,5 +1218,61 @@ mod tests {
         assert_eq!(bridge.await.expect("bridge join"), ChannelResult::Aborted);
         assert!(fake.terminated());
         assert_eq!(sink.events().last(), Some(&SinkEvent::Close));
+    }
+
+    // ---- Performance baselines (M1) ----
+    //
+    // Replayed with:
+    //   cargo test --release -- baseline -- --ignored --test-threads=1 --nocapture
+
+    /// Throughput of the pipe pump into the bounded output queue. The bulk
+    /// workload reads full 32 KiB chunks (the case M5 removes a copy from);
+    /// the small workload reads 512-byte pieces (the interactive case that
+    /// must not regress).
+    #[tokio::test]
+    #[ignore = "performance baseline; replay with cargo test --release -- baseline -- --ignored --nocapture"]
+    async fn baseline_pipe_pump_throughput() {
+        async fn run(total: usize, write_size: usize) -> (std::time::Duration, usize) {
+            let (mut writer, reader) = tokio::io::duplex(2 * OUTPUT_CHUNK_BYTES);
+            let (tx, mut rx) = mpsc::channel::<OutputChunk>(OUTPUT_QUEUE_CHUNKS);
+            let pump = spawn_pipe_pump(reader, None, tx);
+            let consumer = tokio::spawn(async move {
+                let mut chunks = 0usize;
+                let mut bytes = 0usize;
+                while let Some(chunk) = rx.recv().await {
+                    if chunk.failed {
+                        break;
+                    }
+                    bytes += chunk.data.len();
+                    chunks += 1;
+                }
+                (chunks, bytes)
+            });
+            let start = std::time::Instant::now();
+            let payload = vec![7u8; write_size];
+            let mut written = 0usize;
+            while written < total {
+                writer.write_all(&payload).await.expect("feed pump");
+                written += payload.len();
+            }
+            drop(writer);
+            pump.await.expect("pump join");
+            let (chunks, bytes) = consumer.await.expect("consumer join");
+            assert_eq!(bytes, total);
+            (start.elapsed(), chunks)
+        }
+
+        let total = 64 * 1024 * 1024;
+        let (bulk_elapsed, bulk_chunks) = run(total, OUTPUT_CHUNK_BYTES).await;
+        println!(
+            "baseline pipe pump bulk 64 MiB in {OUTPUT_CHUNK_BYTES}B writes: {bulk_elapsed:?} ({:.0} MiB/s, {bulk_chunks} chunks)",
+            (total as f64 / 1024.0 / 1024.0) / bulk_elapsed.as_secs_f64()
+        );
+        let small_total = 8 * 1024 * 1024;
+        let (small_elapsed, small_chunks) = run(small_total, 512).await;
+        println!(
+            "baseline pipe pump small 8 MiB in 512B writes: {small_elapsed:?} ({:.0} MiB/s, {small_chunks} chunks)",
+            (small_total as f64 / 1024.0 / 1024.0) / small_elapsed.as_secs_f64()
+        );
     }
 }

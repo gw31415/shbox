@@ -250,14 +250,17 @@ where
 /// back to a plain stderr headline when no subscriber is installed.
 fn report(error: &BootstrapError) {
     if logging::initialized() {
-        error!(step = error.step, "startup failed: {error}");
+        error!(step = error.step, error = %error, "startup failed");
     } else {
+        // Startup can fail before logging exists — the config file is one of
+        // logging's own inputs — so the chain goes to plain stderr here, and
+        // only here: a `Display` already inlines its source chain.
         eprintln!("shbox: {error}");
-    }
-    let mut cause = std::error::Error::source(error);
-    while let Some(current) = cause {
-        eprintln!("shbox: caused by: {current}");
-        cause = current.source();
+        let mut cause = std::error::Error::source(error);
+        while let Some(current) = cause {
+            eprintln!("shbox: caused by: {current}");
+            cause = current.source();
+        }
     }
 }
 

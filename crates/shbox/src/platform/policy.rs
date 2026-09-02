@@ -131,15 +131,32 @@ pub(crate) const CURATED_WRITE_PATHS: &[&str] = &[];
 /// validated sandbox shell. Workspace and launch-temp grants stay
 /// request-local: they are derived per launch by the platform backends, never
 /// stored here.
+///
+/// Filesystem snapshot semantics: the curated and operator-configured read
+/// paths are resolved, canonicalized, sorted, and deduplicated once when the
+/// snapshot is built. A configured path that exists at startup stays granted
+/// for the daemon's lifetime even if it disappears and reappears afterwards;
+/// one that is absent at startup is never granted until the daemon restarts.
+/// This matches the process-lifetime config contract: `shbox` never re-reads
+/// its configuration, and SIGHUP only revalidates the key sources.
 #[derive(Clone)]
 pub(crate) struct SandboxLaunchPolicy {
     shell: PathBuf,
     network: NetworkMode,
-    read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
     temp_root: PathBuf,
     resources: SandboxResources,
     cgroup_parent: Option<PathBuf>,
+    /// Invariant filesystem tiers resolved once at snapshot construction, so
+    /// a launch never re-stats or canonicalizes policy paths.
+    resolved: ResolvedFilesystem,
+}
+
+/// Precomputed invariant filesystem tiers of one policy snapshot.
+#[derive(Clone)]
+struct ResolvedFilesystem {
+    read_only: Vec<PathBuf>,
+    execute: Vec<PathBuf>,
 }
 
 impl fmt::Debug for SandboxLaunchPolicy {
@@ -147,7 +164,8 @@ impl fmt::Debug for SandboxLaunchPolicy {
         f.debug_struct("SandboxLaunchPolicy")
             .field("shell", &self.shell)
             .field("network", &self.network)
-            .field("read_paths", &self.read_paths)
+            .field("read_only_paths", &self.resolved.read_only)
+            .field("execute_paths", &self.resolved.execute)
             .field(
                 "sandbox_env_keys",
                 &self.sandbox_env.keys().collect::<Vec<_>>(),
@@ -184,7 +202,8 @@ impl SandboxLaunchPolicy {
 
     /// Assemble a policy from explicit parts. The production path is
     /// [`from_config`](Self::from_config); tests use this to construct
-    /// policies without a TOML config fixture.
+    /// policies without a TOML config fixture. The invariant filesystem
+    /// tiers are resolved here, once, per the snapshot contract.
     pub(crate) fn from_parts(
         shell: PathBuf,
         network: NetworkMode,
@@ -194,14 +213,34 @@ impl SandboxLaunchPolicy {
         resources: SandboxResources,
         cgroup_parent: Option<PathBuf>,
     ) -> Self {
+        let mut read_only = Vec::new();
+        let mut execute = Vec::new();
+
+        for (path, class) in CURATED_READ_PATHS {
+            let target = match class {
+                ReadPathClass::ExecutableRuntime => &mut execute,
+                ReadPathClass::SystemData | ReadPathClass::TerminalDevice => &mut read_only,
+            };
+            target.push(PathBuf::from(path));
+        }
+
+        execute.push(shell.clone());
+        if let Some(parent) = shell.parent() {
+            execute.push(parent.to_path_buf());
+        }
+        read_only.extend(read_paths.iter().cloned());
+
+        canonicalize_existing_paths(&mut read_only);
+        canonicalize_existing_paths(&mut execute);
+
         Self {
             shell,
             network,
-            read_paths,
             sandbox_env,
             temp_root,
             resources,
             cgroup_parent,
+            resolved: ResolvedFilesystem { read_only, execute },
         }
     }
 
@@ -232,30 +271,14 @@ impl SandboxLaunchPolicy {
         &self.temp_root
     }
 
-    /// Resolve readable paths into the engine's non-executable and executable
-    /// tiers. Operator-configured read paths never gain execute permission;
-    /// only curated runtime paths and the configured shell do.
+    /// The invariant filesystem tiers resolved at snapshot construction:
+    /// read-only and executable path lists, canonicalized, sorted, and
+    /// deduplicated once when the policy was built.
     fn resolved_filesystem_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let mut read_only = Vec::new();
-        let mut execute = Vec::new();
-
-        for (path, class) in CURATED_READ_PATHS {
-            let target = match class {
-                ReadPathClass::ExecutableRuntime => &mut execute,
-                ReadPathClass::SystemData | ReadPathClass::TerminalDevice => &mut read_only,
-            };
-            target.push(PathBuf::from(path));
-        }
-
-        execute.push(self.shell.clone());
-        if let Some(parent) = self.shell.parent() {
-            execute.push(parent.to_path_buf());
-        }
-        read_only.extend(self.read_paths.iter().cloned());
-
-        canonicalize_existing_paths(&mut read_only);
-        canonicalize_existing_paths(&mut execute);
-        (read_only, execute)
+        (
+            self.resolved.read_only.clone(),
+            self.resolved.execute.clone(),
+        )
     }
 
     pub(crate) fn curated_write_paths(&self) -> Vec<PathBuf> {
@@ -436,9 +459,10 @@ impl SandboxLaunchPolicy {
                     return Ok(LaunchTemp { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => {
-                    return Err(LaunchError::new(
+                Err(error) => {
+                    return Err(LaunchError::with_source(
                         "sandbox launch temp directory could not be created",
+                        error,
                     ));
                 }
             }
@@ -698,6 +722,54 @@ mod tests {
         }
     }
 
+    /// Configured read paths follow process-lifetime snapshot semantics: a
+    /// path absent when the policy snapshot is built is never granted, even
+    /// if it appears later, and no launch-time stat re-decides the grant.
+    #[test]
+    fn configured_paths_are_resolved_once_at_snapshot_time() {
+        let directory = tempfile::tempdir().expect("configured root");
+        let missing = directory.path().join("created-later");
+        let policy = SandboxLaunchPolicy::from_parts(
+            PathBuf::from("/bin/sh"),
+            NetworkMode::Disabled,
+            vec![missing.clone()],
+            BTreeMap::new(),
+            PathBuf::from("/state/runtime"),
+            crate::config::SandboxResources::default(),
+            None,
+        );
+        let (read_only, _) = policy.resolved_filesystem_paths();
+        assert!(
+            !read_only.contains(&missing),
+            "an absent configured path must not be granted by the snapshot"
+        );
+
+        // Creating the path afterwards does not change the frozen snapshot.
+        std::fs::create_dir(&missing).expect("create configured path");
+        let (read_only, _) = policy.resolved_filesystem_paths();
+        assert!(!read_only.contains(&missing));
+
+        // A path that exists at snapshot time is canonicalized once and stays
+        // granted for the policy's lifetime.
+        let existing = directory.path().join("share");
+        std::fs::create_dir(&existing).expect("create existing");
+        let policy = SandboxLaunchPolicy::from_parts(
+            PathBuf::from("/bin/sh"),
+            NetworkMode::Disabled,
+            vec![existing.clone()],
+            BTreeMap::new(),
+            PathBuf::from("/state/runtime"),
+            crate::config::SandboxResources::default(),
+            None,
+        );
+        let (read_only, _) = policy.resolved_filesystem_paths();
+        let canonical = std::fs::canonicalize(&existing).expect("canonical");
+        assert!(read_only.contains(&canonical));
+        std::fs::remove_dir(&existing).expect("remove after snapshot");
+        let (read_only, _) = policy.resolved_filesystem_paths();
+        assert!(read_only.contains(&canonical), "the grant is a snapshot");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn disabled_network_uses_an_unprivileged_isolated_network_namespace() {
@@ -873,5 +945,32 @@ mod tests {
             login_shell_argv0(Path::new("/")).is_err(),
             "a path with no file name has no login form"
         );
+    }
+
+    // ---- Performance baselines (M1) ----
+    //
+    // Replayed with:
+    //   cargo test --release -- baseline -- --ignored --test-threads=1 --nocapture
+
+    /// Cost of one `engine_config` construction: before M4 this resolves,
+    /// canonicalizes, sorts, and deduplicates the invariant policy paths on
+    /// every launch; after M4 the printed per-launch cost must drop to pure
+    /// in-memory assembly.
+    #[test]
+    #[ignore = "performance baseline; replay with cargo test --release -- baseline -- --ignored --nocapture"]
+    fn baseline_engine_config_construction() {
+        let policy = test_policy("/bin/sh");
+        let workspace = std::env::temp_dir();
+        let iterations = 500;
+        for _ in 0..50 {
+            std::hint::black_box(policy.engine_config(&workspace, &workspace));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let config = policy.engine_config(&workspace, &workspace);
+            std::hint::black_box(&config);
+        }
+        let elapsed = start.elapsed() / iterations;
+        println!("baseline engine_config per launch: {elapsed:?}");
     }
 }

@@ -144,45 +144,56 @@ pub enum ChildStage {
 }
 
 impl ChildStage {
+    /// Every stage in wire-code order (`code` = index + 1). Both directions
+    /// derive from this one table, so adding a stage cannot desynchronize
+    /// them.
+    const STAGES: [Self; 14] = [
+        Self::ParentDeath,
+        Self::Session,
+        Self::ControllingTerminal,
+        Self::WorkingDirectory,
+        Self::UserNamespace,
+        Self::MountPropagation,
+        Self::NoNewPrivs,
+        Self::Capabilities,
+        Self::Landlock,
+        Self::Seccomp,
+        Self::FdHygiene,
+        Self::Exec,
+        Self::Supervisor,
+        Self::ResourceLimits,
+    ];
+
     /// Stable wire code for the stage, used by the child status record.
     pub fn code(self) -> u8 {
-        match self {
-            ChildStage::ParentDeath => 1,
-            ChildStage::Session => 2,
-            ChildStage::ControllingTerminal => 3,
-            ChildStage::WorkingDirectory => 4,
-            ChildStage::UserNamespace => 5,
-            ChildStage::MountPropagation => 6,
-            ChildStage::NoNewPrivs => 7,
-            ChildStage::Capabilities => 8,
-            ChildStage::Landlock => 9,
-            ChildStage::Seccomp => 10,
-            ChildStage::FdHygiene => 11,
-            ChildStage::Exec => 12,
-            ChildStage::Supervisor => 13,
-            ChildStage::ResourceLimits => 14,
-        }
+        Self::STAGES
+            .iter()
+            .position(|&stage| stage == self)
+            .map_or(0, |index| index as u8 + 1)
     }
 
     /// Decode a wire code reported by the child.
     pub fn from_code(code: u8) -> Option<Self> {
-        Some(match code {
-            1 => ChildStage::ParentDeath,
-            2 => ChildStage::Session,
-            3 => ChildStage::ControllingTerminal,
-            4 => ChildStage::WorkingDirectory,
-            5 => ChildStage::UserNamespace,
-            6 => ChildStage::MountPropagation,
-            7 => ChildStage::NoNewPrivs,
-            8 => ChildStage::Capabilities,
-            9 => ChildStage::Landlock,
-            10 => ChildStage::Seccomp,
-            11 => ChildStage::FdHygiene,
-            12 => ChildStage::Exec,
-            13 => ChildStage::Supervisor,
-            14 => ChildStage::ResourceLimits,
-            _ => return None,
-        })
+        let index = usize::from(code.checked_sub(1)?);
+        Self::STAGES.get(index).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChildStage;
+
+    #[test]
+    fn stage_codes_round_trip() {
+        for (index, stage) in ChildStage::STAGES.iter().enumerate() {
+            assert_eq!(stage.code(), index as u8 + 1);
+            assert_eq!(ChildStage::from_code(stage.code()), Some(*stage));
+        }
+        assert_eq!(ChildStage::from_code(0), None);
+        assert_eq!(
+            ChildStage::from_code((ChildStage::STAGES.len() + 1) as u8),
+            None
+        );
     }
 }
 

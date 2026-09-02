@@ -145,14 +145,7 @@ impl Paths {
 
     /// True when `path` is `root` or located inside `root`.
     pub fn contains(root: &Path, path: &Path) -> bool {
-        let mut current = Some(path);
-        while let Some(dir) = current {
-            if dir == root {
-                return true;
-            }
-            current = dir.parent();
-        }
-        false
+        path.ancestors().any(|dir| dir == root)
     }
 }
 

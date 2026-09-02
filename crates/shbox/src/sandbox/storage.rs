@@ -94,10 +94,12 @@ impl Storage {
         root: &Path,
         faults: Option<Arc<FaultInjector>>,
     ) -> Result<Storage, Error> {
+        // `paths::Error` implements `std::error::Error`, so it rides along
+        // as the io source instead of being flattened to a string.
         paths::validate_dir(root).map_err(|source| Error::Io {
             operation: "validate sandbox root",
             path: root.to_path_buf(),
-            source: io::Error::other(source.to_string()),
+            source: io::Error::other(source),
         })?;
         Ok(Storage {
             root: root.to_path_buf(),
@@ -140,11 +142,11 @@ impl Storage {
         for name in read_names(root.as_raw_fd())
             .map_err(|source| self.io_path("scan sandbox root", source))?
         {
-            let Ok(raw) = String::from_utf8(name.clone()) else {
+            let Ok(raw) = std::str::from_utf8(&name) else {
                 unknown_entries += 1;
                 continue;
             };
-            let Ok(id) = SandboxId::parse(&raw) else {
+            let Ok(id) = SandboxId::parse(raw) else {
                 unknown_entries += 1;
                 continue;
             };

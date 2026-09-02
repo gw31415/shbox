@@ -16,7 +16,7 @@
 
 use std::fmt;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A tri-state limit value.
 ///
@@ -62,7 +62,9 @@ impl<T: fmt::Display> fmt::Display for Limit<T> {
 /// Filesystem access policy.
 ///
 /// `Unrestricted` is an explicit opt-out of filesystem confinement; with
-/// `Restricted`, nothing is accessible unless a rule grants it.
+/// `Restricted`, nothing is accessible unless a rule grants it. There is
+/// deliberately no `Default`: an unconfined sandbox must be written out,
+/// never arrived at implicitly.
 ///
 /// Rule tiers express caller intent. Both Seatbelt and Landlock preserve the
 /// distinction between read-only data and executable runtime paths:
@@ -75,11 +77,10 @@ impl<T: fmt::Display> fmt::Display for Limit<T> {
 /// The backend resolves each rule to an open file descriptor before the
 /// child exists, so rules are pinned to the opened object rather than to a
 /// re-resolvable path name.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesystemPolicy {
     /// No filesystem confinement is installed. The caller explicitly opts
     /// out; the crate never selects this implicitly.
-    #[default]
     Unrestricted,
     /// Deny-by-default filesystem access with explicit grants.
     Restricted {
@@ -104,6 +105,24 @@ impl PathRule {
     /// Build a rule for `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         PathRule { path: path.into() }
+    }
+}
+
+/// An operator-provided cgroup directory to create sandbox cgroups under
+/// (Linux only). Validated (writable cgroup v2 directory) at spawn time;
+/// meaningless and ignored on the other backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupParent(PathBuf);
+
+impl CgroupParent {
+    /// Wrap an absolute cgroup v2 directory path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        CgroupParent(path.into())
+    }
+
+    /// The configured cgroup directory path.
+    pub fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -221,10 +240,9 @@ impl ResourceLimits {
 ///
 /// An *allowlist* is `default_action: Errno(..)` with rules that match
 /// allowed syscalls to `matched_action: Allow`; a *denylist* inverts the two.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallPolicy {
     /// Install no filter at all.
-    #[default]
     Unrestricted,
     /// Install a filter with explicit default/matched actions and rules.
     Filter {
@@ -466,10 +484,12 @@ impl fmt::Display for Capability {
 
 /// The complete sandbox configuration for one spawn.
 ///
-/// Every field is explicit: there is no implicit merge with daemon globals.
-/// Callers resolve their own administrator/user/session layers into this
-/// struct before spawning.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Every field is explicit: there is no implicit merge with daemon globals,
+/// and no `Default` — the fail-open policies (filesystem, syscalls) must be
+/// written out or chosen through [`SandboxConfig::unrestricted`]. Callers
+/// resolve their own administrator/user/session layers into this struct
+/// before spawning.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxConfig {
     /// Filesystem confinement.
     pub filesystem: FilesystemPolicy,
@@ -498,8 +518,14 @@ impl SandboxConfig {
     /// capability drop, FD hygiene) still apply.
     pub fn unrestricted() -> Self {
         SandboxConfig {
+            filesystem: FilesystemPolicy::Unrestricted,
             network: NetworkPolicy::Unrestricted,
-            ..SandboxConfig::default()
+            resources: ResourceLimits::default(),
+            syscalls: SyscallPolicy::Unrestricted,
+            namespaces: NamespacePolicy::default(),
+            capabilities: CapabilityPolicy::default(),
+            inherited_fds: Vec::new(),
+            cgroup_parent: None,
         }
     }
 }

@@ -338,7 +338,7 @@ fn validate_listen(raw: Option<&[String]>) -> Result<Vec<ListenEndpoint>, Error>
     for value in values {
         let endpoint = ListenEndpoint::from_str(value).map_err(|err| Error::Invalid {
             field: "listen",
-            message: err.0,
+            message: err.to_string(),
         })?;
         if listen.contains(&endpoint) {
             return Err(Error::Invalid {

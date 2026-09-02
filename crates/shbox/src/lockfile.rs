@@ -17,6 +17,25 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::{self, Paths};
 
+/// The logical role a lock plays; part of the error contract so callers can
+/// tell which acquisition failed without parsing a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRole {
+    /// The data-root `registry.lock`.
+    Registry,
+    /// The state-root daemon `lock`.
+    State,
+}
+
+impl fmt::Display for LockRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockRole::Registry => f.write_str("registry lock (sandbox data root)"),
+            LockRole::State => f.write_str("daemon lock (state root)"),
+        }
+    }
+}
+
 /// Held advisory locks; dropping this value releases both.
 #[derive(Debug)]
 pub struct Locks {
@@ -31,12 +50,12 @@ impl Locks {
     /// another process already holds it. Partial acquisition is rolled back.
     pub fn acquire(paths: &Paths) -> Result<Locks, Error> {
         let registry = LockFile::acquire(paths.registry_lock())
-            .map_err(|err| err.context("registry lock (sandbox data root)"))?;
+            .map_err(|err| err.with_role(LockRole::Registry))?;
         let state = match LockFile::acquire(paths.state_lock()) {
             Ok(state) => state,
             // Dropping `registry` releases the already-held lock before the
             // caller sees the failure.
-            Err(err) => return Err(err.context("daemon lock (state root)")),
+            Err(err) => return Err(err.with_role(LockRole::State)),
         };
         Ok(Locks {
             _registry: registry,
@@ -63,25 +82,22 @@ impl LockFile {
             .open(path)
             .map_err(|err| {
                 if err.kind() == io::ErrorKind::NotFound {
-                    Error::new(path, "lock parent directory is missing", Some(err))
+                    Error::new(path, Failure::MissingParentDirectory, Some(err))
                 } else if err.raw_os_error() == Some(libc::ELOOP) {
-                    Error::new(path, "lock path is a symlink", Some(err))
+                    Error::new(path, Failure::Symlink, Some(err))
                 } else {
-                    Error::new(path, "cannot open lock file", Some(err))
+                    Error::new(path, Failure::Io, Some(err))
                 }
             })?;
         validate_lock_file(path, &file)?;
+        // SAFETY: the descriptor is valid for the lifetime of the held file.
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Err(Error::new(
-                    path,
-                    "another daemon already holds this lock",
-                    None,
-                ));
+                return Err(Error::new(path, Failure::HeldByOtherDaemon, None));
             }
-            return Err(Error::new(path, "cannot lock lock file", Some(err)));
+            return Err(Error::new(path, Failure::Io, Some(err)));
         }
         Ok(LockFile {
             path: path.to_path_buf(),
@@ -100,28 +116,34 @@ impl Drop for LockFile {
     }
 }
 
+/// The failure class of a lock acquisition; callers match on this instead of
+/// parsing the `Display` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The lock's parent directory does not exist.
+    MissingParentDirectory,
+    /// The lock path is a symlink (rejected by `O_NOFOLLOW` or stat checks).
+    Symlink,
+    /// Another process holds the advisory lock.
+    HeldByOtherDaemon,
+    /// Any other OS-level failure; the `io::Error` source carries the detail.
+    Io,
+}
+
 /// Validate the opened lock file before relying on it: a regular file, owned
 /// by the daemon user, not group/world writable.
 fn validate_lock_file(path: &Path, file: &fs::File) -> Result<(), Error> {
     let metadata = file
         .metadata()
-        .map_err(|err| Error::new(path, "cannot stat lock file", Some(err)))?;
+        .map_err(|err| Error::new(path, Failure::Io, Some(err)))?;
     if !metadata.is_file() {
-        return Err(Error::new(path, "lock path is not a regular file", None));
+        return Err(Error::new(path, Failure::Symlink, None));
     }
     if metadata.uid() != paths::euid() {
-        return Err(Error::new(
-            path,
-            "lock file is not owned by the daemon user",
-            None,
-        ));
+        return Err(Error::new(path, Failure::Io, None));
     }
     if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(Error::new(
-            path,
-            "lock file is group or world writable",
-            None,
-        ));
+        return Err(Error::new(path, Failure::Io, None));
     }
     Ok(())
 }
@@ -129,30 +151,53 @@ fn validate_lock_file(path: &Path, file: &fs::File) -> Result<(), Error> {
 /// Errors from lock acquisition.
 #[derive(Debug)]
 pub struct Error {
-    message: String,
+    failure: Failure,
     path: PathBuf,
+    role: Option<LockRole>,
     source: Option<io::Error>,
 }
 
 impl Error {
-    fn new(path: &Path, message: &str, source: Option<io::Error>) -> Error {
+    fn new(path: &Path, failure: Failure, source: Option<io::Error>) -> Error {
         Error {
-            message: message.to_string(),
+            failure,
             path: path.to_path_buf(),
+            role: None,
             source,
         }
     }
 
-    /// Add the logical role of the lock (registry vs state) to the message.
-    pub fn context(mut self, role: &str) -> Error {
-        self.message = format!("{} ({role})", self.message);
+    /// Attach the logical role of the lock (registry vs state) to the error.
+    pub fn with_role(mut self, role: LockRole) -> Error {
+        self.role = Some(role);
         self
+    }
+
+    /// The failure class.
+    #[cfg(test)]
+    pub fn failure(&self) -> Failure {
+        self.failure
+    }
+
+    /// The logical role attached at acquisition, if any.
+    #[cfg(test)]
+    pub fn role(&self) -> Option<LockRole> {
+        self.role
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.message, self.path.display())?;
+        if let Some(role) = self.role {
+            write!(f, "{role}: ")?;
+        }
+        match self.failure {
+            Failure::MissingParentDirectory => write!(f, "lock parent directory is missing")?,
+            Failure::Symlink => write!(f, "lock path is a symlink or not a regular file")?,
+            Failure::HeldByOtherDaemon => write!(f, "another daemon already holds this lock")?,
+            Failure::Io => write!(f, "cannot open or lock lock file")?,
+        }
+        write!(f, ": {}", self.path.display())?;
         if let Some(source) = &self.source {
             write!(f, ": {source}")?;
         }
@@ -204,7 +249,7 @@ mod tests {
         let paths = paths_for(&home, "a");
         let _locks = Locks::acquire(&paths).expect("first acquire");
         let err = Locks::acquire(&paths).expect_err("second daemon, same roots");
-        assert!(err.to_string().contains("another daemon"), "{err}");
+        assert_eq!(err.failure(), Failure::HeldByOtherDaemon, "{err}");
     }
 
     #[test]
@@ -221,7 +266,8 @@ mod tests {
         );
         second.ensure().expect("ensure");
         let err = Locks::acquire(&second).expect_err("shared data root");
-        assert!(err.to_string().contains("registry lock"), "{err}");
+        assert_eq!(err.failure(), Failure::HeldByOtherDaemon, "{err}");
+        assert_eq!(err.role(), Some(LockRole::Registry));
     }
 
     #[test]
@@ -239,7 +285,8 @@ mod tests {
         );
         second.ensure().expect("ensure");
         let err = Locks::acquire(&second).expect_err("shared state root");
-        assert!(err.to_string().contains("daemon lock"), "{err}");
+        assert_eq!(err.failure(), Failure::HeldByOtherDaemon, "{err}");
+        assert_eq!(err.role(), Some(LockRole::State));
 
         // The first-acquired registry lock of the failed attempt was released:
         // a fresh daemon on that data root (with a free state root) can start.
@@ -255,6 +302,6 @@ mod tests {
         fs::write(&victim, b"").expect("write victim");
         std::os::unix::fs::symlink(&victim, paths.registry_lock()).expect("symlink");
         let err = Locks::acquire(&paths).expect_err("symlinked lock");
-        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(err.failure(), Failure::Symlink, "{err}");
     }
 }

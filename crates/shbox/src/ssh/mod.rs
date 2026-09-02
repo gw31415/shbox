@@ -175,11 +175,12 @@ impl ConnHandler {
         };
         let lease = managed.lease.clone();
         let mut process = managed.process;
-        let Some(window_revision) = channel::synchronize_sandbox_window(
-            &self.conn.registry,
-            channel,
-            process.control.as_ref(),
-        ) else {
+        let control = Arc::clone(&process.control);
+        let Some(window_revision) =
+            channel::synchronize_window(&self.conn.registry, channel, |rows, cols| {
+                control.resize(rows, cols)
+            })
+        else {
             let control = Arc::clone(&process.control);
             channel::wait_for_process_cleanup(control).await;
             self.shared.sandbox.clear_runtime(&lease);
@@ -245,30 +246,16 @@ impl ConnHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), crate::server::HandlerError> {
-        if self.conn.registry.pty(channel).is_some() || self.conn.registry.start(channel).is_none()
-        {
-            let _ = session.channel_failure(channel);
-            return Ok(());
-        }
-        let Some(principal) = self.conn.principal() else {
-            let _ = session.channel_failure(channel);
-            self.conn.registry.remove(channel);
-            return Ok(());
-        };
-        let manager = Arc::clone(&self.shared.sandbox);
-        let list = tokio::task::spawn_blocking(move || manager.list(&principal)).await;
-        let output = match list {
-            Ok(result) => result.map(|ids| {
-                ids.into_iter()
-                    .map(|id| format!("{id}\n"))
-                    .collect::<String>()
-                    .into_bytes()
-            }),
-            Err(error) => {
-                tracing::warn!(error = %error, "sandbox list task failed");
-                Err(crate::sandbox::manager::Error::Unavailable)
-            }
-        };
+        let output = self
+            .run_management(channel, "sandbox list task failed", |manager, principal| {
+                manager.list(principal).map(|ids| {
+                    ids.into_iter()
+                        .map(|id| format!("{id}\n"))
+                        .collect::<String>()
+                        .into_bytes()
+                })
+            })
+            .await;
         self.complete_management(channel, session, output).await
     }
 
@@ -278,26 +265,45 @@ impl ConnHandler {
         session: &mut Session,
         id: SandboxId,
     ) -> Result<(), crate::server::HandlerError> {
-        if self.conn.registry.pty(channel).is_some() || self.conn.registry.start(channel).is_none()
-        {
-            let _ = session.channel_failure(channel);
-            return Ok(());
+        let output = self
+            .run_management(
+                channel,
+                "sandbox delete task failed",
+                move |manager, principal| manager.delete(principal, &id).map(|_| Vec::new()),
+            )
+            .await;
+        self.complete_management(channel, session, output).await
+    }
+
+    /// Shared skeleton for the management channels: guard the channel, take
+    /// the principal, run the manager call on the blocking pool, and map a
+    /// task panic onto `Unavailable`. Returns the output bytes for
+    /// [`Self::complete_management`].
+    async fn run_management(
+        &mut self,
+        channel: ChannelId,
+        task_failure: &'static str,
+        operation: impl FnOnce(
+            &crate::sandbox::SandboxManager,
+            &crate::auth::Principal,
+        ) -> Result<Vec<u8>, crate::sandbox::manager::Error>
+        + Send
+        + 'static,
+    ) -> Result<Vec<u8>, crate::sandbox::manager::Error> {
+        if self.conn.registry.has_pty(channel) || self.conn.registry.start(channel).is_none() {
+            return Err(crate::sandbox::manager::Error::Unavailable);
         }
         let Some(principal) = self.conn.principal() else {
-            let _ = session.channel_failure(channel);
-            self.conn.registry.remove(channel);
-            return Ok(());
+            return Err(crate::sandbox::manager::Error::Unavailable);
         };
         let manager = Arc::clone(&self.shared.sandbox);
-        let result =
-            match tokio::task::spawn_blocking(move || manager.delete(&principal, &id)).await {
-                Ok(result) => result.map(|_| Vec::new()),
-                Err(error) => {
-                    tracing::warn!(error = %error, "sandbox delete task failed");
-                    Err(crate::sandbox::manager::Error::Unavailable)
-                }
-            };
-        self.complete_management(channel, session, result).await
+        match tokio::task::spawn_blocking(move || operation(&manager, &principal)).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(error = %error, task_failure);
+                Err(crate::sandbox::manager::Error::Unavailable)
+            }
+        }
     }
 
     /// Approve the single terminal operation for a channel and dispatch it.
@@ -307,8 +313,8 @@ impl ConnHandler {
         session: &mut Session,
         operation: ChannelOperation,
     ) -> Result<(), crate::server::HandlerError> {
-        let username = self.username.clone().unwrap_or_default();
-        match self.route(&username) {
+        let username = self.username.as_deref().unwrap_or("");
+        match self.route(username) {
             Err(rejection) => {
                 tracing::debug!(?rejection, "route refused");
                 let _ = session.channel_failure(channel);
@@ -352,19 +358,20 @@ impl ConnHandler {
         // Do not acknowledge the request until fork/exec and PTY setup have
         // completed. A client-visible success must never be followed by a
         // spawn failure that was already known to the daemon.
-        let (process, waiter) = match channel::spawn_host_process(request).await {
+        let (mut process, waiter) = match channel::spawn_host_process(request).await {
             Ok(process) => process,
             Err(err) => {
-                tracing::warn!("host process spawn failed: {err}");
+                tracing::warn!(error = %err, "host process spawn failed");
                 let handle = session.handle();
                 let _ = channel::finish_failed(channel, &handle).await;
                 self.conn.registry.remove(channel);
                 return Ok(());
             }
         };
-        let mut process = process;
         let Some(window_revision) =
-            channel::synchronize_host_window(&self.conn.registry, channel, &mut process)
+            channel::synchronize_window(&self.conn.registry, channel, |rows, cols| {
+                process.resize(rows, cols)
+            })
         else {
             // A failed resize ioctl means the PTY is unusable; complete the
             // channel with the generic failure instead of leaving the client
@@ -387,7 +394,7 @@ impl ConnHandler {
         let host_tasks = Arc::clone(&self.conn.host_tasks);
         let shutdown = self.conn.shutdown.clone();
         let host_control = process.control();
-        let task = tokio::spawn(async move {
+        let task: crate::server::HostTaskFuture = Box::pin(async move {
             // The bridge task owns the channel end to end; the handler only
             // routes further client events into the mailbox.
             channel::run_host_process(channel::HostProcessRun {
@@ -403,9 +410,11 @@ impl ConnHandler {
             .await;
             conn.registry.remove(channel);
         });
-        if let Err((task, control)) = host_tasks.track(task, host_control) {
+        if let Err((mut task, control)) = host_tasks.track(task, host_control) {
+            // The registry is closed (shutdown); run the bridge to completion
+            // here so the process is still torn down deterministically.
             control.force_terminate();
-            let _ = task.await;
+            let _ = task.as_mut().await;
         }
         Ok(())
     }
@@ -601,7 +610,7 @@ impl russh::server::Handler for ConnHandler {
         }
         match name {
             "list" => {
-                let username = self.username.clone().unwrap_or_default();
+                let username = self.username.as_deref().unwrap_or("");
                 let Some(principal) = self.conn.principal() else {
                     let _ = session.channel_failure(channel);
                     return Ok(());
@@ -616,12 +625,12 @@ impl russh::server::Handler for ConnHandler {
                 // `_` is a host context, never a delete target. Other
                 // selectors must be valid SandboxIds before they can reach
                 // the later manager implementation.
-                let username = self.username.clone().unwrap_or_default();
+                let username = self.username.as_deref().unwrap_or("");
                 if username == "_" {
                     let _ = session.channel_failure(channel);
                     return Ok(());
                 }
-                let Ok(id) = SandboxId::parse(&username) else {
+                let Ok(id) = SandboxId::parse(username) else {
                     let _ = session.channel_failure(channel);
                     return Ok(());
                 };
@@ -784,9 +793,8 @@ impl russh::server::Handler for ConnHandler {
     ) -> Result<(), Self::Error> {
         let accepted = self.conn.registry.try_send(channel, ChannelEvent::Eof);
         if accepted {
-            self.conn
-                .registry
-                .with_state(channel, |state| state.eof_from_client = true);
+            // The bridge's local `client_eof` tracks delivery; no registry
+            // flag is needed.
         } else {
             // A full mailbox must not lose the EOF silently.
             let _ = session.close(channel);

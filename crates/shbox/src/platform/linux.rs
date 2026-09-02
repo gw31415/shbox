@@ -235,7 +235,12 @@ impl ProcessLauncher for LinuxLauncher {
             None => self.engine.spawn(command, config),
         }
         .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
-        let pid = child.id();
+        // `None` would mean the child was already reaped — a pid of 0 must
+        // never reach the group-signaling control (`kill(0, ..)` would
+        // signal the daemon's own process group).
+        let pid = child
+            .id()
+            .ok_or_else(|| LaunchError::new("sandbox child vanished before launch completion"))?;
 
         // From here any fallible parent-side PTY setup must tear the
         // now-owned session down if the launch cannot be published to the

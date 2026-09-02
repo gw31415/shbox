@@ -56,7 +56,7 @@ fn restricted_to(workspace: &std::path::Path) -> SandboxConfig {
             execute: system_execute_paths(),
         },
         network: NetworkPolicy::Disabled,
-        ..SandboxConfig::default()
+        ..SandboxConfig::unrestricted()
     }
 }
 
@@ -425,7 +425,7 @@ fn terminate_signals_the_session_and_wait_reports_the_signal() {
     command = command.arg("-c").arg("trap '' TERM; sleep 30");
     command.session = shbox_sandbox::SessionSetup::NewSession;
     let mut child = sandbox.spawn(command, unrestricted()).expect("spawn");
-    let pid = child.id();
+    let pid = child.id().expect("child present");
     child.signal_process_group(libc::SIGKILL).expect("signal");
     let status = child.wait().expect("wait");
     assert_eq!(status.signal(), Some(9), "status: {status:?}");
@@ -500,7 +500,7 @@ fn dropping_the_handle_tears_down_descendants() {
     let mut command = CommandSpec::new("/bin/sh");
     command = command.arg("-c").arg("sleep 30 & sleep 30 & wait");
     let child = sandbox.spawn(command, unrestricted()).expect("spawn");
-    let pid = child.id();
+    let pid = child.id().expect("child present");
     drop(child);
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -723,7 +723,7 @@ mod linux_only {
         let mut child = Sandbox::detect()
             .spawn(command, unrestricted())
             .expect("spawn");
-        let pid = child.id();
+        let pid = child.id().expect("child present");
 
         child.signal(libc::SIGSTOP).expect("stop direct child");
         wait_for_process_state(pid, b'T', Duration::from_secs(1));
@@ -779,7 +779,7 @@ mod linux_only {
         let mut child = Sandbox::detect()
             .spawn(command, unrestricted())
             .expect("spawn");
-        let pid = child.id();
+        let pid = child.id().expect("child present");
         let descendant = wait_for_descendant(pid, Duration::from_secs(1));
         drop(child.take_stdin().expect("stdin pipe"));
         assert_eq!(child.wait().expect("wait").code(), Some(0));
@@ -897,7 +897,7 @@ mod linux_only {
             }
             Err(error) => panic!("PID namespace setup failed unexpectedly: {error}"),
         };
-        let pid = child.id();
+        let pid = child.id().expect("child present");
         let descendant = wait_for_descendant(pid, Duration::from_secs(1));
         drop(child);
 

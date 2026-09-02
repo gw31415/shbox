@@ -13,6 +13,7 @@ tcp = []
 ws = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 libc = "0.2"
 nix = { version = "0.31", features = ["term"] }

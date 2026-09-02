@@ -89,11 +89,10 @@ fn decode_sha256_base64(digest: &str) -> Result<[u8; 32], FingerprintError> {
             base64_value(byte).ok_or(FingerprintError::InvalidCharacter(index, byte))?;
     }
     let mut out = [0u8; 32];
-    for group in 0..10 {
-        let v = &values[group * 4..group * 4 + 4];
-        out[group * 3] = (v[0] << 2) | (v[1] >> 4);
-        out[group * 3 + 1] = (v[1] << 4) | (v[2] >> 2);
-        out[group * 3 + 2] = (v[2] << 6) | v[3];
+    for (v, group) in values[..40].chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        group[0] = (v[0] << 2) | (v[1] >> 4);
+        group[1] = (v[1] << 4) | (v[2] >> 2);
+        group[2] = (v[2] << 6) | v[3];
     }
     // The final 3 characters encode the last 2 bytes plus 2 padding bits that
     // must be zero for the encoding to be canonical.
@@ -165,16 +164,12 @@ pub fn validate_key_source_file(path: &Path, source_name: &'static str) -> Resul
             });
         }
     };
+    // `symlink_metadata` above reports the link itself, so a symlink lands
+    // here as "not a regular file" — no separate symlink check to reach.
     if !metadata.is_file() {
         return Err(Error::Invalid {
             path: path.to_path_buf(),
             reason: format!("{source_name} is not a regular file"),
-        });
-    }
-    if metadata.file_type().is_symlink() {
-        return Err(Error::Invalid {
-            path: path.to_path_buf(),
-            reason: format!("{source_name} must not be a symlink"),
         });
     }
     if metadata.len() > MAX_AUTHORIZED_KEYS_BYTES {
@@ -396,6 +391,9 @@ fn parse_key_source(
         reason: "file is not valid UTF-8".into(),
     })?;
     let mut keys: Vec<AuthorizedKey> = Vec::new();
+    // Duplicate fingerprints are rejected; the auxiliary set keeps detection
+    // linear in the key count while the ordered `Vec` preserves file order.
+    let mut seen = std::collections::HashSet::new();
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
         if line.len() > MAX_AUTHORIZED_KEYS_LINE_BYTES {
@@ -428,10 +426,7 @@ fn parse_key_source(
             });
         }
         let fingerprint = KeyFingerprint::from_ssh_key(&key);
-        if keys
-            .iter()
-            .any(|existing| existing.fingerprint == fingerprint)
-        {
+        if !seen.insert(fingerprint.clone()) {
             return Err(Error::Invalid {
                 path: path.to_path_buf(),
                 reason: format!("line {number} duplicates an earlier key"),
@@ -478,8 +473,10 @@ impl AuthSnapshot {
         let mut admin_count = 0;
 
         for host_key in host_keys {
-            if !principals.contains_key(&host_key.fingerprint) {
-                principals.insert(host_key.fingerprint.clone(), Role::Admin);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                principals.entry(host_key.fingerprint.clone())
+            {
+                entry.insert(Role::Admin);
                 keys.push(host_key);
                 admin_count += 1;
             }
@@ -570,9 +567,17 @@ pub enum RefreshOutcome {
 #[derive(Debug)]
 struct StoreState {
     snapshot: Arc<AuthSnapshot>,
-    /// `[0]` is the host `authorized_keys` identity, `[1]` the sandbox
-    /// `allowed_keys` identity.
-    identities: [FileIdentity; 2],
+    identities: SourceIdentities,
+}
+
+/// The two key-source identities by role, so a swapped observe order cannot
+/// compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceIdentities {
+    /// The host `authorized_keys`.
+    host: FileIdentity,
+    /// The sandbox `allowed_keys`.
+    allowed: FileIdentity,
 }
 
 /// The single live key store: the accepted-key snapshot plus the on-disk
@@ -580,14 +585,16 @@ struct StoreState {
 ///
 /// Every authentication request stats both key sources (two syscalls) and
 /// re-runs the full [`AuthSnapshot::load`] validation pipeline only when an
-/// identity changed or [`KeyStore::invalidate`] was called. A failed refresh
+/// identity changed or [`KeyStore::invalidate`] was called. The unchanged
+/// comparison runs under a read lock, so concurrent unchanged requests do not
+/// serialize behind each other; a changed or forced check takes the write
+/// lock, which makes concurrent refreshes single-flight. A failed refresh
 /// never publishes: the previous snapshot keeps serving and the *observed*
 /// identities are adopted, so a broken file costs at most one rejected parse
 /// per on-disk change rather than one per request.
 ///
 /// Locking: one [`std::sync::RwLock`], acquired only on blocking threads and
-/// never held across an `.await`. Holding it across the re-read is what makes
-/// concurrent refreshes single-flight. The store owns both paths so a future
+/// never held across an `.await`. The store owns both paths so a future
 /// subsystem that manages keys can serialize the current list and write it
 /// back through this same validation path.
 #[derive(Debug)]
@@ -614,7 +621,10 @@ impl KeyStore {
             allowed_path: allowed_path.to_path_buf(),
             state: RwLock::new(StoreState {
                 snapshot: Arc::new(snapshot),
-                identities: [observe_identity(host_path), observe_identity(allowed_path)],
+                identities: SourceIdentities {
+                    host: observe_identity(host_path),
+                    allowed: observe_identity(allowed_path),
+                },
             }),
             revalidate: AtomicBool::new(false),
             #[cfg(test)]
@@ -624,17 +634,23 @@ impl KeyStore {
 
     /// The live snapshot without touching the filesystem.
     pub fn snapshot(&self) -> Arc<AuthSnapshot> {
-        self.state.read().expect("key store state").snapshot.clone()
+        self.state().snapshot.clone()
     }
 
     /// Admin keys in the live snapshot. Consumed once at boot to select
     /// managed mode; later refreshes do not re-decide it.
     pub fn admin_count(&self) -> usize {
+        self.state().snapshot.admin_count()
+    }
+
+    /// The guarded store state. A poisoned lock means a refresh panicked
+    /// mid-call; `StoreState` is never half-updated (a new snapshot is
+    /// published as one coherent value), so recovering the data is safe and
+    /// beats cascading the panic to every later authentication.
+    fn state(&self) -> std::sync::RwLockReadGuard<'_, StoreState> {
         self.state
             .read()
-            .expect("key store state")
-            .snapshot
-            .admin_count()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Force the next request-time check to re-read and re-validate both key
@@ -648,17 +664,38 @@ impl KeyStore {
     /// invalidated, re-run the full [`AuthSnapshot::load`] pipeline and
     /// publish the result.
     ///
-    /// Blocking (file I/O); call it from `spawn_blocking`. On failure the live
-    /// snapshot is untouched and the observed identities are adopted, so the
-    /// next request does not re-parse until the on-disk state changes again.
+    /// Blocking (file I/O); call it from `spawn_blocking`. The unchanged
+    /// fast path compares the observed identities under a read lock; the
+    /// reload path re-observes under the write guard, so concurrent refreshes
+    /// remain single-flight. On failure the live snapshot is untouched and
+    /// the observed identities are adopted, so the next request does not
+    /// re-parse until the on-disk state changes again.
     pub fn refresh_if_changed(&self) -> Result<RefreshOutcome, Error> {
-        let mut state = self.state.write().expect("key store state");
-        // Observe under the write guard: concurrent refreshes serialize here,
-        // so the first publisher satisfies every other waiter's comparison.
-        let observed = [
-            observe_identity(&self.host_path),
-            observe_identity(&self.allowed_path),
-        ];
+        // Fast path: two stats and an identity comparison. Any change found
+        // here falls through to the serialized slow path.
+        let observed = SourceIdentities {
+            host: observe_identity(&self.host_path),
+            allowed: observe_identity(&self.allowed_path),
+        };
+        if !self.revalidate.load(Ordering::Acquire) {
+            let state = self.state();
+            if state.identities == observed {
+                return Ok(RefreshOutcome::Unchanged);
+            }
+        }
+
+        // Slow path: see `state()`; a poisoned guard still holds a coherent
+        // snapshot. Re-observe under the write guard: concurrent refreshes
+        // serialize here, so the first publisher satisfies every other
+        // waiter's comparison.
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = SourceIdentities {
+            host: observe_identity(&self.host_path),
+            allowed: observe_identity(&self.allowed_path),
+        };
         let forced = self.revalidate.swap(false, Ordering::AcqRel);
         if !forced && state.identities == observed {
             return Ok(RefreshOutcome::Unchanged);
@@ -1394,5 +1431,161 @@ mod tests {
         assert_eq!(reloaded, 1);
         assert_eq!(unchanged, waiters - 1);
         assert_eq!(store.load_count(), 2);
+    }
+
+    /// Concurrent unchanged refreshes take the read-lock fast path: they all
+    /// observe `Unchanged` without serializing behind a writer or forcing a
+    /// reload.
+    #[test]
+    fn store_concurrent_unchanged_refreshes_take_the_fast_path() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
+        let waiters = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(waiters));
+        let handles: Vec<_> = (0..waiters)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.refresh_if_changed()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("join").expect("refresh"),
+                RefreshOutcome::Unchanged
+            );
+        }
+        assert_eq!(store.load_count(), 1, "no reload may be triggered");
+    }
+
+    /// Duplicate detection stays linear and order-stable on large key sets.
+    #[test]
+    fn parses_large_key_sets_in_file_order() {
+        let keys: Vec<(String, KeyFingerprint)> = (0..200).map(|_| generated_key()).collect();
+        let text = keys
+            .iter()
+            .map(|(line, _)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = AuthSnapshot::parse_authorized_keys(text.as_bytes()).expect("parse");
+        assert_eq!(parsed.len(), keys.len());
+        for (entry, (_, expected)) in parsed.iter().zip(keys.iter()) {
+            assert_eq!(entry.fingerprint, *expected);
+        }
+        // A duplicate anywhere still invalidates the whole file.
+        let duplicated = format!("{text}\n{}", keys[100].0);
+        assert!(AuthSnapshot::parse_authorized_keys(duplicated.as_bytes()).is_err());
+    }
+
+    // ---- Performance baselines (M1) ----
+    //
+    // Replayed with:
+    //   cargo test --release --all-features -- baseline -- --ignored --test-threads=1 --nocapture
+    // These are measurement scaffolding, not pass/fail performance gates:
+    // each test prints a value recorded in PLANS.md and only asserts the
+    // workload actually completed.
+
+    fn median_of(cases: usize, run: impl Fn() -> std::time::Duration) -> std::time::Duration {
+        let mut samples: Vec<std::time::Duration> = (0..cases).map(|_| run()).collect();
+        samples.sort();
+        samples[cases / 2]
+    }
+
+    /// Scaling of `parse_key_source` versus configured-key count. The
+    /// duplicate-fingerprint check makes this quadratic before M3; the
+    /// per-key cost printed for n and 2n must match within noise after it.
+    #[test]
+    #[ignore = "performance baseline; replay with cargo test --release -- baseline -- --ignored --nocapture"]
+    fn baseline_parse_key_source_scaling() {
+        // Valid Ed25519 keys are required: every line runs through
+        // `PublicKey::from_openssh`, so synthetic blobs cannot stand in.
+        let keys: Vec<String> = (0..1000).map(|_| generated_key().0).collect();
+        for count in [250, 500, 1000] {
+            let text = keys[..count].join("\n");
+            let elapsed = median_of(5, || {
+                let start = std::time::Instant::now();
+                let parsed = parse_key_source(text.as_bytes(), Path::new("<baseline>"), true)
+                    .expect("parse");
+                assert_eq!(parsed.len(), count);
+                start.elapsed()
+            });
+            println!(
+                "baseline parse_key_source n={count}: {elapsed:?} ({:?}/key)",
+                elapsed / count as u32
+            );
+        }
+    }
+
+    /// Steady-state cost of an unchanged request-time refresh: two
+    /// `symlink_metadata` calls plus synchronization, measured alone and
+    /// under concurrent refreshers.
+    #[test]
+    #[ignore = "performance baseline; replay with cargo test --release -- baseline -- --ignored --nocapture"]
+    fn baseline_keystore_unchanged_refresh() {
+        let home = auth_tempdir();
+        let host_path = home.path().join("authorized_keys");
+        let allowed_path = home.path().join("allowed_keys");
+        let (line_a, _) = generated_key();
+        let (line_b, _) = generated_key();
+        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
+        assert_eq!(
+            store.refresh_if_changed().expect("first refresh"),
+            RefreshOutcome::Unchanged
+        );
+
+        let iterations = 2_000;
+        let elapsed = median_of(5, || {
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                assert_eq!(
+                    store.refresh_if_changed().expect("refresh"),
+                    RefreshOutcome::Unchanged
+                );
+            }
+            start.elapsed()
+        });
+        println!(
+            "baseline unchanged refresh per call (single thread): {:?}",
+            elapsed / iterations
+        );
+
+        let threads = 8;
+        let per_thread = 500;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..per_thread {
+                        assert_eq!(
+                            store.refresh_if_changed().expect("refresh"),
+                            RefreshOutcome::Unchanged
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        let total = threads * per_thread;
+        println!(
+            "baseline unchanged refresh per call ({threads} concurrent threads): {:?}",
+            start.elapsed() / (total as u32)
+        );
     }
 }

@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn relative_program_is_rejected() {
-        let error = validate(&SandboxConfig::default(), &CommandSpec::new("sh"))
+        let error = validate(&SandboxConfig::unrestricted(), &CommandSpec::new("sh"))
             .expect_err("relative program");
         assert!(matches!(
             error,
@@ -345,7 +345,7 @@ mod tests {
         command
             .args
             .push(OsStr::from_bytes(b"bad\0arg").to_os_string());
-        let error = validate(&SandboxConfig::default(), &command).expect_err("nul arg");
+        let error = validate(&SandboxConfig::unrestricted(), &command).expect_err("nul arg");
         assert!(matches!(
             error,
             SandboxError::InvalidPolicy { field: "args", .. }
@@ -356,7 +356,7 @@ mod tests {
     fn env_name_with_equals_is_rejected() {
         let mut command = minimal_command();
         command.env.push(("A=B".into(), "v".into()));
-        let error = validate(&SandboxConfig::default(), &command).expect_err("env =");
+        let error = validate(&SandboxConfig::unrestricted(), &command).expect_err("env =");
         assert!(matches!(
             error,
             SandboxError::InvalidPolicy { field: "env", .. }
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn inherited_fds_must_be_open_and_unique() {
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         config.inherited_fds.push(0);
         assert!(matches!(
             validate(&config, &minimal_command()),
@@ -376,7 +376,7 @@ mod tests {
         ));
 
         let file = std::fs::File::open("/dev/null").expect("/dev/null");
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         config.inherited_fds.push(file.as_raw_fd());
         config.inherited_fds.push(file.as_raw_fd());
         assert!(matches!(
@@ -387,7 +387,7 @@ mod tests {
             })
         ));
 
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         config.inherited_fds.push(909);
         assert!(matches!(
             validate(&config, &minimal_command()),
@@ -397,14 +397,14 @@ mod tests {
             })
         ));
 
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         config.inherited_fds.push(file.as_raw_fd());
         assert!(validate(&config, &minimal_command()).is_ok());
     }
 
     #[test]
     fn cpu_quota_bounds_are_enforced() {
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         config.resources.cpu_max = Limit::Value(CpuMax {
             quota_us: 0,
             period_us: 100_000,
@@ -442,7 +442,7 @@ mod tests {
                 matched_action: SeccompAction::Allow,
                 rules: Vec::new(),
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         assert!(matches!(
             validate(&config, &minimal_command()),
@@ -465,7 +465,7 @@ mod tests {
                     conditions: Vec::new(),
                 }],
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         assert!(matches!(
             validate(&config, &minimal_command()),
@@ -488,7 +488,7 @@ mod tests {
                 read_write: Vec::new(),
                 execute: Vec::new(),
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         let error = validate(&config, &CommandSpec::new(&program)).expect_err("uncovered program");
         assert!(
@@ -516,7 +516,7 @@ mod tests {
                 read_write: Vec::new(),
                 execute: Vec::new(),
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         let error = validate(&config, &CommandSpec::new(&program)).expect_err("uncovered program");
         assert!(
@@ -542,7 +542,7 @@ mod tests {
                 read_write: Vec::new(),
                 execute: vec![PathRule::new(granted.path())],
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         assert!(validate(&config, &CommandSpec::new(&program)).is_ok());
     }
@@ -558,7 +558,7 @@ mod tests {
                 read_write: vec![PathRule::new(root.path())],
                 execute: Vec::new(),
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         assert!(validate(&config, &CommandSpec::new(&program)).is_ok());
     }
@@ -573,7 +573,7 @@ mod tests {
                 read_write: vec![PathRule::new("/bin")],
                 execute: Vec::new(),
             },
-            ..SandboxConfig::default()
+            ..SandboxConfig::unrestricted()
         };
         let error = validate(&config, &command).expect_err("uncovered cwd");
         assert!(

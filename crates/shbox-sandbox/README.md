@@ -99,7 +99,7 @@ let config = SandboxConfig {
         pids: Limit::Value(64),
         ..ResourceLimits::default()
     },
-    ..SandboxConfig::default()
+    ..SandboxConfig::unrestricted()
 };
 
 let mut child = sandbox.spawn(command, config)?;

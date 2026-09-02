@@ -30,10 +30,9 @@ use std::time::{Duration, Instant};
 
 use crate::command::{CommandSpec, SessionSetup, Stdio};
 use crate::error::{ExitStatus, SandboxError};
-use crate::policy::{NetworkNamespacePolicy, ResourceLimits, SandboxConfig};
+use crate::policy::{CgroupParent, NetworkNamespacePolicy, ResourceLimits, SandboxConfig};
 use crate::{BackendChild, Platform, SandboxCapabilities, SandboxChild};
 
-pub use cgroup::CgroupParent;
 use cgroup::{Cgroup, create_sandbox_cgroup};
 use clone3::{
     CLONE_INTO_CGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
@@ -1067,7 +1066,7 @@ mod tests {
 
     #[test]
     fn namespace_flags_follow_policy() {
-        let mut config = SandboxConfig::default();
+        let mut config = SandboxConfig::unrestricted();
         assert_eq!(namespace_flags(&config), 0);
         config.namespaces.user = true;
         assert_eq!(namespace_flags(&config), CLONE_NEWUSER);

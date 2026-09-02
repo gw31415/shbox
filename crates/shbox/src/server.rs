@@ -6,6 +6,8 @@
 //! authentication succeeds; authenticated connections have no idle timeout.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -152,10 +154,17 @@ impl Drop for HostProcessSlot {
     }
 }
 
+/// A boxed host-bridge future handed to [`HostTaskRegistry::track`].
+pub(crate) type HostTaskFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Owns the join handles for host bridges that are spawned from russh handler
 /// callbacks. Keeping the handles outside the connection task prevents a
 /// daemon shutdown from dropping the Tokio runtime while a host process is
 /// still in its TERM/KILL/reap sequence.
+///
+/// Tracking does not spawn a completion-wrapper task: the tracked bridge
+/// carries a [`HostTaskGuard`] that removes its registry entry when the
+/// bridge itself finishes, so one host process costs exactly one task.
 #[derive(Debug, Default)]
 pub(crate) struct HostTaskRegistry {
     tasks: std::sync::Mutex<HashMap<u64, HostTaskEntry>>,
@@ -169,32 +178,46 @@ struct HostTaskEntry {
     control: Arc<crate::ssh::host::HostProcessControl>,
 }
 
+/// Registry-entry cleanup embedded in the tracked bridge's own lifecycle.
+struct HostTaskGuard {
+    registry: std::sync::Weak<HostTaskRegistry>,
+    id: u64,
+}
+
+impl Drop for HostTaskGuard {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.complete(self.id);
+        }
+    }
+}
+
 impl HostTaskRegistry {
     pub(crate) fn track(
         self: &Arc<Self>,
-        task: tokio::task::JoinHandle<()>,
+        task: HostTaskFuture,
         control: Arc<crate::ssh::host::HostProcessControl>,
-    ) -> Result<
-        (),
-        (
-            tokio::task::JoinHandle<()>,
-            Arc<crate::ssh::host::HostProcessControl>,
-        ),
-    > {
+    ) -> Result<(), (HostTaskFuture, Arc<crate::ssh::host::HostProcessControl>)> {
         let mut tasks = self.tasks.lock().expect("host task registry");
         if self.closed.load(Ordering::Acquire) {
             return Err((task, control));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let registry = Arc::clone(self);
-        let wrapper = tokio::spawn(async move {
-            let _ = task.await;
-            registry.complete(id);
+        let guard = HostTaskGuard {
+            registry: Arc::downgrade(self),
+            id,
+        };
+        // Spawn while the registry lock is held: a bridge that finishes
+        // immediately removes its entry through this same mutex, so the
+        // insert below always happens before that removal can observe it.
+        let task_handle = tokio::spawn(async move {
+            task.await;
+            drop(guard);
         });
         tasks.insert(
             id,
             HostTaskEntry {
-                task: wrapper,
+                task: task_handle,
                 control,
             },
         );
@@ -343,8 +366,14 @@ impl SshServer {
                                 });
                             }
                             Err(err) => {
+                                // Transient failures (EMFILE/ENFILE under fd
+                                // pressure, ECONNABORTED from a client that
+                                // vanished mid-handshake) must not silently
+                                // kill this transport while the daemon keeps
+                                // running. Pause briefly and keep accepting;
+                                // only shutdown ends the loop.
                                 tracing::warn!(error = %err, "listener accept failed");
-                                break;
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         },
                     }
@@ -689,5 +718,69 @@ mod tests {
             let Error::Bind { address, .. } = &err;
             assert_eq!(address, &occupied);
         }
+    }
+
+    // ---- Performance baseline (M1) ----
+
+    /// Tracking one host bridge must not multiply Tokio tasks: the bridge
+    /// removes its own registry entry through an embedded guard, so one
+    /// tracked task costs exactly one task (M6).
+    #[tokio::test]
+    async fn tracked_host_task_cost_is_one_task() {
+        let registry = Arc::new(HostTaskRegistry::default());
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let control = Arc::new(crate::ssh::host::HostProcessControl::for_tests());
+        let before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let tracked = registry.track(
+            Box::pin(async move {
+                let _ = gate_rx.await;
+            }),
+            Arc::clone(&control),
+        );
+        assert!(tracked.is_ok(), "tracking must succeed before close");
+        let after = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        println!(
+            "tracked host task cost: {} tokio tasks per tracked task",
+            after - before
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "tracking must not spawn a completion-wrapper task"
+        );
+
+        drop(gate_tx);
+        registry.join_all().await;
+        let settled = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        assert_eq!(
+            settled, before,
+            "completion removes the tracked entry and its task"
+        );
+    }
+
+    /// A bridge tracked after the registry closed still runs to completion:
+    /// `track` hands the future back and the caller drives it, so shutdown
+    /// cannot leak a half-cleaned host process.
+    #[tokio::test]
+    async fn track_after_close_returns_the_future_for_the_caller_to_run() {
+        let registry = Arc::new(HostTaskRegistry::default());
+        let control = Arc::new(crate::ssh::host::HostProcessControl::for_tests());
+        registry.close();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let task: HostTaskFuture = Box::pin(async move {
+            let _ = done_tx.send("ran");
+        });
+        let Err((mut task, control)) = registry.track(task, control) else {
+            panic!("closed registry must refuse tracking");
+        };
+        control.force_terminate();
+        task.as_mut().await;
+        assert_eq!(done_rx.await.expect("bridge ran"), "ran");
     }
 }

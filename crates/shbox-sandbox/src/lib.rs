@@ -73,13 +73,14 @@ use std::sync::Arc;
 pub use command::{CommandSpec, SessionSetup, Stdio};
 pub use error::{ChildStage, ExitStatus, SandboxError};
 pub use policy::{
-    ArgLen, CAP_LAST_NUMBER, Capability, CapabilityPolicy, CmpOp, CpuMax, FilesystemPolicy, Limit,
-    NamespacePolicy, NetworkNamespacePolicy, NetworkPolicy, PathRule, ResourceLimits,
-    SandboxConfig, SeccompAction, Syscall, SyscallCondition, SyscallPolicy, SyscallRule,
+    ArgLen, CAP_LAST_NUMBER, Capability, CapabilityPolicy, CgroupParent, CmpOp, CpuMax,
+    FilesystemPolicy, Limit, NamespacePolicy, NetworkNamespacePolicy, NetworkPolicy, PathRule,
+    ResourceLimits, SandboxConfig, SeccompAction, Syscall, SyscallCondition, SyscallPolicy,
+    SyscallRule,
 };
 
 #[cfg(target_os = "linux")]
-pub use linux::{CgroupParent, ResourceDomain, syscall_number};
+pub use linux::{ResourceDomain, syscall_number};
 
 /// Which backend a [`Sandbox`] resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +152,12 @@ pub struct SandboxChild {
 }
 
 impl SandboxChild {
-    /// The engine-owned direct child's PID. Identity for supervision purposes
-    /// is the internal pidfd on Linux; this value is diagnostic. With a Linux
-    /// PID namespace it identifies the internal PID 1 supervisor.
-    pub fn id(&self) -> u32 {
-        self.child.as_ref().map_or(0, |child| child.id())
+    /// The engine-owned direct child's PID, or `None` once the child has
+    /// been reaped. Identity for supervision purposes is the internal pidfd
+    /// on Linux; this value is diagnostic. With a Linux PID namespace it
+    /// identifies the internal PID 1 supervisor.
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
     }
 
     /// Take the parent's stdin pipe writer, if `Stdio::Pipe` was requested.
@@ -304,7 +306,7 @@ impl Sandbox {
     /// Like [`detect`](Self::detect); the cgroup parent is meaningless on
     /// macOS and is ignored.
     #[cfg(target_os = "macos")]
-    pub fn detect_with(_cgroup_parent: Option<std::path::PathBuf>) -> Sandbox {
+    pub fn detect_with(_cgroup_parent: Option<CgroupParent>) -> Sandbox {
         let capabilities = macos::detect_capabilities();
         Sandbox {
             backend: Backend::MacOs(Arc::new(macos::MacosBackend::new(&capabilities))),
@@ -315,7 +317,7 @@ impl Sandbox {
     /// Like [`detect`](Self::detect) on unsupported platforms: every spawn
     /// fails closed.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub fn detect_with(_cgroup_parent: Option<std::path::PathBuf>) -> Sandbox {
+    pub fn detect_with(_cgroup_parent: Option<CgroupParent>) -> Sandbox {
         Sandbox {
             backend: Backend::Unsupported,
             capabilities: Arc::new(SandboxCapabilities {

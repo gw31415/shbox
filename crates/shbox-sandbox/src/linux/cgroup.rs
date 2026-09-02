@@ -16,24 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::SandboxError;
-use crate::policy::{Limit, ResourceLimits};
-
-/// An operator-provided cgroup directory to create sandbox cgroups under.
-/// Validated (writable cgroup v2 directory) at spawn time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CgroupParent(PathBuf);
-
-impl CgroupParent {
-    /// Wrap an absolute cgroup v2 directory path.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        CgroupParent(path.into())
-    }
-
-    /// The configured cgroup directory path.
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
+use crate::policy::{CgroupParent, Limit, ResourceLimits};
 
 /// Controllers a `ResourceLimits` needs enabled on the creation parent.
 fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {

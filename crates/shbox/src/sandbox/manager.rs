@@ -5,7 +5,7 @@
 //! ownership check, count ledger, and the runtime registry placeholder used by
 //! later process-launch milestones.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -98,7 +98,33 @@ struct Ledger {
     owner_counts: BTreeMap<KeyFingerprint, usize>,
     reserved_sandboxes: usize,
     runtime: HashMap<u64, RuntimeEntry>,
+    /// Secondary per-sandbox index over `runtime`: sandbox id -> its live
+    /// tokens. Maintained by [`Ledger::insert_runtime`] and
+    /// [`Ledger::remove_runtime`] only, so every per-sandbox decision scales
+    /// with that sandbox's runtimes instead of scanning the global map.
+    runtime_by_sandbox: HashMap<SandboxId, HashSet<u64>>,
     next_runtime_token: u64,
+}
+
+impl Ledger {
+    fn insert_runtime(&mut self, token: u64, entry: RuntimeEntry) {
+        self.runtime_by_sandbox
+            .entry(entry.sandbox_id.clone())
+            .or_default()
+            .insert(token);
+        self.runtime.insert(token, entry);
+    }
+
+    fn remove_runtime(&mut self, token: u64) -> Option<RuntimeEntry> {
+        let entry = self.runtime.remove(&token)?;
+        if let Some(tokens) = self.runtime_by_sandbox.get_mut(&entry.sandbox_id) {
+            tokens.remove(&token);
+            if tokens.is_empty() {
+                self.runtime_by_sandbox.remove(&entry.sandbox_id);
+            }
+        }
+        Some(entry)
+    }
 }
 
 /// Persistent sandbox lifecycle service.  The type is intentionally
@@ -203,7 +229,7 @@ impl SandboxManager {
     ) -> Result<SandboxHandle, Error> {
         self.ensure_ready()?;
         let lifecycle_lock = self.lifecycle_lock(id);
-        let _guard = lifecycle_lock.lock().expect("sandbox lifecycle lock");
+        let _guard = lifecycle_lock.lock();
         match self.storage.inspect(id).map_err(Error::Storage)? {
             Entry::Active(metadata) => {
                 if !self.note_valid_record(id, &metadata) {
@@ -287,7 +313,7 @@ impl SandboxManager {
     ) -> Result<DeleteResult, Error> {
         self.ensure_ready()?;
         let lifecycle_lock = self.lifecycle_lock(id);
-        let _guard = lifecycle_lock.lock().expect("sandbox lifecycle lock");
+        let _guard = lifecycle_lock.lock();
         let entry = self.storage.inspect(id).map_err(Error::Storage)?;
         let metadata = match entry {
             Entry::Absent => {
@@ -342,6 +368,39 @@ impl SandboxManager {
         self.ledger.lock().expect("sandbox ledger").runtime.len()
     }
 
+    #[cfg(test)]
+    fn runtime_tokens_for_sandbox(&self, id: &SandboxId) -> Vec<u64> {
+        let ledger = self.ledger.lock().expect("sandbox ledger");
+        runtime_tokens_for(&ledger, id)
+    }
+
+    /// The secondary per-sandbox index must mirror the primary runtime map:
+    /// every entry indexed under its own sandbox id, no stale tokens, and no
+    /// unindexed entries.
+    #[cfg(test)]
+    fn runtime_index_is_consistent(&self) -> bool {
+        let ledger = self.ledger.lock().expect("sandbox ledger");
+        if ledger.runtime_by_sandbox.values().any(|tokens| {
+            tokens
+                .iter()
+                .any(|token| !ledger.runtime.contains_key(token))
+        }) {
+            return false;
+        }
+        let indexed = ledger
+            .runtime_by_sandbox
+            .values()
+            .map(|tokens| tokens.len())
+            .sum::<usize>();
+        indexed == ledger.runtime.len()
+            && ledger.runtime.iter().all(|(token, entry)| {
+                ledger
+                    .runtime_by_sandbox
+                    .get(&entry.sandbox_id)
+                    .is_some_and(|tokens| tokens.contains(token))
+            })
+    }
+
     /// Register a launch marker and invoke the private process seam. A delete
     /// racing with the adapter sets the cancellation flag; a process returned
     /// after that point is terminated before it can escape the registry.
@@ -375,13 +434,13 @@ impl SandboxManager {
         let process = match self.launcher.launch(request) {
             Ok(process) => process,
             Err(error) => {
-                self.clear_runtime_if(&lease);
+                self.clear_runtime(&lease);
                 return Err(Error::Launch(error));
             }
         };
         if !self.finish_launch(&lease, Arc::clone(&process.control)) {
             terminate_and_wait(&process.control);
-            self.clear_runtime_if(&lease);
+            self.clear_runtime(&lease);
             return Err(Error::Unavailable);
         }
         Ok(ManagedProcess { process, lease })
@@ -397,16 +456,15 @@ impl SandboxManager {
         }
         let max_sandbox_processes = self.caps.max_sandbox_processes as usize;
         let sandbox_processes = ledger
-            .runtime
-            .values()
-            .filter(|entry| entry.sandbox_id == *handle.id())
-            .count();
+            .runtime_by_sandbox
+            .get(handle.id())
+            .map_or(0, |tokens| tokens.len());
         if sandbox_processes >= max_sandbox_processes {
-            return Err(Error::Limit("max_sandbox_processes"));
+            return Err(Error::Limit(CapacityLimit::SandboxProcesses));
         }
         let token = next_runtime_token(&mut ledger);
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        ledger.runtime.insert(
+        ledger.insert_runtime(
             token,
             RuntimeEntry {
                 sandbox_id: handle.id().clone(),
@@ -470,22 +528,7 @@ impl SandboxManager {
                     .is_none_or(|process| process.wait_for_cleanup(Duration::ZERO))
         });
         if remove {
-            ledger.runtime.remove(&lease.token);
-            self.runtime_changed.notify_all();
-        }
-    }
-
-    fn clear_runtime_if(&self, lease: &RuntimeLease) {
-        let mut ledger = self.ledger.lock().expect("sandbox ledger");
-        let remove = ledger.runtime.get(&lease.token).is_some_and(|entry| {
-            entry.sandbox_id == lease.sandbox_id
-                && entry
-                    .process
-                    .as_ref()
-                    .is_none_or(|process| process.wait_for_cleanup(Duration::ZERO))
-        });
-        if remove {
-            ledger.runtime.remove(&lease.token);
+            ledger.remove_runtime(lease.token);
             self.runtime_changed.notify_all();
         }
     }
@@ -497,17 +540,19 @@ impl SandboxManager {
     fn cancel_runtime(&self, id: &SandboxId) -> bool {
         let processes = {
             let mut ledger = self.ledger.lock().expect("sandbox ledger");
-            ledger
-                .runtime
-                .values_mut()
-                .filter(|entry| entry.sandbox_id == *id)
-                .filter_map(|entry| {
-                    entry
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    entry.process.clone()
-                })
-                .collect::<Vec<_>>()
+            let mut processes = Vec::new();
+            for token in runtime_tokens_for(&ledger, id) {
+                let Some(entry) = ledger.runtime.get_mut(&token) else {
+                    continue;
+                };
+                entry
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Some(process) = &entry.process {
+                    processes.push(Arc::clone(process));
+                }
+            }
+            processes
         };
         for process in processes {
             process.terminate();
@@ -521,10 +566,9 @@ impl SandboxManager {
         // observe the launcher reap/cleanup barrier after SIGKILL.
         let processes = {
             let ledger = self.ledger.lock().expect("sandbox ledger");
-            ledger
-                .runtime
-                .values()
-                .filter(|entry| entry.sandbox_id == *id)
+            runtime_tokens_for(&ledger, id)
+                .into_iter()
+                .filter_map(|token| ledger.runtime.get(&token))
                 .filter_map(|entry| entry.process.clone())
                 .collect::<Vec<_>>()
         };
@@ -651,7 +695,7 @@ impl SandboxManager {
                             .get(token)
                             .is_some_and(|entry| entry.process.is_some())
                     {
-                        ledger.runtime.remove(token);
+                        ledger.remove_runtime(*token);
                     }
                 }
                 self.runtime_changed.notify_all();
@@ -678,14 +722,20 @@ impl SandboxManager {
     fn wait_for_runtime_cleanup(&self, id: &SandboxId, deadline: Instant) -> bool {
         loop {
             let mut ledger = self.ledger.lock().expect("sandbox ledger");
-            let process = ledger
-                .runtime
-                .iter()
-                .find(|(_, entry)| entry.sandbox_id == *id && entry.process.is_some())
-                .map(|(token, entry)| {
-                    (*token, Arc::clone(entry.process.as_ref().expect("process")))
+            let process = runtime_tokens_for(&ledger, id)
+                .into_iter()
+                .find_map(|token| {
+                    ledger.runtime.get(&token).and_then(|entry| {
+                        entry
+                            .process
+                            .as_ref()
+                            .map(|process| (token, Arc::clone(process)))
+                    })
                 });
-            let has_runtime = ledger.runtime.values().any(|entry| entry.sandbox_id == *id);
+            let has_runtime = ledger
+                .runtime_by_sandbox
+                .get(id)
+                .is_some_and(|tokens| !tokens.is_empty());
             if !has_runtime {
                 return true;
             }
@@ -704,7 +754,7 @@ impl SandboxManager {
                     .get(&token)
                     .is_some_and(|entry| entry.sandbox_id == *id)
                 {
-                    ledger.runtime.remove(&token);
+                    ledger.remove_runtime(token);
                     self.runtime_changed.notify_all();
                 }
                 continue;
@@ -743,7 +793,7 @@ impl SandboxManager {
             match self.storage.remove_tree(&id) {
                 Ok(()) => self.remove_record(&id),
                 Err(error) => {
-                    tracing::warn!(sandbox_id = %id, "sandbox deletion reconciliation is pending: {error}");
+                    tracing::warn!(sandbox_id = %id, error = %error, "sandbox deletion reconciliation is pending");
                 }
             }
         }
@@ -818,7 +868,10 @@ impl SandboxManager {
         }
     }
 
-    fn note_corrupt(&self, id: &SandboxId, _reason: String) {
+    fn note_corrupt(&self, id: &SandboxId, reason: String) {
+        // The reason is operator diagnostics for a record the daemon refuses
+        // to serve; it is logged here because no accessor exposes it later.
+        tracing::warn!(sandbox_id = %id, reason = %reason, "sandbox record is corrupt and blocked");
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
         remove_record_from_ledger(&mut ledger, id);
         ledger.blocked.insert(id.clone());
@@ -849,12 +902,12 @@ impl SandboxManager {
             .saturating_add(ledger.reserved_sandboxes)
             >= caps.max_sandboxes as usize
         {
-            return Err(Error::Limit("max_sandboxes"));
+            return Err(Error::Limit(CapacityLimit::Sandboxes));
         }
         if ledger.owner_counts.get(owner).copied().unwrap_or(0)
             >= caps.max_sandboxes_per_owner as usize
         {
-            return Err(Error::Limit("max_sandboxes_per_owner"));
+            return Err(Error::Limit(CapacityLimit::SandboxesPerOwner));
         }
         ledger.reserved_sandboxes += 1;
         increment_owner(&mut ledger.owner_counts, owner);
@@ -891,15 +944,21 @@ impl SandboxManager {
         }
     }
 
-    fn lifecycle_lock(&self, id: &SandboxId) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .lifecycle_locks
-            .lock()
-            .expect("sandbox lifecycle locks");
-        locks
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn lifecycle_lock(&self, id: &SandboxId) -> LifecycleLock<'_> {
+        let entry = {
+            let mut locks = self
+                .lifecycle_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        LifecycleLock {
+            map: &self.lifecycle_locks,
+            entry,
+        }
     }
 
     fn ensure_ready(&self) -> Result<(), Error> {
@@ -907,6 +966,37 @@ impl SandboxManager {
             Ok(())
         } else {
             Err(Error::Unavailable)
+        }
+    }
+}
+
+/// A held per-sandbox lifecycle mutex. The map entry exists only while the
+/// lock is contended or held: dropping this removes the entry when no other
+/// waiter holds a clone, so attacker-chosen IDs cannot grow the map without
+/// bound.
+struct LifecycleLock<'a> {
+    map: &'a Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
+    entry: Arc<Mutex<()>>,
+}
+
+impl LifecycleLock<'_> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for LifecycleLock<'_> {
+    fn drop(&mut self) {
+        // Only this Arc clone remains: no other waiter or holder references
+        // the entry, so the ID's slot can go away.
+        let mut locks = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::strong_count(&self.entry) == 1 {
+            locks.retain(|_, lock| !Arc::ptr_eq(lock, &self.entry));
         }
     }
 }
@@ -948,14 +1038,8 @@ fn remove_record_from_ledger(ledger: &mut Ledger, id: &SandboxId) {
     if let Some(metadata) = ledger.records.remove(id) {
         decrement_owner(&mut ledger.owner_counts, metadata.owner());
     }
-    let tokens: Vec<u64> = ledger
-        .runtime
-        .iter()
-        .filter(|(_, entry)| entry.sandbox_id == *id)
-        .map(|(token, _)| *token)
-        .collect();
-    for token in tokens {
-        let Some(entry) = ledger.runtime.remove(&token) else {
+    for token in runtime_tokens_for(ledger, id) {
+        let Some(entry) = ledger.remove_runtime(token) else {
             continue;
         };
         entry
@@ -965,6 +1049,16 @@ fn remove_record_from_ledger(ledger: &mut Ledger, id: &SandboxId) {
             process.terminate();
         }
     }
+}
+
+/// The live runtime tokens of one sandbox, cloned out of the secondary index
+/// so the caller can mutate the ledger while iterating them.
+fn runtime_tokens_for(ledger: &Ledger, id: &SandboxId) -> Vec<u64> {
+    ledger
+        .runtime_by_sandbox
+        .get(id)
+        .map(|tokens| tokens.iter().copied().collect())
+        .unwrap_or_default()
 }
 
 fn terminate_and_wait(process: &Arc<dyn platform::RunningProcess>) {
@@ -983,8 +1077,30 @@ pub(crate) enum Error {
     Cleanup { source: storage::Error },
     RuntimeCleanup,
     Launch(platform::LaunchError),
-    Limit(&'static str),
+    Limit(CapacityLimit),
     Unavailable,
+}
+
+/// Which capacity limit fired; callers match on the variant instead of
+/// comparing `&'static str`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityLimit {
+    /// Total sandboxes on the daemon.
+    Sandboxes,
+    /// Sandboxes per owner.
+    SandboxesPerOwner,
+    /// Concurrent processes within one sandbox.
+    SandboxProcesses,
+}
+
+impl fmt::Display for CapacityLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CapacityLimit::Sandboxes => f.write_str("max_sandboxes"),
+            CapacityLimit::SandboxesPerOwner => f.write_str("max_sandboxes_per_owner"),
+            CapacityLimit::SandboxProcesses => f.write_str("max_sandbox_processes"),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -996,7 +1112,7 @@ impl fmt::Display for Error {
                 f.write_str("sandbox process cleanup did not finish before deletion deadline")
             }
             Error::Launch(source) => write!(f, "sandbox process launch failed: {source}"),
-            Error::Limit(name) => write!(f, "sandbox capacity limit reached: {name}"),
+            Error::Limit(limit) => write!(f, "sandbox capacity limit reached: {limit}"),
             Error::Unavailable => f.write_str("sandbox is unavailable"),
         }
     }
@@ -1682,7 +1798,7 @@ mod tests {
             .expect("first launch");
         assert!(matches!(
             manager.launch_handle(&handle, platform::LaunchOperation::Shell, None),
-            Err(Error::Limit("max_sandbox_processes"))
+            Err(Error::Limit(CapacityLimit::SandboxProcesses))
         ));
         first.process.control.terminate();
         manager.clear_runtime(&first.lease);
@@ -1794,7 +1910,7 @@ mod tests {
         assert_eq!(left.is_ok() as u8 + right.is_ok() as u8, 1);
         assert!(matches!(
             left.as_ref().err().or(right.as_ref().err()),
-            Some(Error::Limit("max_sandboxes"))
+            Some(Error::Limit(CapacityLimit::Sandboxes))
         ));
         assert_eq!(manager.sandbox_count(), 1);
     }
@@ -1813,5 +1929,121 @@ mod tests {
         let right = right.join().expect("right");
         assert_eq!(left.is_ok() as u8 + right.is_ok() as u8, 1);
         assert_eq!(manager.sandbox_count(), 1);
+    }
+
+    // ---- Performance baselines (M1) ----
+    //
+    // Replayed with:
+    //   cargo test --release -- baseline -- --ignored --test-threads=1 --nocapture
+
+    /// Bookkeeping latency (`begin_launch` + release) for one target sandbox
+    /// while unrelated global runtimes grow. Before M2 this grows linearly
+    /// with the global runtime count because `begin_launch` scans the whole
+    /// runtime map; after M2 it must stay flat.
+    #[test]
+    #[ignore = "performance baseline; replay with cargo test --release -- baseline -- --ignored --nocapture"]
+    fn baseline_launch_bookkeeping_vs_global_runtimes() {
+        let launcher = FakeLauncher::default();
+        // The workload needs thousands of sandboxes for a single owner, far
+        // past the default caps.
+        let caps = Caps {
+            max_sandboxes: 8192,
+            max_sandboxes_per_owner: 8192,
+            ..Caps::default()
+        };
+        let (_root, manager) = manager_with_fake(caps, &launcher);
+        let owner = principal('A', Role::Normal);
+        let target = SandboxId::parse("target").expect("id");
+        let target_handle = manager.claim(&owner, &target).expect("claim target");
+
+        let mut background = Vec::new();
+        let grow_to = |runtimes: usize, background: &mut Vec<ManagedProcess>| {
+            while background.len() < runtimes {
+                let id = SandboxId::parse(&format!("bg{}", background.len())).expect("bg id");
+                let handle = manager.claim(&owner, &id).expect("bg claim");
+                background.push(
+                    manager
+                        .launch_handle(&handle, platform::LaunchOperation::Shell, None)
+                        .expect("bg launch"),
+                );
+            }
+        };
+        let probes = 64;
+        for cardinality in [0usize, 1024, 2048, 4096] {
+            grow_to(cardinality, &mut background);
+            let mut samples = Vec::with_capacity(probes);
+            for _ in 0..probes {
+                let start = Instant::now();
+                let lease = manager.begin_launch(&target_handle).expect("begin launch");
+                samples.push(start.elapsed());
+                manager.clear_runtime(&lease);
+            }
+            samples.sort();
+            let min = samples[0];
+            let median = samples[probes / 2];
+            println!(
+                "baseline begin_launch+release with {cardinality} unrelated runtimes: min {min:?}, median {median:?}"
+            );
+        }
+    }
+
+    /// The per-sandbox runtime index must stay exact across every lifecycle
+    /// path: launch success, failed launch, process exit, cancellation via
+    /// delete with launches in flight, and unrelated-sandbox isolation.
+    #[test]
+    fn runtime_index_tracks_every_lifecycle_path() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let dev = SandboxId::parse("dev").expect("id");
+        let other = SandboxId::parse("other").expect("id");
+        let dev_handle = manager.claim(&owner, &dev).expect("claim dev");
+        let other_handle = manager.claim(&owner, &other).expect("claim other");
+
+        // Launch success: two leases on dev, one on an unrelated sandbox.
+        let first = manager
+            .launch_handle(&dev_handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        let _second = manager
+            .launch_handle(&dev_handle, platform::LaunchOperation::Shell, None)
+            .expect("second launch");
+        let second_process = launcher.last_process().expect("second process");
+        let _background = manager
+            .launch_handle(&other_handle, platform::LaunchOperation::Shell, None)
+            .expect("background launch");
+        let background_process = launcher.last_process().expect("background process");
+        assert_eq!(manager.runtime_tokens_for_sandbox(&dev).len(), 2);
+        assert_eq!(manager.runtime_tokens_for_sandbox(&other).len(), 1);
+        assert!(manager.runtime_index_is_consistent());
+
+        // A failed launch never leaves a marker behind.
+        launcher.fail_next();
+        assert!(matches!(
+            manager.launch_handle(&dev_handle, platform::LaunchOperation::Shell, None),
+            Err(Error::Launch(_))
+        ));
+        assert_eq!(manager.runtime_tokens_for_sandbox(&dev).len(), 2);
+        assert!(manager.runtime_index_is_consistent());
+
+        // Process exit plus release removes exactly that lease.
+        first.process.control.terminate();
+        manager.clear_runtime(&first.lease);
+        assert_eq!(manager.runtime_tokens_for_sandbox(&dev).len(), 1);
+        assert_eq!(manager.runtime_count(), 2);
+        assert!(manager.runtime_index_is_consistent());
+
+        // Deleting dev cancels and drains its remaining lease without
+        // touching the unrelated sandbox.
+        assert_eq!(
+            manager.delete(&owner, &dev).expect("delete dev"),
+            DeleteResult::Deleted
+        );
+        assert_eq!(manager.runtime_tokens_for_sandbox(&dev).len(), 0);
+        assert_eq!(manager.runtime_tokens_for_sandbox(&other).len(), 1);
+        assert_eq!(manager.runtime_count(), 1);
+        assert!(manager.runtime_index_is_consistent());
+        assert!(second_process.terminated());
+        assert!(!background_process.terminated());
+        assert!(manager.claim(&owner, &dev).expect("reclaim").created());
     }
 }

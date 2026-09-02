@@ -8,6 +8,7 @@
 //! configuration or SSH surfaces.
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -178,18 +179,28 @@ pub(crate) fn production_launcher(
     ))
 }
 
-/// Adapter-level launch failure, intentionally free of platform-specific
-/// fields at the manager boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Adapter-level launch failure. Internally a diagnostic message (the
+/// manager maps every launch failure onto one generic remote response), but
+/// an `io::Error` source is kept when one exists so the cause chain survives
+/// logging.
+#[derive(Debug)]
 pub(crate) struct LaunchError {
     message: String,
+    source: Option<io::Error>,
 }
 
 impl LaunchError {
-    #[allow(dead_code)]
     pub(crate) fn new(message: impl Into<String>) -> LaunchError {
         LaunchError {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    pub(crate) fn with_source(message: impl Into<String>, source: io::Error) -> LaunchError {
+        LaunchError {
+            message: message.into(),
+            source: Some(source),
         }
     }
 }
@@ -200,7 +211,11 @@ impl fmt::Display for LaunchError {
     }
 }
 
-impl std::error::Error for LaunchError {}
+impl std::error::Error for LaunchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|err| err as _)
+    }
+}
 
 /// Fallback used when the production sandbox launcher could not be
 /// initialized. Sandbox requests fail closed after the durable claim. This

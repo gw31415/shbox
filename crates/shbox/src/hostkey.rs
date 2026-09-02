@@ -135,8 +135,11 @@ impl HostKey {
                 return Err(Error::io(path, "cannot publish host key", err));
             }
             if let Err(err) = fs::remove_file(&temp) {
-                tracing::warn!(path = %temp.display(), "failed to remove host key temporary file");
-                let _ = err;
+                tracing::warn!(
+                    path = %temp.display(),
+                    error = %err,
+                    "failed to remove host key temporary file"
+                );
             }
             sync_dir(parent)
                 .map_err(|err| Error::io(path, "cannot flush host key directory", err))?;
@@ -156,6 +159,7 @@ fn sync_dir(dir: &Path) -> std::result::Result<(), io::Error> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)?;
+    // SAFETY: the descriptor is a valid open file for the call's duration.
     let result = unsafe { libc::fsync(handle.as_raw_fd()) };
     if result != 0 {
         return Err(io::Error::last_os_error());
