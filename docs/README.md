@@ -12,6 +12,7 @@
 6. [platforms.md](platforms.md) — Linux/macOS backend と正式 support 条件
 7. [testing.md](testing.md) — unit/OpenSSH/native platform acceptance
 8. [release.md](release.md) — blocking CI、release evidence、deployment gate
+9. [maintenance.md](maintenance.md) — upstream 依存関係の更新・追従体制
 
 ## Normative language
 
