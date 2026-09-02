@@ -83,13 +83,14 @@ fi
 
 rustc_version="$(rustc_gate --version)"
 [[ "$rustc_version" == "rustc $RUST_MINOR."* ]] || die "Rust $RUST_MINOR is required, got: $rustc_version"
-grep -Fqx "rust-version = \"$RUST_MINOR\"" Cargo.toml || die "Cargo.toml rust-version is not $RUST_MINOR"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" crates/shbox/Cargo.toml || die "shbox rust-version is not $RUST_MINOR"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" crates/shbox-sandbox/Cargo.toml || die "shbox-sandbox rust-version is not $RUST_MINOR"
 target='aarch64-apple-darwin'
 rustc_host="$(rustc_gate -vV | awk '$1 == "host:" { print $2 }')"
 [[ "$rustc_host" == "$target" ]] || die "rustc host is $rustc_host, expected native target $target"
 
 # There is no wrapper/selfexec compatibility path in the production source.
-if grep -RnE 'ARAPUCA_|NONO_|selfexec' src Cargo.toml >/dev/null 2>&1; then
+if grep -RnE 'ARAPUCA_|NONO_|selfexec' crates --include='*.rs' --include='Cargo.toml' >/dev/null 2>&1; then
   die "production source still contains a launcher-control/selfexec path"
 fi
 

@@ -5,8 +5,8 @@
 //! writable workspace, and the private per-launch temporary directory. It
 //! deliberately contains no resource limits (CPU, memory, file size, open
 //! files, PID counts) and no confinement-backend types: Linux maps this
-//! snapshot to `nono` capabilities and macOS to a generated Seatbelt profile,
-//! and neither backend leaks back through this interface.
+//! snapshot into an explicit `shbox-sandbox` engine configuration, and no
+//! backend detail leaks back through this interface.
 //!
 //! Every writable location is granted per launch, never in the base policy:
 //! the sandbox workspace, `/dev/null` on Linux, and the launch temp
@@ -18,8 +18,15 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use shbox_sandbox::NetworkNamespacePolicy;
+use shbox_sandbox::{
+    FilesystemPolicy, Limit, NamespacePolicy, NetworkPolicy as SandboxNetwork, PathRule,
+    ResourceLimits, SandboxConfig as EngineConfig,
+};
+
 use super::{LaunchError, LaunchOperation};
-use crate::config::{Config, NetworkMode};
+use crate::config::{Config, NetworkMode, SandboxResources};
 
 /// Maximum remote command length accepted for `shell -c` execution.
 pub(crate) const MAX_COMMAND_BYTES: usize = 32 * 1024;
@@ -47,7 +54,7 @@ pub(crate) enum ReadPathClass {
 
 /// The curated default readable paths for Linux, frozen as (path, class).
 ///
-/// Curated for the Linux nono policy:
+/// Curated for the Linux Landlock policy:
 /// system binaries and libraries, TLS trust stores, resolver/loader data,
 /// locale and account databases, and the entropy devices. `/tmp` is
 /// deliberately absent (host-shared; the per-launch temp directory replaces
@@ -131,6 +138,8 @@ pub(crate) struct SandboxLaunchPolicy {
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
     temp_root: PathBuf,
+    resources: SandboxResources,
+    cgroup_parent: Option<PathBuf>,
 }
 
 impl fmt::Debug for SandboxLaunchPolicy {
@@ -144,6 +153,11 @@ impl fmt::Debug for SandboxLaunchPolicy {
                 &self.sandbox_env.keys().collect::<Vec<_>>(),
             )
             .field("temp_root", &self.temp_root)
+            .field("resources", &self.resources)
+            .field(
+                "cgroup_parent",
+                &self.cgroup_parent.as_deref().map(Path::display),
+            )
             .finish()
     }
 }
@@ -163,6 +177,8 @@ impl SandboxLaunchPolicy {
             config.read_paths().to_vec(),
             config.sandbox_env().clone(),
             temp_root.into(),
+            *config.resources(),
+            config.cgroup_parent().map(Path::to_path_buf),
         )
     }
 
@@ -175,6 +191,8 @@ impl SandboxLaunchPolicy {
         read_paths: Vec<PathBuf>,
         sandbox_env: BTreeMap<String, String>,
         temp_root: PathBuf,
+        resources: SandboxResources,
+        cgroup_parent: Option<PathBuf>,
     ) -> Self {
         Self {
             shell,
@@ -182,6 +200,8 @@ impl SandboxLaunchPolicy {
             read_paths,
             sandbox_env,
             temp_root,
+            resources,
+            cgroup_parent,
         }
     }
 
@@ -189,8 +209,20 @@ impl SandboxLaunchPolicy {
         &self.shell
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn network(&self) -> NetworkMode {
         self.network
+    }
+
+    /// The operator-configured per-sandbox resource limits.
+    pub(crate) fn resources(&self) -> &crate::config::SandboxResources {
+        &self.resources
+    }
+
+    /// The operator-specified cgroup v2 creation parent, if any.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cgroup_parent(&self) -> Option<&Path> {
+        self.cgroup_parent.as_deref()
     }
 
     /// The shbox-owned runtime temp root; each launch creates a unique
@@ -200,36 +232,134 @@ impl SandboxLaunchPolicy {
         &self.temp_root
     }
 
-    /// The final canonicalized readable path list for policy preparation:
-    /// curated defaults (omitting absent entries), the validated shell plus
-    /// its parent directory, and the operator-configured read paths.
-    pub(crate) fn resolved_read_paths(&self) -> Vec<PathBuf> {
-        let mut read_paths: Vec<PathBuf> = CURATED_READ_PATHS
-            .iter()
-            .map(|(path, _)| PathBuf::from(path))
-            .collect();
-        read_paths.push(self.shell.clone());
-        if let Some(parent) = self.shell.parent() {
-            read_paths.push(parent.to_path_buf());
-        }
-        read_paths.extend(self.read_paths.iter().cloned());
+    /// Resolve readable paths into the engine's non-executable and executable
+    /// tiers. Operator-configured read paths never gain execute permission;
+    /// only curated runtime paths and the configured shell do.
+    fn resolved_filesystem_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut read_only = Vec::new();
+        let mut execute = Vec::new();
 
-        // Optional curated entries are omitted when absent, so filter before
-        // canonicalization. Canonicalization can only fail for entries that
-        // just disappeared between the existence check and the call; those
-        // are dropped the same way as absent entries.
-        read_paths.retain(|path| path.exists());
-        let mut read_paths: Vec<PathBuf> = read_paths
-            .iter()
-            .filter_map(|path| fs::canonicalize(path).ok())
-            .collect();
-        read_paths.sort();
-        read_paths.dedup();
-        read_paths
+        for (path, class) in CURATED_READ_PATHS {
+            let target = match class {
+                ReadPathClass::ExecutableRuntime => &mut execute,
+                ReadPathClass::SystemData | ReadPathClass::TerminalDevice => &mut read_only,
+            };
+            target.push(PathBuf::from(path));
+        }
+
+        execute.push(self.shell.clone());
+        if let Some(parent) = self.shell.parent() {
+            execute.push(parent.to_path_buf());
+        }
+        read_only.extend(self.read_paths.iter().cloned());
+
+        canonicalize_existing_paths(&mut read_only);
+        canonicalize_existing_paths(&mut execute);
+        (read_only, execute)
     }
 
     pub(crate) fn curated_write_paths(&self) -> Vec<PathBuf> {
         CURATED_WRITE_PATHS.iter().map(PathBuf::from).collect()
+    }
+
+    /// Build the engine sandbox configuration for one launch.
+    ///
+    /// This is the single place where shbox's own policy — the curated
+    /// readable system paths, the per-launch writable workspace and temp
+    /// directory, the operator's network mode, and the operator's resource
+    /// limits — is resolved into an explicit
+    /// [`shbox_sandbox::SandboxConfig`]. The engine crate itself ships no
+    /// profiles: every restriction here is deliberate shbox policy.
+    ///
+    /// `is_pty` selects the process/session shape the terminal path needs
+    /// (new session plus controlling terminal).
+    pub(crate) fn engine_config(&self, workspace: &Path, launch_temp: &Path) -> EngineConfig {
+        let (mut read_only, execute) = self.resolved_filesystem_paths();
+        let mut read_write = self.curated_write_paths();
+        read_write.push(workspace.to_path_buf());
+        read_write.push(launch_temp.to_path_buf());
+        // /dev/null is writable, not a read grant; keep the tiers disjoint.
+        read_only.retain(|path| {
+            !CURATED_WRITE_PATHS
+                .iter()
+                .any(|write| Path::new(write) == path)
+        });
+
+        EngineConfig {
+            filesystem: FilesystemPolicy::Restricted {
+                read_only: read_only.into_iter().map(PathRule::new).collect(),
+                read_write: read_write.into_iter().map(PathRule::new).collect(),
+                execute: execute.into_iter().map(PathRule::new).collect(),
+            },
+            network: self.engine_network(),
+            resources: self.engine_resources(),
+            syscalls: shbox_sandbox::SyscallPolicy::Unrestricted,
+            namespaces: self.engine_namespaces(),
+            capabilities: shbox_sandbox::CapabilityPolicy::DropAll,
+            inherited_fds: Vec::new(),
+            cgroup_parent: self.cgroup_parent.clone(),
+        }
+    }
+
+    /// Map the operator network mode onto the engine policy.
+    ///
+    /// Linux: `outbound` keeps the historical contract of unrestricted
+    /// networking (Landlock cannot express connect-any-port allowlists).
+    /// macOS: `outbound` maps to the client-only TCP tier the audited
+    /// Seatbelt profile has always used.
+    #[cfg(target_os = "linux")]
+    fn engine_network(&self) -> SandboxNetwork {
+        match self.network {
+            NetworkMode::Disabled => SandboxNetwork::Disabled,
+            NetworkMode::Outbound => SandboxNetwork::Unrestricted,
+        }
+    }
+
+    /// Linux `network = "disabled"` is an all-network contract. Landlock
+    /// mediates TCP bind/connect, while an unprivileged fresh network
+    /// namespace removes the remaining host-network reachability (including
+    /// UDP). The accompanying user namespace supplies the privilege required
+    /// to create the network namespace without granting capabilities to the
+    /// daemon in the host namespace.
+    #[cfg(target_os = "linux")]
+    fn engine_namespaces(&self) -> NamespacePolicy {
+        let mut namespaces = NamespacePolicy::default();
+        if self.network == NetworkMode::Disabled {
+            namespaces.user = true;
+            namespaces.network = NetworkNamespacePolicy::Isolated;
+        }
+        namespaces
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn engine_namespaces(&self) -> NamespacePolicy {
+        NamespacePolicy::default()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn engine_network(&self) -> SandboxNetwork {
+        match self.network {
+            NetworkMode::Disabled => SandboxNetwork::Disabled,
+            NetworkMode::Outbound => SandboxNetwork::OutboundTcp,
+        }
+    }
+
+    /// Map the operator resource limits onto cgroup-backed engine limits.
+    fn engine_resources(&self) -> ResourceLimits {
+        let resources = &self.resources;
+        ResourceLimits {
+            memory_bytes: option_limit(resources.memory_bytes),
+            swap_bytes: option_limit(resources.swap_bytes),
+            pids: option_limit(resources.pids),
+            cpu_max: option_limit(
+                resources
+                    .cpu_quota_micros
+                    .map(|quota| shbox_sandbox::CpuMax {
+                        quota_us: quota,
+                        period_us: resources.cpu_period_micros.unwrap_or(100_000),
+                    }),
+            ),
+        }
     }
 
     /// The environment for one sandbox process: workspace-scoped basics, the
@@ -316,6 +446,25 @@ impl SandboxLaunchPolicy {
         Err(LaunchError::new(
             "sandbox launch temp directory could not be allocated",
         ))
+    }
+}
+
+fn canonicalize_existing_paths(paths: &mut Vec<PathBuf>) {
+    paths.retain(|path| path.exists());
+    *paths = paths
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect();
+    paths.sort();
+    paths.dedup();
+}
+
+/// An optional configured value becomes an explicit `Value` limit; absent
+/// stays `Inherit` (no contribution to the sandbox's shared resource domain).
+fn option_limit<T>(value: Option<T>) -> Limit<T> {
+    match value {
+        Some(value) => Limit::Value(value),
+        None => Limit::Inherit,
     }
 }
 
@@ -518,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_read_paths_include_shell_and_configured_entries() {
+    fn resolved_filesystem_paths_keep_operator_reads_non_executable() {
         let directory = tempfile::tempdir().expect("configured read root");
         let configured = directory.path().join("share");
         std::fs::create_dir(&configured).expect("configured dir");
@@ -528,22 +677,37 @@ mod tests {
             vec![configured],
             BTreeMap::new(),
             PathBuf::from("/state/runtime"),
+            crate::config::SandboxResources::default(),
+            None,
         );
-        let resolved = policy.resolved_read_paths();
+        let (read_only, execute) = policy.resolved_filesystem_paths();
         let canonical_shell = std::fs::canonicalize("/bin/sh").expect("shell");
-        assert!(resolved.contains(&canonical_shell));
+        assert!(execute.contains(&canonical_shell));
+        assert!(!read_only.contains(&canonical_shell));
+        let configured = std::fs::canonicalize(directory.path().join("share").as_path())
+            .expect("canonical configured");
+        assert!(read_only.contains(&configured));
+        assert!(!execute.contains(&configured));
+
+        for resolved in [&read_only, &execute] {
+            let mut sorted = resolved.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(resolved, &sorted);
+            assert!(resolved.iter().all(|path| path.is_absolute()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disabled_network_uses_an_unprivileged_isolated_network_namespace() {
+        let policy = test_policy("/bin/sh");
+        let namespaces = policy.engine_namespaces();
         assert!(
-            resolved.contains(
-                &std::fs::canonicalize(directory.path().join("share").as_path())
-                    .expect("canonical configured")
-            )
+            namespaces.user,
+            "a user namespace is required to create the network namespace without host capabilities"
         );
-        // Sorted, deduplicated, absolute.
-        let mut sorted = resolved.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(resolved, sorted);
-        assert!(resolved.iter().all(|path| path.is_absolute()));
+        assert_eq!(namespaces.network, NetworkNamespacePolicy::Isolated);
     }
 
     #[test]
@@ -560,9 +724,20 @@ mod tests {
         assert!(!debug.to_lowercase().contains("limit"));
     }
 
+    /// The operator network mode maps onto the engine's network policy
+    /// deterministically per platform (docs/platforms.md).
     #[test]
     fn network_mode_maps_deterministically_from_config() {
-        assert_eq!(test_policy("/bin/sh").network(), NetworkMode::Disabled);
+        let policy = test_policy("/bin/sh");
+        assert_eq!(policy.engine_network(), SandboxNetwork::Disabled);
+    }
+
+    #[test]
+    fn policy_debug_snapshot_carries_resource_state_openly() {
+        let debug = format!("{:?}", test_policy("/bin/sh"));
+        // Resource policy is operator configuration, not hidden global
+        // state: the debug view shows it explicitly.
+        assert!(debug.contains("resources"));
     }
 
     #[test]
@@ -604,6 +779,8 @@ mod tests {
             Vec::new(),
             sandbox_env,
             PathBuf::from("/state/runtime"),
+            crate::config::SandboxResources::default(),
+            None,
         );
         let directory = tempfile::tempdir().expect("workspace");
         let temp = Path::new("/state/runtime/launch-abc");

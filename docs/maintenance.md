@@ -8,7 +8,7 @@ shbox は `russh`、`ssh-key`、`tokio`、`nix` などの外部 crate に依存�
 |---|---|---|
 | SSH 契約系 | `russh`, `ssh-key`, `ssh-encoding` | major / pre-release (`0.x`, `-rc`) の bump は breaking の可能性が高い。release gate 前に必ず OpenSSH 互換 acceptance を通すまで merge しない。 |
 | runtime 系 | `tokio`, `futures-util`, `tokio-tungstenite` | minor は追従可。feature flag（`ws`）の default 挙動を変えない。 |
-| platform 系 | `nix`, `libc`, `nono` | API 変更が頻繁。Linux/macOS 両 native gate での確認を必須とする。 |
+| platform 系 | `nix`, `libc`, `landlock`, `seccompiler` | API 変更が頻繁。Linux/macOS 両 native gate での確認を必須とする。 |
 | その他 | `serde`, `toml`, `tracing`, `usage-rs` 等 | patch/minor は `cargo update` で追従してよい。 |
 
 `ssh-key` の `-rc` 版を指定している期間は、正式版が出た時点で rc 指定を外す移行を最優先タスクとする。

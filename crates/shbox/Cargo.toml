@@ -1,0 +1,40 @@
+[package]
+name = "shbox"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Foreground SSH daemon that maps OpenSSH clients onto persistent sandbox workspaces"
+publish = false
+
+[features]
+default = ["tcp"]
+
+tcp = []
+ws = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+libc = "0.2"
+nix = { version = "0.31", features = ["term"] }
+rand = { version = "0.10", features = ["thread_rng"] }
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+shbox-sandbox = { path = "../shbox-sandbox" }
+ssh-key = { version = "0.7.0-rc", features = ["rand_core"] }
+serde = { version = "1", features = ["derive"] }
+serde_with = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry", "time"] }
+usage-rs = { package = "usage-rs", version = "6.6", features = ["completions"] }
+usage-lib = "6.6"
+xdg = "3"
+
+[dev-dependencies]
+proptest = "1"
+ssh-encoding = "0.3"
+tempfile = "3"
+# WebSocket client for the `ws` transport integration tests. The `connect`
+# feature stays test-only; the daemon itself only serves upgrades.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }

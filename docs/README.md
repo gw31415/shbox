@@ -36,18 +36,18 @@
 SSH/session layer
     -> ProcessLauncher
         -> shbox-owned PTY/process lifecycle
-        -> OS confinement
-            Linux: nono 0.74.0 / Landlock
-                   (+ nono-selected seccomp fallback when required)
+        -> shbox-sandbox engine
+            Linux: clone3+pidfd / Landlock / seccomp
+                   (+ cgroup v2 via CLONE_INTO_CGROUP when limits are set)
             macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
 ```
 
-Linux では nono を library として利用し、外部 sandbox CLI、sibling helper、delegated cgroup controller を必要としない。macOS では parent process が Seatbelt profile を構築し、`/usr/bin/sandbox-exec` に適用を委ねる。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
+Linux では workspace 内の shbox-sandbox crate が confinement engine を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（cgroup は resource limits を設定した場合のみ、delegation が必要）。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
 
 ## Change discipline
 
-- public config に backend selector や backend 固有 option を追加しない。
-- sandbox resource limits（CPU/memory/PID/file quota）を shbox の機能として暗黙に復活させない。
+- public config に backend selector や undocumented/raw backend option を追加しない。
+- sandbox resource limits は explicit な `[sandbox]` 設定でのみ付与する（[configuration.md](configuration.md) §4.4）。engine 側の preset/profile は作らない。
 - PTY failure を pipe ベースの疑似 interactive mode で回避しない。
 - Linux confinement failure を unconfined execution に degrade しない。
 - macOS Seatbelt prerequisite failure を unconfined execution に degrade しない。

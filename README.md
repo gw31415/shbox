@@ -6,6 +6,18 @@ Foreground SSH daemon that maps OpenSSH clients onto persistent sandbox workspac
 - Main dependencies: `russh` 0.63, `tokio` 1, `ssh-key` 0.7.0-rc
 - Transports: `tcp` (default feature), `ws` (feature-gated WebSocket)
 
+## Workspace layout
+
+| crate | role |
+|---|---|
+| `crates/shbox` | the SSH daemon (transport, auth, sessions, sandbox workspaces) |
+| `crates/shbox-sandbox` | sandbox engine: Linux `clone3`+pidfd / Landlock / seccomp / cgroup v2, macOS Seatbelt |
+
+The daemon composes its per-launch policy (curated readable system paths,
+per-launch workspace, network mode, resource limits) into an explicit
+`shbox-sandbox` `SandboxConfig`; the engine crate itself ships no security
+profiles. See [crates/shbox-sandbox/README.md](crates/shbox-sandbox/README.md).
+
 ## Build
 
 ```sh

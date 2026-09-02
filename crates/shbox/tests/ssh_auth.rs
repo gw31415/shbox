@@ -767,9 +767,7 @@ fn parse_tty_probe(output: &[u8]) -> TtyProbe {
 fn wait_for_pid_gone(pid: libc::pid_t, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        // SAFETY: signal zero performs existence/permission checking only.
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if pid_is_terminated(pid) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -777,6 +775,35 @@ fn wait_for_pid_gone(pid: libc::pid_t, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// A fixture PID counts as terminated when the kernel forgot it entirely or
+/// when it is dead-but-unreaped. On Linux an orphan is reparented to the
+/// surrounding init, and a container whose PID 1 never waits keeps it as a
+/// zombie that still answers `kill(pid, 0)`. A zombie holds no address space
+/// and cannot run again, so the cleanup contract is satisfied either way; a
+/// live state (`S`, `R`, …) keeps counting as present.
+fn pid_is_terminated(pid: libc::pid_t) -> bool {
+    // SAFETY: signal zero performs existence/permission checking only.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if linux_process_state(pid).as_deref() == Some("Z") {
+        return true;
+    }
+    false
+}
+
+/// Read the scheduler state field of `/proc/<pid>/stat`. The comm field is
+/// parenthesized and may itself contain spaces, so parsing starts after the
+/// final closing parenthesis.
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: libc::pid_t) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = stat.rsplit_once(')')?.1;
+    tail.split_whitespace().next().map(str::to_owned)
 }
 
 #[derive(Debug, Clone)]
@@ -1629,20 +1656,10 @@ fn sandbox_shutdown_cleans_up_descendants() {
         ("sandbox parent", parent_pid),
         ("sandbox descendant", descendant_pid),
     ] {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            // SAFETY: each PID was written by the sandbox process created by
-            // this fixture; kill(pid, 0) only probes its existence.
-            let result = unsafe { libc::kill(pid, 0) };
-            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{label} {pid} survived sandbox shutdown"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(10)),
+            "{label} {pid} survived sandbox shutdown"
+        );
     }
 }
 
@@ -2172,17 +2189,10 @@ fn daemon_shutdown_cleans_up_an_active_host_process() {
     );
 
     for (label, pid) in [("host process", host_pid), ("descendant", descendant_pid)] {
-        let deadline = Instant::now() + Duration::from_secs(7);
-        loop {
-            // SAFETY: the PID was written by the host process created by this
-            // fixture; kill(pid, 0) only probes its existence.
-            let result = unsafe { libc::kill(pid, 0) };
-            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "{label} {pid} survived shutdown");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(
+            wait_for_pid_gone(pid, Duration::from_secs(7)),
+            "{label} {pid} survived shutdown"
+        );
     }
     let _ = std::fs::remove_file(pid_path);
     let _ = std::fs::remove_file(descendant_path);
@@ -2234,20 +2244,10 @@ fn second_shutdown_signal_force_stops_host_process() {
     );
     let _ = client.join();
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        // SAFETY: the PID was written by the host process created by this
-        // fixture; kill(pid, 0) only probes its existence.
-        let result = unsafe { libc::kill(host_pid, 0) };
-        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "host process {host_pid} survived second shutdown signal"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_for_pid_gone(host_pid, Duration::from_secs(3)),
+        "host process {host_pid} survived second shutdown signal"
+    );
     let _ = std::fs::remove_file(pid_path);
 }
 
@@ -2291,20 +2291,10 @@ fn daemon_crash_does_not_orphan_an_active_host_process() {
     let _ = daemon.child.wait();
     let _ = client.join();
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        // SAFETY: the PID was written by the host process created by this
-        // fixture; kill(pid, 0) only probes its existence.
-        let result = unsafe { libc::kill(child_pid, 0) };
-        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "host process {child_pid} survived daemon crash"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_for_pid_gone(child_pid, Duration::from_secs(3)),
+        "host process {child_pid} survived daemon crash"
+    );
     let _ = std::fs::remove_file(pid_path);
 }
 

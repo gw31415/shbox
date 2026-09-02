@@ -1017,7 +1017,7 @@ mod tests {
             Err(FingerprintError::BadLength(35))
         );
         // Padded input is rejected.
-        let mut padded = good.clone();
+        let mut padded = good;
         padded.push('=');
         assert_eq!(
             KeyFingerprint::parse(&padded),
@@ -1135,7 +1135,14 @@ mod tests {
         assert!(matches!(present, FileIdentity::Inode { .. }));
         // A permission-only change moves ctime but not mtime; the identity
         // must still change so the next request re-runs the safety checks.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        // Toggle one mode bit instead of assigning a fixed mode: the Linux
+        // platform gate runs under `umask 077`, so a newly-created file may
+        // already be 0600 and `chmod 0600` would not be a metadata change.
+        let mode = fs::symlink_metadata(&path)
+            .expect("stat")
+            .permissions()
+            .mode();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode ^ 0o100)).expect("chmod");
         assert_ne!(observe_identity(&path), present);
         fs::remove_file(&path).expect("remove");
         assert_eq!(observe_identity(&path), FileIdentity::Absent);

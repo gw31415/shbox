@@ -87,23 +87,23 @@ fake launcherの成功はnative sandbox gateの代用ではない。
 
 ## 5. Linux native confinement test
 
-Linux production backendはnono `0.74.0`をlibraryとして使い、Landlock ruleをparent側でprepareしてchildで適用する。
+Linux production backendはworkspace内の`shbox-sandbox` engine（landlock 0.4 / seccompiler 0.5）を使い、Landlock ruleset・seccomp BPF・cgroupをparent側で準備してchildで適用する。engine自体のunit/integration testは`cargo test -p shbox-sandbox`で実行される。
 
 `scripts/verify-linux-platform --arch x86_64|aarch64` はblocking gateであり、次を確認する。
 
 - native architecture
 - non-root execution
 - Rust 1.95
-- pinned nono 0.74.0
+- pinned landlock 0.4 / seccompiler 0.5（engine crate）
 - 実kernelのLandlock ABI
 - network rights availability
 - signal/IPC scoping availability
-- nonoが選択したseccomp network fallbackの有無
+- Landlock network mediationの有効性（ABI 4+）
 - locked release build
 - full native OpenSSH/PTTY suite
 - `cargo check --all-targets`
 
-control-group delegationはsandbox availabilityの前提ではない。環境診断として `/proc/self/cgroup` を表示してもよいが、その値でgateを成功・失敗させない。
+resource limit 無指定の sandbox availability には control-group delegation は不要である。resource limit を検証する場合は、書き込み可能な cgroup v2 parent が必要であり、無い場合はその launch が fail closed する。環境診断として `/proc/self/cgroup` を表示する。
 
 ### 5.1 Filesystem proof
 
@@ -121,7 +121,9 @@ control-group delegationはsandbox availabilityの前提ではない。環境診
 
 `disabled`:
 
+- fresh user+network namespace が作成され、host/external route/interface を共有しないこと
 - 実TCP `connect()` が失敗すること
+- 実UDP送信でhost/external endpointへ到達できないこと
 
 `outbound`:
 
@@ -129,12 +131,15 @@ control-group delegationはsandbox availabilityの前提ではない。環境診
 
 `outbound` のportable contractは任意宛先へのclient connectionが使えることまでである。Linuxでは現在これより広いsocket accessが可能になり得るが、macOSはbind/inboundをallowしない。testはclient successを必須にし、portableなinbound behaviorを仮定しない。
 
+engine 単体で all-network denial を検証する場合は、必要な user namespace または privilege setup とともに `NetworkNamespacePolicy::Isolated` を明示し、fresh network namespaceから外部到達性がないことを確認する。public shbox adapter は `network = "disabled"` からこの構成を自動的に選択する。
+
 ### 5.3 Process cleanup proof
 
-- direct child終了後にinitial owned process groupの残processを停止すること
+- PID namespace無しではdirect childをreapする前にinitial owned process groupの残processを停止すること
+- PID namespace有りではinternal PID1 supervisorの下でuser commandがPID2として動き、signal/status forwardingとnamespace descendant teardownが成立すること
 - signal requestがowned foreground/process groupへ届くこと
 - disconnect/delete/daemon shutdownでmanaged groupを停止すること
-- Linux direct childはdaemon death時のparent-death signalを持つこと
+- Linux cloneはprocess-lifetime spawn-owner threadが担当し、engine-owned direct childはdaemon death時のparent-death signalを持つこと
 
 Landlock confinement inheritanceとprocess cleanupは別の保証である。意図的に新sessionへdetachしたdescendantを、process-group cleanupが完全なprocess tree containmentとして回収するとは主張しない。
 
@@ -154,6 +159,8 @@ Landlock confinement inheritanceとprocess cleanupは別の保証である。意
 - `cargo check --all-targets`
 
 production launcherはSeatbelt profileをspawn前に構築し、`sandbox-exec -p <profile> -- <shell>`で適用する。PTYはshboxが所有するため、Seatbelt smokeだけでPTY correctnessを代用しない。
+
+macOS resource-limit testでは `memory_max` が `RLIMIT_AS`、`pids_max` が `RLIMIT_NPROC` に変換されること、`cpu_quota_micros` または `swap_max` の指定が launch 前に fail closed することを確認する。
 
 ## 7. OpenSSH / PTY blocking suite
 
@@ -232,7 +239,7 @@ pipeをPTYの代用にしてはならない。
 
 release workflowは `v*` tag push時（または明示的なmanual dispatch時）だけ実行する。通常のbranch push/PRでは重いnative matrixを起動しない。
 
-release workflowはproduction inputsに、廃止済みsandbox backend、sibling launcher helper、launcher-control environment path、external sandbox CLI invocation、sandbox用control-group filesystem write pathが再導入された場合に失敗する。
+release workflowはproduction inputsに、廃止済みsandbox backend、sibling launcher helper、launcher-control environment path、project-owned external sandbox CLI invocation、resource limit 無指定時の sandbox 用 control-group filesystem write pathが再導入された場合に失敗する（macOSの固定OS component `/usr/bin/sandbox-exec` は許可）。
 
 このguardはbehavior testの代用ではなく、release時にarchitecture regressionを拒否する追加条件である。開発中の検出はlocal checksを使い、必要な場合だけmanual dispatchする。
 
@@ -250,7 +257,7 @@ PR run `33518661744`、commit `aff82c4` でnative release gateは全job成功し
 - macOS 15 arm64 Seatbelt: success
 - macOS 26 arm64 Seatbelt: success
 
-Linux native jobsはkernel `6.17.0-1022-azure`、nono `0.74.0`、Landlock ABI V6、network/scoping support有効、seccomp network fallbackなしを報告した。
+Linux native jobsはkernel `6.17.0-1022-azure`、Landlock ABI V6、network support有効を報告した（nono `0.74.0` 時代の記録。engine 移行後に再取得する）。
 
 macOS jobsは `15.7.7` と `26.5.2` のarm64 runnerでSeatbelt deny/allow smokeとfull suiteを通した。
 
@@ -272,7 +279,7 @@ GitHub native gateがgreenでも、Fly production tupleのacceptanceを代用し
 - graceful daemon shutdown
 - Linux daemon SIGKILL時のdirect-child parent-death behavior
 - deliberately detached descendantの明示的な制約確認
-- sandbox launchがcontrol-group filesystem writeを要求しないこと
+- resource limit 無指定時に sandbox launch が control-group filesystem write を要求せず、指定時だけ delegated cgroup v2 files を使うこと
 
 このproduction acceptanceがないtupleを「Fly verified」と記載してはならない。
 

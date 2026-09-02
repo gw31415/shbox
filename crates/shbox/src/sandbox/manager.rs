@@ -321,6 +321,9 @@ impl SandboxManager {
         if !self.cancel_runtime(id) {
             return Err(Error::RuntimeCleanup);
         }
+        self.launcher
+            .release_sandbox_resources(id)
+            .map_err(Error::Launch)?;
         self.storage
             .remove_tree(id)
             .map_err(|source| Error::Cleanup { source })?;
@@ -393,7 +396,12 @@ impl SandboxManager {
             return Err(Error::Unavailable);
         }
         let max_sandbox_processes = self.caps.max_sandbox_processes as usize;
-        if ledger.runtime.len() >= max_sandbox_processes {
+        let sandbox_processes = ledger
+            .runtime
+            .values()
+            .filter(|entry| entry.sandbox_id == *handle.id())
+            .count();
+        if sandbox_processes >= max_sandbox_processes {
             return Err(Error::Limit("max_sandbox_processes"));
         }
         let token = next_runtime_token(&mut ledger);
@@ -1412,6 +1420,38 @@ mod tests {
     }
 
     #[test]
+    fn resource_release_failure_keeps_deleting_tree_and_is_retryable() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let workspace = handle.workspace().clone();
+
+        launcher.fail_release_next();
+        assert!(matches!(manager.delete(&owner, &id), Err(Error::Launch(_))));
+        assert!(
+            workspace.is_dir(),
+            "release failure must preserve sandbox tree"
+        );
+        assert_eq!(manager.sandbox_count(), 1);
+        assert!(manager.list(&owner).expect("deleting list").is_empty());
+        assert!(matches!(
+            manager.claim(&owner, &id),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(launcher.released_sandboxes(), vec![id.clone()]);
+
+        assert_eq!(
+            manager.delete(&owner, &id).expect("retry delete"),
+            DeleteResult::Deleted
+        );
+        assert!(!workspace.exists());
+        assert_eq!(manager.sandbox_count(), 0);
+        assert_eq!(launcher.released_sandboxes(), vec![id.clone(), id]);
+    }
+
+    #[test]
     fn root_sync_fault_is_reconciled_as_absent() {
         let root = TempDir::new().expect("tempdir");
         let paths = paths_for(&root);
@@ -1560,6 +1600,8 @@ mod tests {
             Vec::new(),
             std::collections::BTreeMap::new(),
             paths.runtime_dir().to_path_buf(),
+            crate::config::SandboxResources::default(),
+            None,
         );
         let launcher = LinuxLauncher::new(policy).expect("linux launcher");
         let manager =
@@ -1597,6 +1639,8 @@ mod tests {
             Vec::new(),
             std::collections::BTreeMap::new(),
             paths.runtime_dir().to_path_buf(),
+            crate::config::SandboxResources::default(),
+            None,
         );
         let launcher = MacosLauncher::new(policy).expect("macos launcher");
         let manager =
@@ -1646,6 +1690,35 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_process_cap_applies_independently_to_each_sandbox() {
+        let launcher = FakeLauncher::default();
+        let caps = Caps {
+            max_sandbox_processes: 1,
+            ..Caps::default()
+        };
+        let (_root, manager) = manager_with_fake(caps, &launcher);
+        let owner = principal('A', Role::Normal);
+        let first_id = SandboxId::parse("first").expect("first id");
+        let second_id = SandboxId::parse("second").expect("second id");
+        let first_handle = manager.claim(&owner, &first_id).expect("first claim");
+        let second_handle = manager.claim(&owner, &second_id).expect("second claim");
+
+        let first = manager
+            .launch_handle(&first_handle, platform::LaunchOperation::Shell, None)
+            .expect("first launch");
+        let second = manager
+            .launch_handle(&second_handle, platform::LaunchOperation::Shell, None)
+            .expect("second sandbox launch");
+        assert_eq!(manager.runtime_count(), 2);
+
+        first.process.control.terminate();
+        second.process.control.terminate();
+        manager.clear_runtime(&first.lease);
+        manager.clear_runtime(&second.lease);
+        assert_eq!(manager.runtime_count(), 0);
+    }
+
+    #[test]
     fn delete_wins_against_a_barriered_launch_and_terminates_late_process() {
         let launcher = FakeLauncher::default();
         let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
@@ -1656,7 +1729,7 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(2));
         launcher.set_barrier(Arc::clone(&barrier));
         let launch_manager = Arc::clone(&manager);
-        let launch_handle = handle.clone();
+        let launch_handle = handle;
         let join = thread::spawn(move || {
             launch_manager.launch_handle(&launch_handle, platform::LaunchOperation::Shell, None)
         });
@@ -1672,7 +1745,7 @@ mod tests {
             "launch reached the fake barrier"
         );
         let delete_manager = Arc::clone(&manager);
-        let delete_owner = owner.clone();
+        let delete_owner = owner;
         let delete_id = id.clone();
         let delete = thread::spawn(move || delete_manager.delete(&delete_owner, &delete_id));
         for _ in 0..100 {

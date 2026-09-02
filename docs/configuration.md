@@ -1,6 +1,6 @@
 # shbox 設定仕様
 
-この文書は v0.1 の公開 TOML schema、CLI override、XDG layout、built-in concurrency cap を定義する。backend 固有 option や sandbox CPU/memory/PID/file quota は公開設定ではない。
+この文書は v0.1 の公開 TOML schema、CLI override、XDG layout、built-in concurrency cap を定義する。backend selector や raw backend option は公開しないが、§4.4 の resource limit（Linux の `cgroup_parent` を含む）は platform-specific な公開設定である。
 
 ## 1. 読み込みと lifetime
 
@@ -33,6 +33,14 @@ network = "disabled"
 # 追加 read-only path。単一 string も一要素配列として受理する。
 # 省略時: []
 read_paths = ["/opt/toolchain"]
+
+# resource limits。すべて省略時は parent の制限を継承する。
+# memory_max = 1073741824
+# swap_max = 536870912
+# pids_max = 64
+# cpu_quota_micros = 50000
+# cpu_period_micros = 100000
+# cgroup_parent = "/sys/fs/cgroup/shbox"
 
 [sandbox.env]
 # operator が全 sandbox launch に追加する environment。
@@ -95,7 +103,7 @@ shell は process-lifetime policy の一部であり、request ごとに選択�
 
 | value | contract |
 |---|---|
-| `disabled` | sandbox network access を blocking policy で拒否する。default。 |
+| `disabled` | host/external network reachability を拒否する。default。Linux では fresh user+network namespace に隔離し、加えて Landlock が TCP `bind`/`connect` を拒否する。macOS では deny-default Seatbelt profile が network operation を許可しない。 |
 | `outbound` | ordinary network socket use を許す。port allowlist/proxy policy ではない。 |
 
 Linux/macOS の enforcement 差は [platforms.md](platforms.md) を参照する。
@@ -118,7 +126,28 @@ validation:
 
 OS が ordinary command runtime に必要とする system/runtime path は implementation の curated set として別途追加され、public config には列挙しない。
 
-### 4.4 `[sandbox.env]`
+### 4.4 Resource limits
+
+`sandbox` table の optional key で、sandbox ごとの resource limit を指定する。Linux では cgroup v2、macOS では表現可能な値を child の `setrlimit` に変換する。macOS で CPU quota または swap limit を指定した場合は起動を fail closed する。`cgroup_parent` は Linux 用であり、macOS では使われない。
+
+| key | Linux | macOS |
+|---|---|---|
+| `memory_max` | `memory.max`、bytes | `RLIMIT_AS`、address-space bytes（RSS ceiling ではない） |
+| `swap_max` | `memory.swap.max`、bytes | unsupported。指定時は fail closed |
+| `pids_max` | `pids.max`、process count | `RLIMIT_NPROC`、OS/user-scope の process limit |
+| `cpu_quota_micros` | `cpu.max` の quota、microseconds of CPU per period | unsupported。指定時は fail closed |
+| `cpu_period_micros` | `cpu.max` の period、1000..=1000000（quota 指定時だけ有効。default 100000） | CPU quota が unsupported のため、quota なしでは効果なし |
+| `cgroup_parent` | per-`SandboxId` resource domain cgroup の作成先となる absolute cgroup v2 directory | 使用しない |
+
+`memory_max`、`swap_max`、`pids_max`、`cpu_quota_micros` の省略は `Inherit` であり、その controller に対する sandbox-local の変更を行わない。public shbox adapter でこれらのいずれかを指定すると、`SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch はその domain を共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初から domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。daemon crash 時の orphan process や resource domain を自動 cleanup する保証ではない。明示 limit は ancestor cgroup の制限に追加される制限であり、child が親・祖先 cgroup の制限を解除または引き上げることはできない。
+
+なお、`shbox-sandbox::Sandbox::spawn` を直接利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。これは public shbox adapter の `SandboxId` 共有 domain とは別の lifecycle である。
+
+`cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、必要な controller（`memory` / `cpu` / `pids`）を `subtree_control` に有効化できる最初の階層を使う。書き込み可能な階層が無ければ resource-limit launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=yes` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。
+
+macOS の `memory_max` は `RLIMIT_AS`、`pids_max` は `RLIMIT_NPROC` として child の exec 前に設定され、descendant に継承される。これらは Linux cgroup tree quota ではない。
+
+### 4.5 `[sandbox.env]`
 
 全 sandbox launch に追加する `name = "value"` table。
 
@@ -190,27 +219,24 @@ private `TMPDIR` は launch ごとに unique、owner-only directory とし、lau
 | unauthenticated connections | 32 |
 | total connections | 128 |
 | channels per connection | 16 |
-| concurrent sandbox processes | 128 |
+| concurrent processes per sandbox | 128 |
 | concurrent host-mode processes | 16 |
 | auth attempts per connection | 6 |
 | total sandboxes | 1024 |
 | sandboxes per owner | 128 |
 | SSH handshake timeout | 30 s |
 
-これらは admission/concurrency limit であり、sandbox 内の process に CPU quota、memory ceiling、PID tree quota、file-size/open-file quota を設定する resource-control feature ではない。
+これらは admission/concurrency limit であり、§4.4 の per-sandbox resource limits の代替ではない。file-size/open-file quota を設定する機能でもない。`concurrent processes per sandbox`（`max_sandbox_processes`）は `SandboxId` ごとの launch 数に対して数えられる（daemon 全体での global cap ではない）。
 
-## 7. Sandbox resource limits は提供しない
+## 7. Unsupported resource controls
 
-v0.1 の shbox sandbox policy には次の per-launch/per-sandbox resource quota はない。
+§4.4 に記載した memory、swap、PID、CPU の limit は platform ごとに実装される。v0.1 で提供しない per-launch/per-sandbox quota は次の通りである。
 
-- CPU percentage/quota
-- memory/RSS ceiling
-- process/PID count quota
 - file-size quota
 - open-file quota
 - workspace disk quota
 
-operator が systemd、container runtime、VM/provider、OS account policy などで service-level resource controls を設定することは可能だが、それは shbox public sandbox contract ではない。
+macOS では CPU quota と swap limit も表現できず、指定すると黙って無視せず fail closed する。operator が systemd、container runtime、VM/provider、OS account policy などで追加の service-level resource controls を設定することは可能だが、それは shbox public sandbox contract の代替ではない。
 
 旧設定名らしき unknown field を互換目的で黙って受理することもしない。`deny_unknown_fields` により明示的な config error になる。
 

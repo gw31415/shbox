@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Blocking native Linux sandbox/PTTY platform gate.
 #
-# shbox owns process/PTY lifecycle and uses nono's prepared Landlock/seccomp
-# policy as its Linux confinement layer. This gate deliberately requires no
-# cgroup delegation and never writes cgroupfs.
+# shbox owns process/PTY lifecycle on top of the in-workspace
+# shbox-sandbox engine (clone3+pidfd, Landlock, seccomp, cgroup v2 when
+# resource limits are configured). This gate requires no cgroup delegation:
+# the default configuration runs without a dedicated cgroup.
 
 set -euo pipefail
 umask 077
 
-readonly NONO_VERSION="0.74.0"
 readonly RUST_MINOR="1.95"
 
 die() {
@@ -22,8 +22,8 @@ usage: scripts/verify-linux-platform --arch x86_64|aarch64 [--target TARGET]
 
 Runs the native shbox Linux gate as the current non-root account. The gate
 requires Rust 1.95, OpenSSH, a C compiler for the PTY identity fixture, and a
-kernel on which the pinned nono policy can prepare and enforce Landlock.
-No control-group delegation, sibling runner binary, external wrapper, or nono CLI is used.
+kernel with Landlock ABI 4+ (6.7+). No sibling runner binary or external
+wrapper is used; cgroup resource limits stay optional.
 USAGE
   exit 2
 }
@@ -107,15 +107,11 @@ fi
 
 rustc_version="$(rustc_gate --version)"
 [[ "$rustc_version" == "rustc $RUST_MINOR."* ]] || die "Rust $RUST_MINOR is required, got: $rustc_version"
-grep -Fqx "rust-version = \"$RUST_MINOR\"" Cargo.toml || die "Cargo.toml rust-version is not $RUST_MINOR"
-grep -Fqx "nono = { version = \"=$NONO_VERSION\", default-features = false }" Cargo.toml || \
-  die "Cargo.toml does not pin nono $NONO_VERSION"
-awk -v expected="version = \"$NONO_VERSION\"" '
-  $0 == "[[package]]" { inside = 0 }
-  $0 == "name = \"nono\"" { inside = 1; seen = 1; next }
-  inside && $0 == expected { version = 1 }
-  END { exit !(seen && version) }
-' Cargo.lock || die "Cargo.lock does not contain nono $NONO_VERSION"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" crates/shbox/Cargo.toml || die "shbox rust-version is not $RUST_MINOR"
+grep -Fqx "rust-version = \"$RUST_MINOR\"" crates/shbox-sandbox/Cargo.toml || die "shbox-sandbox rust-version is not $RUST_MINOR"
+if grep -Rnw crates --include=Cargo.toml -e 'nono' >/dev/null 2>&1; then
+  die "a crate still depends on the retired nono confinement layer"
+fi
 
 rustc_host="$(rustc_gate -vV | awk '$1 == "host:" { print $2 }')"
 [[ "$rustc_host" == "$target" ]] || die "rustc host is $rustc_host, expected native target $target"
@@ -123,7 +119,7 @@ kernel_release="$(uname -r)"
 
 printf 'Linux platform gate: arch=%s target=%s kernel=%s user=%s uid=%s\n' \
   "$actual_machine" "$target" "$kernel_release" "$runner_user" "$uid"
-printf 'Linux platform gate: %s; nono=%s\n' "$rustc_version" "$NONO_VERSION"
+printf 'Linux platform gate: %s\n' "$rustc_version"
 printf 'Linux platform gate: OpenSSH version\n'
 ssh -V 2>&1
 if [[ -r /proc/self/cgroup ]]; then
@@ -131,12 +127,12 @@ if [[ -r /proc/self/cgroup ]]; then
   cat /proc/self/cgroup
 fi
 
-# Exercise the exact prepared nono API and print the detected Landlock ABI and
-# scoping/network capability before the larger suite. This is a real kernel
-# probe; failure is blocking.
-printf 'Linux platform gate: nono/Landlock capability probe\n'
+# Exercise the exact engine API this launcher pins and print the detected
+# Landlock ABI and cgroup state before the larger suite. This is a real
+# kernel probe; failure is blocking.
+printf 'Linux platform gate: engine/Landlock capability probe\n'
 SHBOX_PLATFORM_DIAGNOSTICS=1 cargo_gate test --locked --target "$target" --bin shbox \
-  platform::linux::tests::pinned_nono_api_prepares_a_restricted_policy \
+  platform::linux::tests::engine_capability_probe \
   -- --exact --nocapture --test-threads=1
 
 printf 'Linux platform gate: locked native release build\n'

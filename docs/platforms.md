@@ -8,14 +8,15 @@ shbox の正式 support は「target で build できる」ことではなく、
 SSH/session layer
     -> ProcessLauncher
         -> shbox-owned PTY/process lifecycle
-        -> OS confinement
-            Linux: nono 0.74.0 / Landlock
-                   (+ nono-selected seccomp fallback when required)
+        -> shbox-sandbox engine (in-workspace crate)
+            Linux: clone3 + pidfd + Landlock + seccomp
+                   + cgroup v2 (CLONE_INTO_CGROUP, when limits are set)
+                   + namespaces + no_new_privs + capability drop
             macOS: generated Seatbelt profile
                    via /usr/bin/sandbox-exec
 ```
 
-`ProcessLauncher` は private test seam であり public backend selector ではない。policy は backend-neutral で、shell、network mode、read-only paths、environment、private launch temp root を表す。
+`ProcessLauncher` は private test seam であり public backend selector ではない。shbox の policy 層は backend-neutral で、shell、network mode、read-only paths、environment、private launch temp root、resource limits を表現し、launch ごとに explicit な engine `SandboxConfig` へ解決する。engine crate 自体は preset/profile を持たない（[crates/shbox-sandbox](../crates/shbox-sandbox/README.md)）。
 
 両 platform とも shbox 自身が次を所有する。
 
@@ -33,19 +34,19 @@ confinement library/tool に PTY ownership を委譲しない。
 
 ### 2.1 Confinement
 
-Linux は pinned `nono = 0.74.0` を Rust library として使う。外部 executable/CLI は必要ない。
+Linux は workspace 内の `shbox-sandbox` crate（`landlock 0.4` / `seccompiler 0.5` / libc のみ）を engine として使う。外部 executable/CLI は必要ない。
 
 parent process は child を作る前に:
 
 - Landlock ABI を detect
-- readable/writable path capability を prepare
-- network mode を prepare
-- signal/IPC scope request を prepare
-- kernel capabilityに応じた seccomp network fallbackをprepare
+- filesystem/network policy を Landlock ruleset として構築（path fd はこの時点で open・pin される）
+- seccomp policy があれば BPF program まで compile
+- resource limit が設定されていれば、direct engine spawn では one-shot cgroup、public shbox adapter では `SandboxId` 共有 resource domain cgroup を child 生成前に準備し limit を書き込む
+- argv/envp/cwd を C string まで marshal
 
-する。
+する。実際の `clone3` は process-lifetime の専用 spawn-owner thread が担当するため、`PR_SET_PDEATHSIG` の親 thread は短命な Tokio blocking worker にならない。PID namespace 無しでは user child を `clone3(CLONE_PIDFD | … | CLONE_INTO_CGROUP)`（limit 時）で直接生成する。PID namespace 有りでは outer clone を内部 PID1 supervisor/reaper とし、resource limit があれば PID1 が nested `clone3(CLONE_INTO_CGROUP)` で user PID2 を quota cgroup 内へ直接生成する。post-clone path は固定順序・allocation-free で、path lookup、policy allocation、filter compile を行わない。
 
-prepared policy だけを post-fork child へ持ち込み、child は raw/fixed setup後に `apply_raw` を行う。path lookupやpolicy allocationをmultithreaded post-fork childで行わない。
+engine の invariant（no_new_privs、capability drop、FD hygiene、setup 失敗時の fail-closed、pidfd supervision）は shbox policy からは弱められない。
 
 ### 2.2 Filesystem policy
 
@@ -63,13 +64,13 @@ Landlock restriction は descendant に継承される。
 
 ### 2.3 Network
 
-`disabled` は nono network blocked policy。Landlock network mediation が不足するkernelでは、nonoが選択するseccomp fallbackを利用する。fallback preparation/applicationに失敗すればlaunchを拒否する。
+`disabled` は fresh user+network namespace と Landlock network rules を組み合わせる。fresh network namespace が host/external network reachability を切り離し、child は capability drop 後に exec されるため初期状態で down の loopback を再構成できない。Landlock（ABI 4+）は TCP `bind`/`connect` も deny する。必要な namespace setup または Landlock network rights が利用できなければ launch は fail closed する。
 
-`outbound` のpublic contractは任意remote endpointへのclient connectionを利用可能にすることまでとする。Linuxのnono mappingは現在 `AllowAll` であり、任意remote portへのconnectだけをwildcard許可してbindだけを禁止するportless Landlock ruleとして偽装しない。このためLinuxではcontractより広いsocket operationが可能になり得る。macOSは別途bind/inbound ruleを付与しない。inbound listenerの可否をportable contractとして依存してはならない。
+`outbound` のpublic contractは任意remote endpointへのclient connectionを利用可能にすることまでとする。Linux mappingは `NetworkPolicy::Unrestricted`（Landlock network ruleなし）であり、任意remote portへのconnectだけをwildcard許可してbindだけを禁止するportless Landlock ruleとして偽装しない。このためLinuxではcontractより広いsocket operationが可能になり得る。macOSは別途bind/inbound ruleを付与しない。
 
-### 2.4 Signal/IPC scope
+### 2.4 seccomp / namespaces
 
-nono policy は signal isolation と shared-memory-oriented IPC modeをrequestする。kernel ABIがscopingを提供する場合はそれを利用する。release diagnosticsは実ABIとnetwork/scoping capabilityを記録する。
+engine は per-sandbox な seccomp filter（allowlist/denylist/argument filter）と namespace 選択（user/pid/mount/ipc/uts/net）を `SandboxConfig` 経由で提供する。shbox は `network = "disabled"` のとき user+network namespace を使用し、それ以外の namespace と syscall filter は現時点では有効化しない。capability drop と no_new_privs は policy によらず常に適用される。
 
 ### 2.5 PTY/process setup
 
@@ -87,19 +88,23 @@ non-PTY childもnew sessionを作り、pipesをfd0/1/2へ接続して同じconfi
 
 setup failureはstatus pipeでparentへ返し、partially configured childを公開しない。
 
-### 2.6 cgroup delegation は prerequisite ではない
+### 2.6 cgroup v2（resource limits を設定した場合のみ）
 
-shbox sandbox runtime は delegated cgroup controllers を要求せず、sandbox launch のために cgroup filesystem を変更しない。
+`[sandbox]` に resource limit（`memory_max` / `swap_max` / `pids_max` / `cpu_quota_micros`）を設定すると、public shbox adapter は `SandboxId` ごとに一つの durable resource domain cgroup を作り、同じ sandbox の全 concurrent launch を `clone3(CLONE_INTO_CGROUP)` で最初からその cgroup に入れる（limit 適用前の window が存在しない）。child exit では shared domain を削除せず、sandbox deletion が runtime cleanup を完了した後に release/remove する。これらを 1 つも設定しなければ cgroup は不要で、cgroupfs は変更しない。`cpu_period_micros` 単独では cgroup を作らず、CPU quota と組み合わせた場合だけ有効である。direct `shbox-sandbox::Sandbox::spawn` は resource limit 指定時に one-shot per-launch cgroup を所有する。
 
-systemd の `KillMode=control-group` を deployment artifact で使う場合、それはservice managerがdaemon service全体をcleanupする方針であり、shbox sandbox implementationのcontroller delegationとは別の概念である。
+cgroup parent は auto-discovery（自身の cgroup から上位へ、必要 controller を `subtree_control` に有効化できる最初の階層）または `[sandbox] cgroup_parent` で明示指定できる。書き込み可能な cgroup 階層が無い場合、resource limit がある構成は fail closed する。
+
+明示 limit は parent/ancestor cgroup の制限に追加される制限であり、child が inherited cgroup restriction を解除または引き上げることはできない。
+
+systemd の `KillMode=control-group` を deployment artifact で使う場合、それはservice managerがdaemon service全体をcleanupする方針であり、per-sandbox cgroup delegationとは別の概念である。
 
 ### 2.7 Resource limits
 
-shboxはper-sandbox CPU/memory/PID/file quotaを提供しない。provider/service managerのresource controlsとsandbox confinementを混同しない。
+per-sandbox の memory/swap/PID/CPU quota は `[sandbox]` 設定（[configuration.md](configuration.md)）で付与する。無指定の分野は provider/service manager 側の resource controls を継承する（`Inherit`）。macOS では memory/PID のみがそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` に変換され、CPU quota と swap limit は startup で fail closed する。
 
 ### 2.8 Lifecycle containment limitation
 
-shboxはinitial sandbox session/process groupをownership unitとしてsignal/cleanupする。direct childにはparent-death behaviorも設定する。
+shboxはinitial sandbox session/process groupをownership unitとしてsignal/cleanupする。Linux の engine-owned direct child には parent-death behavior を設定する。PID namespace 有りではその direct child は内部 PID1 supervisor であり、通常の signal/wait API は PID1 経由で logical user PID2 を扱う。PID1 teardown は namespace 内の残processを kernel teardown へ委ねる。
 
 ただしdescendantが意図的に`setsid()`して別session/process groupへdetachすると、元process groupに対するlifecycle cleanupから外れ得る。これはcgroup tree containmentと同じ保証ではない。
 
@@ -109,7 +114,7 @@ Landlock等のconfinement継承とprocess lifecycle containmentは別軸であ�
 
 ### 3.1 Confinement
 
-macOS は parent process が Seatbelt profile を文字列として完全に生成し、固定system path `/usr/bin/sandbox-exec` をexecして適用する。
+macOS は parent process が Seatbelt profile を文字列として完全に生成し、固定 OS コンポーネント `/usr/bin/sandbox-exec` を exec して適用する。project-owned な外部 helper binary、sibling launcher、self-exec path は許可しない。
 
 profileはdeny-defaultで、validated policyから:
 
@@ -119,6 +124,8 @@ profileはdeny-defaultで、validated policyから:
 - configured network mode
 
 を構築する。
+
+`network = "disabled"` では network allow rule を出力しないため、macOS の Seatbelt path は network operation を許可しない。`outbound` は client-only TCP rule を出力する。macOS の resource limit は `memory_max`/`pids_max` を `RLIMIT_AS`/`RLIMIT_NPROC` に変換し、CPU quota/swap limit は startup で fail closed する。
 
 post-fork childで動的policy builderを呼ばない。
 
@@ -154,7 +161,7 @@ Milestone 8 CI evidence（run `33518661744`）:
 | macOS 15 arm64 | pass | pass | macOS `15.7.7`, Seatbelt smoke pass |
 | macOS 26 arm64 | build/native pass | pass | macOS `26.5.2`, Seatbelt smoke pass |
 
-Linux CIでは両architectureともnetwork/scoping capability=true、seccomp network fallback=Noneだった。
+Linux CIでは両architectureともLandlock network capability=trueだった（nono時代の記録。engine移行後のmatrixは各targetでverify scriptを再実行して更新する）。
 
 ### 4.1 Production-provider acceptance
 
@@ -167,7 +174,8 @@ generic hosted Linux gateはLinux implementationのnative proofだが、特定pr
 - supported native Linux architecture
 - Rust build artifact generated from locked dependencies
 - unprivileged dedicated service account
-- kernelがrequired nono policyをprepare/applyできること
+- kernelがLandlock ABI 4+（6.7+）を提供すること（filesystem/network policy 用）
+- resource limits を設定する場合: 書き込み可能な cgroup v2 階層（delegation）
 - safe XDG config/data/state directories
 - OpenSSH-facing listener bind capability
 

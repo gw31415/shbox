@@ -16,7 +16,7 @@ sandbox 内で実行される code は不正または buggy であり得る。sh
 - Ed25519 authentication keys
 - admin key と reserved host selector `_`
 - persistent XDG data/state roots
-- Linux nono/Landlock または macOS Seatbelt confinement
+- Linux Landlock/seccomp（shbox-sandbox engine）または macOS Seatbelt confinement
 
 詳細は [security.md](security.md) を参照する。
 
@@ -157,11 +157,11 @@ client EOFはnon-PTY stdinを閉じる。PTY EOFのためにshboxが勝手に`0x
 
 ## 9. Process cleanup
 
-normal exitではdirect childをreapし、owned process groupの残留processをcleanupする。
+normal exitではengine-owned direct childをreapする。Linux PID namespace無しではowned process groupの残留processをreap前にcleanupし、PID namespace有りでは内部PID1 supervisorがlogical user PID2とnamespace descendantをcleanupする。
 
 channel close、client disconnect、sandbox delete、daemon shutdownではgraceful termination後にforce-killへescalateする。
 
-Linux direct sandbox childにはparent-death behaviorが設定される。ただしprocess-group cleanupはcgroup tree containmentではない。descendantがdeliberateに`setsid()`してdetachした場合、元process groupのlifecycle ownershipから外れ得る。filesystem/network confinementの継承とprocess-tree cleanupの強度を同一視しない。
+Linux の engine-owned direct sandbox child には parent-death behavior が設定され、clone は process-lifetime spawn-owner thread が担当する。PID namespace 有りでは direct child は内部 PID1 supervisor となる。ただし PID namespace を使わない通常の process-group cleanup は cgroup tree containmentではない。descendantがdeliberateに`setsid()`してdetachした場合、元process groupのlifecycle ownershipから外れ得る。filesystem/network confinementの継承とprocess-tree cleanupの強度を同一視しない。
 
 ## 10. Network と filesystem
 
@@ -179,10 +179,10 @@ curated runtime/system pathsとoperatorの`read_paths`はread-onlyである。�
 
 `[sandbox] network`:
 
-- `disabled`: outbound TCPを含むnetwork accessをblocking policyで拒否する。
+- `disabled`: 全platformでhost/external network reachabilityを拒否する。Linuxのcurrent adapterはfresh user+network namespaceへ隔離し、さらにLandlockでTCP `bind`/`connect`を拒否する。macOSはdeny-default Seatbelt profileでnetwork operationを許可しない。
 - `outbound`: outbound client connectionを利用可能にする。destination allowlistやproxy policyではない。Linuxの現在のmappingはこれより広いsocket accessを許し得る一方、macOSはbind/inbound ruleを付与しないため、inbound listenerの可否をcross-platform contractとして依存してはならない。
 
-Linuxではnono/Landlockを使用し、必要な古いkernel capability差にはnonoが選択するseccomp fallbackだけを利用する。macOSではgenerated Seatbelt profileでpolicyを表す。
+Linuxではworkspace内のshbox-sandbox engine（clone3+pidfd/Landlock/seccomp/cgroup v2）を使用する。macOSではgenerated Seatbelt profileでpolicyを表す。Linuxのresource limitはcgroup v2、macOSの`memory_max`/`pids_max`はそれぞれ`RLIMIT_AS`/`RLIMIT_NPROC`で適用する。macOSのCPU quota/swap limitはunsupportedで、指定時はfail closedする。
 
 ## 11. Environment
 
@@ -204,8 +204,9 @@ v0.1は次を提供しない。
 - persistent rootfs image
 - sandbox attach API
 - UID/GID switching per sandbox
-- CPU/memory/PID/file-size/open-file quota
-- workspace quota
+- file-size/open-file quota
+- workspace disk quota
+- macOSのCPU quota/swap limit
 - port forwarding
 - SFTP
 - public backend/plugin selection

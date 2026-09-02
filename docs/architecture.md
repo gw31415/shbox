@@ -26,8 +26,8 @@ russh SSH/session layer
            |      controlling TTY, termios, resize
            |
            +--> OS confinement
-                  Linux: nono 0.74.0 / Landlock
-                         + nono-selected seccomp fallback
+                  Linux: shbox-sandbox engine
+                         (clone3+pidfd / Landlock / seccomp / cgroup v2)
                   macOS: generated Seatbelt profile
                          applied by /usr/bin/sandbox-exec
 ```
@@ -106,32 +106,38 @@ backend-neutral policy は一度だけ構築し、以下を保持する。
 - curated + configured read-only paths
 - operator sandbox environment
 - per-launch private temp root
+- configured per-sandbox resource limits with platform-specific enforcement
 
-CPU、memory、PID、file quota の sandbox resource limits は policy に存在しない。
+file-size、open-file、workspace disk quota は policy に存在しない。
 
 ### 4.3 Linux launcher
 
-Linux launcher は parent 側で filesystem/network capability set と nono policy を prepare する。child を作る前に path lookup、allocation、Landlock ABI detection を終える。
+Linux launcher は parent 側で shbox policy を engine の `SandboxConfig` へ解決し、engine が Landlock ruleset 構築・seccomp compile・必要な cgroup 作成をすべて child 生成前に終える。実際の `clone3` は process-lifetime の専用 spawn-owner thread が行い、`PR_SET_PDEATHSIG` が短命な caller thread に結び付かないようにする。PID namespace 無しでは user child が direct clone、PID namespace 有りでは direct clone が内部 PID1 supervisor/reaper となり user command はその PID2 child として動く。
 
 post-fork child が行うのは、事前準備済み data を使った raw/fixed operation に限定する。
 
-1. parent-death signal を設定し parent PID を再確認
-2. PTY なら fd 0/1/2 を slave に揃える
-3. `setsid()`
-4. PTY なら controlling terminal を取得
-5. workspace へ `chdir`
-6. prepared nono sandbox を raw apply
-7. target shell を `exec`
+1. parent-death signal を設定し namespace-aware に parent liveness を確認
+2. user/mount namespace の初期化
+3. PID namespace 有りなら内部 PID1 が user PID2 を nested clone（limit 時は `CLONE_INTO_CGROUP`）
+4. user process が PTY/pipes を fd 0/1/2 に揃え `setsid()` / controlling terminal / `chdir` を実施
+5. `no_new_privs` / capability / Landlock / seccomp / FD hygiene を適用
+6. target shell を `exec`
 
 child setup failure は CLOEXEC status pipe で stage/errno を parent に返し、client には generic launch failure を返す。
 
-nono 0.74.0 は library としてのみ利用する。外部 nono executable は不要である。
+confinement engine は workspace 内 crate `shbox-sandbox`（landlock 0.4 / seccompiler 0.5）である。Linux では project-owned な外部 sandbox executable、sibling helper、self-exec path を使わない。
 
 ### 4.4 macOS launcher
 
 macOS launcher は parent 側で deny-default Seatbelt profile を生成する。profile は workspace/private temp を writable、curated system/runtime paths を readable とし、network mode を shbox policy から決定する。
 
-PTY/session setup は shbox child setup が行い、その後 `/usr/bin/sandbox-exec -p <profile> <shell> ...` を exec する。別 helper や self-exec path はない。
+PTY/session setup は shbox child setup が行い、その後固定 OS コンポーネント `/usr/bin/sandbox-exec -p <profile> <shell> ...` を exec する。project-owned な別 helper や self-exec path はない。`/usr/bin/sandbox-exec` は macOS で許可された OS component であり、project artifact として配布する helper ではない。
+
+### 4.5 Network and resource semantics
+
+現在の shbox Linux adapter は `network = "disabled"` を fresh user+network namespace に写像し、host/external network reachability を切り離す。child は exec 前に capability を drop するため、sandboxed program は初期状態で down の loopback を有効化できない。さらに Landlock の network rights（ABI 4+）で TCP `bind`/`connect` も deny する。`outbound` は host network namespace を共有する。
+
+resource limit を指定した public shbox Linux launch は、`SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch で共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初からその domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に release/remove する。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。明示 limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。macOS は `memory_max` を `RLIMIT_AS`、`pids_max` を `RLIMIT_NPROC` として exec 前に適用し、CPU quota と swap limit は unsupported として fail closed する。
 
 ## 5. Startup and readiness
 
@@ -164,7 +170,7 @@ owner だけが通常の shell/exec と delete を行える。admin は管理 ro
 
 launch ごとの disposable state:
 
-- direct child + process group/session
+- engine-owned direct child + logical user process group/session（PID namespace 有りでは direct child は内部 PID1、user process は PID2）
 - PTY master/slave（PTY request 時）
 - stdin/stdout/stderr pipes（non-PTY 時）
 - private `TMPDIR`
@@ -190,11 +196,11 @@ interactive shell の job control、Ctrl-C、Ctrl-Z、`jobs`/`fg`/`bg` は OS �
 
 ## 9. Process control and cleanup
 
-normal completion では direct child を必ず一度 reap し、残る owned process group を force-cleanup して private temp を削除する。
+normal completion では engine-owned direct child を必ず一度 reap する。PID namespace 無しでは reap 前に残る owned process group を force-cleanup する。PID namespace 有りでは内部 PID1 が user PID2 の status を返し、残descendantを停止/reapしてから終了する。最後に private temp を削除する。
 
 channel close/client disconnect/delete/daemon shutdown では managed process groupへ graceful termination を送り、grace period 後に kill へ escalate する。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task が disconnect を観測できるようにする。
 
-Linux direct sandbox child は parent-death signal を設定するため daemon の abrupt deathでも direct child cleanupを補助する。
+Linux の engine-owned direct sandbox child には parent-death signal を設定し、その clone は process-lifetime spawn-owner thread が担当する。ただし daemon の abrupt death 時に orphan process や durable resource domain を cleanup する保証とは扱わない。
 
 ### 9.1 重要な containment limit
 
@@ -212,6 +218,8 @@ delete は runtime と persistent state の競合を避ける。
 4. workspace tree を安全に削除
 5. metadata を削除
 6. global reservation を解放
+
+resource limit を使う Linux sandbox では、child exit だけでは `SandboxId` の durable resource domain を削除しない。runtime cancellation と child cleanup の完了後、この delete path が domain を release/remove する。
 
 途中 crash では `Deleting` record が restart 後の再開点になる。target workspace が既に無い場合も idempotent に完了する。
 

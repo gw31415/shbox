@@ -1,76 +1,75 @@
-//! macOS production launcher using shbox-owned process/PTY lifecycle and Seatbelt.
+//! macOS production launcher: shbox policy on the `shbox-sandbox` engine.
 //!
-//! The Seatbelt profile is generated completely in the parent. The post-fork
-//! child performs only the fixed terminal/session and chdir operations before
-//! exec'ing `/usr/bin/sandbox-exec`; no allocating sandbox API is called there.
+//! The engine crate owns the Seatbelt profile generation and the
+//! fork/exec/hygiene chain; this adapter owns the SSH-facing lifecycle
+//! (PTY, session, I/O plumbing, waiter thread) exactly like the Linux one.
+//! macOS is best-effort development isolation: see the engine crate docs
+//! for the platform's security posture.
 
 #![cfg(target_os = "macos")]
 
-use std::collections::BTreeSet;
 use std::fmt;
-use std::fmt::Write as _;
 use std::fs;
-use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::policy::{LaunchTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
-use super::terminal::{PtyIo, PtyPair, child_session_setup, duplicate_fd};
+use shbox_sandbox::{
+    CommandSpec, Sandbox, SandboxConfig as EngineConfig, SandboxError, SessionSetup, Stdio,
+};
+
+use super::policy::{
+    CURATED_READ_PATHS, LaunchTemp, ReadPathClass, SandboxLaunchPolicy, login_shell_argv0,
+    validated_shell_command,
+};
+use super::terminal::{PtyIo, PtyPair, duplicate_fd};
 use super::{
     LaunchError, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessReader,
     ProcessWriter, RunningProcess,
 };
+#[cfg(test)]
 use crate::config::NetworkMode;
+#[cfg(test)]
+use crate::config::SandboxResources;
 
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-/// Fixed system shell that installs the login `argv[0]` for sandbox shell
-/// requests; sandbox-exec itself always derives its child's `argv[0]` from
-/// the command path. `/bin` is executable inside every sandbox profile.
-const LOGIN_WRAPPER_SHELL: &str = "/bin/sh";
 const PROCESS_GROUP_SETTLE: Duration = Duration::from_secs(1);
 
-/// Process-lifetime macOS launcher. Seatbelt is only the confinement layer;
-/// shbox owns every process and terminal resource around it.
+/// macOS launcher backed by the engine's Seatbelt backend and the
+/// process-lifetime shbox policy snapshot.
 pub(crate) struct MacosLauncher {
     policy: SandboxLaunchPolicy,
+    engine: Sandbox,
 }
 
 impl fmt::Debug for MacosLauncher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MacosLauncher")
             .field("policy", &self.policy)
-            .field("wrapper", &SANDBOX_EXEC)
+            .field("capabilities", self.engine.capabilities())
             .finish()
     }
 }
 
 impl MacosLauncher {
     pub(crate) fn new(policy: SandboxLaunchPolicy) -> Result<Self, LaunchError> {
-        let metadata = fs::metadata(SANDBOX_EXEC).map_err(|_| {
-            LaunchError::new("sandbox process adapter unavailable: sandbox-exec is missing")
-        })?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        let engine = Sandbox::detect();
+        if !engine.capabilities().seatbelt_available {
             return Err(LaunchError::new(
-                "sandbox process adapter unavailable: sandbox-exec is not executable",
+                "sandbox process adapter unavailable: /usr/bin/sandbox-exec is missing",
             ));
         }
-        Ok(Self { policy })
-    }
-
-    fn profile_for(
-        &self,
-        workspace: &Path,
-        launch_temp: &Path,
-        pty: bool,
-    ) -> Result<String, LaunchError> {
-        build_seatbelt_profile(&self.policy, workspace, launch_temp, pty)
+        if policy.resources().cpu_quota_micros.is_some() {
+            return Err(LaunchError::new(
+                "sandbox process adapter unavailable: CPU quota cannot be enforced on macOS",
+            ));
+        }
+        if policy.resources().swap_bytes.is_some() {
+            return Err(LaunchError::new(
+                "sandbox process adapter unavailable: swap limit cannot be enforced on macOS",
+            ));
+        }
+        Ok(Self { policy, engine })
     }
 }
 
@@ -81,24 +80,47 @@ impl ProcessLauncher for MacosLauncher {
         if !workspace.is_dir() {
             return Err(LaunchError::new("sandbox workspace is unavailable"));
         }
-
         let launch_temp = self.policy.create_launch_temp()?;
+        // Resolve through symlinks once: the confinement rules and the
+        // TMPDIR the child sees must name the same canonical directory.
         let launch_temp_path = fs::canonicalize(launch_temp.path())
             .map_err(|_| LaunchError::new("sandbox launch temp directory became unavailable"))?;
-        let is_pty = request.pty.is_some();
-        let profile = self.profile_for(&workspace, &launch_temp_path, is_pty)?;
-        let workspace_c = std::ffi::CString::new(workspace.as_os_str().as_bytes())
-            .map_err(|_| LaunchError::new("sandbox workspace path contains NUL"))?;
-        let command_arg = validated_shell_command(&request.operation)?;
-        let environment = self.policy.environment_for(
-            &workspace,
-            request.pty.as_ref().map(|pty| pty.term.as_str()),
-            Some(&launch_temp_path),
-        );
+        let mut config: EngineConfig = self.policy.engine_config(&workspace, &launch_temp_path);
+        promote_runtime_grants(&mut config, &self.policy);
 
-        // Darwin lacks pipe2(O_CLOEXEC). Hold the process-wide spawn lock from
-        // descriptor creation through fork/exec so no concurrent child can
-        // inherit the short-lived pipe/PTY descriptors.
+        let mut command = CommandSpec::new(self.policy.shell());
+        match validated_shell_command(&request.operation)? {
+            Some(command_arg) => {
+                // The raw command bytes are the single `-c` argument; this is
+                // not a login shell.
+                command = command.arg("-c").arg(command_arg);
+            }
+            None => {
+                // Login mode without a shell-specific option: sshd's leading
+                // `-` argv[0] convention.
+                command.argv0 = Some(login_shell_argv0(self.policy.shell())?);
+            }
+        }
+        let env = self
+            .policy
+            .environment_for(
+                &workspace,
+                request.pty.as_ref().map(|pty| pty.term.as_str()),
+                Some(&launch_temp_path),
+            )
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    std::ffi::OsString::from(name),
+                    std::ffi::OsString::from(value),
+                )
+            })
+            .collect();
+        command.cwd = Some(workspace);
+        command.env = env;
+
+        // Darwin lacks an atomic pipe2(O_CLOEXEC) surface; hold the
+        // process-wide spawn lock from descriptor creation through fork.
         let _spawn_guard = super::process_spawn_lock()
             .lock()
             .map_err(|_| LaunchError::new("sandbox process adapter is unavailable"))?;
@@ -120,84 +142,26 @@ impl ProcessLauncher for MacosLauncher {
             None
         };
 
-        let (stdin_child, stdin_parent) = if is_pty {
-            (None, None)
+        if let Some(setup) = setup_fd.as_ref() {
+            command.stdin = Stdio::Fd(setup.as_raw_fd());
+            command.stdout = Stdio::Fd(setup.as_raw_fd());
+            command.stderr = Stdio::Fd(setup.as_raw_fd());
+            command.session = SessionSetup::NewSessionWithControllingTerminal;
         } else {
-            let (read, write) = make_pipe("sandbox stdin pipe creation failed")?;
-            (Some(read), Some(write))
-        };
-        let (stdout_parent, stdout_child) = if is_pty {
-            (None, None)
-        } else {
-            let (read, write) = make_pipe("sandbox stdout pipe creation failed")?;
-            (Some(read), Some(write))
-        };
-        let (stderr_parent, stderr_child) = if is_pty {
-            (None, None)
-        } else {
-            let (read, write) = make_pipe("sandbox stderr pipe creation failed")?;
-            (Some(read), Some(write))
-        };
-        let setup_raw = setup_fd.as_ref().map(AsRawFd::as_raw_fd);
-
-        let mut command = Command::new(SANDBOX_EXEC);
-        command.arg("-p").arg(profile);
-        match command_arg {
-            Some(command_arg) => {
-                // The raw command bytes are the single `-c` argument; this is
-                // not a login shell.
-                command.arg(self.policy.shell()).arg("-c").arg(command_arg);
-            }
-            None => {
-                // sandbox-exec derives the child's argv[0] from the command
-                // path, so the shell cannot receive a leading-`-` argv[0]
-                // through it directly. A fixed /bin/sh exec hop installs the
-                // sshd-style login argv[0] with no shell-specific option;
-                // `exec` keeps the same PID, so the configured shell remains
-                // the process shbox reaps and signals.
-                let argv0 = login_shell_argv0(self.policy.shell())?;
-                let shell = self.policy.shell().display().to_string();
-                command.arg(LOGIN_WRAPPER_SHELL).arg("-c").arg(format!(
-                    "exec -a {} {}",
-                    sh_single_quote(&argv0.to_string_lossy()),
-                    sh_single_quote(&shell),
-                ));
-            }
-        }
-        command.env_clear();
-        command.envs(environment.iter().map(|(name, value)| (name, value)));
-        if !is_pty {
-            command.stdin(Stdio::from(stdin_child.expect("non-PTY stdin child")));
-            command.stdout(Stdio::from(stdout_child.expect("non-PTY stdout child")));
-            command.stderr(Stdio::from(stderr_child.expect("non-PTY stderr child")));
+            command.stdin = Stdio::Pipe;
+            command.stdout = Stdio::Pipe;
+            command.stderr = Stdio::Pipe;
+            command.session = SessionSetup::NewSession;
         }
 
-        // SAFETY: all captured values were allocated in the parent. The child
-        // only performs fixed raw syscalls plus the audited terminal helper;
-        // Seatbelt itself is applied by sandbox-exec after exec.
-        unsafe {
-            command.pre_exec(move || {
-                if let Some(setup_raw) = setup_raw {
-                    child_session_setup(setup_raw, true)
-                        .map_err(|error| io::Error::from_raw_os_error(error.errno))?;
-                } else if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::chdir(workspace_c.as_ptr()) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let child = command
-            .spawn()
-            .map_err(|_| LaunchError::new("sandbox process launch failed"))?;
+        // The engine returns only after the Seatbelt launcher exec'd with
+        // the profile applied; failures already cleaned up.
+        let mut child = self
+            .engine
+            .spawn(command, config)
+            .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
         let pid = child.id();
 
-        // fork completed; child-only descriptor copies are no longer needed in
-        // the daemon. Production PTY ownership retains only the master.
-        drop(setup_fd);
         let (stdin, stdout, stderr, lifecycle_fd) = if let Some(pair) = pty_pair.take() {
             let master = pair.into_master();
             let read_fd = duplicate_fd(master.as_raw_fd())
@@ -216,9 +180,9 @@ impl ProcessLauncher for MacosLauncher {
             )
         } else {
             (
-                Some(async_writer(stdin_parent.expect("non-PTY stdin parent"))),
-                Some(async_reader(stdout_parent.expect("non-PTY stdout parent"))),
-                Some(async_reader(stderr_parent.expect("non-PTY stderr parent"))),
+                child.take_stdin().map(async_writer),
+                child.take_stdout().map(async_reader),
+                child.take_stderr().map(async_reader),
                 None,
             )
         };
@@ -231,14 +195,6 @@ impl ProcessLauncher for MacosLauncher {
             .spawn(move || wait_process(child, wait_control, launch_temp, wait_tx));
         if spawn_result.is_err() {
             control.force_terminate();
-            // The failed thread spawn dropped the Child handle, but the direct
-            // process is still ours. Reap it explicitly by PID.
-            unsafe {
-                let mut status = 0;
-                while libc::waitpid(pid as libc::pid_t, &mut status, 0) == -1
-                    && raw_errno() == libc::EINTR
-                {}
-            }
             control.mark_cleanup_complete();
             return Err(LaunchError::new(
                 "sandbox process waiter could not be started",
@@ -256,267 +212,71 @@ impl ProcessLauncher for MacosLauncher {
     }
 }
 
-fn build_seatbelt_profile(
-    policy: &SandboxLaunchPolicy,
-    workspace: &Path,
-    launch_temp: &Path,
-    pty: bool,
-) -> Result<String, LaunchError> {
-    let read_paths = policy.resolved_read_paths();
-    let mut write_paths = policy.curated_write_paths();
-    write_paths.push(workspace.to_path_buf());
-    write_paths.push(launch_temp.to_path_buf());
-
-    let mut profile = String::with_capacity(8192);
-    writeln!(&mut profile, "(version 1)").expect("write profile");
-    writeln!(&mut profile, "(deny default)").expect("write profile");
-
-    // Process/session behavior mirrors nono 0.74's macOS policy: fork/exec,
-    // self + same-sandbox process inspection, and same-sandbox signaling.
-    writeln!(&mut profile, "(allow process-fork)").expect("write profile");
-    writeln!(&mut profile, "(allow process-info* (target self))").expect("write profile");
-    writeln!(&mut profile, "(allow process-info* (target same-sandbox))").expect("write profile");
-    writeln!(&mut profile, "(allow signal (target self))").expect("write profile");
-    writeln!(&mut profile, "(allow signal (target same-sandbox))").expect("write profile");
-
-    writeln!(&mut profile, "(allow sysctl-read)").expect("write profile");
-    writeln!(&mut profile, "(allow system-fsctl)").expect("write profile");
-    writeln!(&mut profile, "(allow system-info)").expect("write profile");
-
-    // Basic macOS Mach/IPC services required by ordinary command runtimes.
-    // Keep the compatibility-oriented lookup baseline from nono, but deny the
-    // credential-bearing security services explicitly.
-    writeln!(&mut profile, "(allow mach-lookup)").expect("write profile");
-    for service in [
-        "com.apple.SecurityServer",
-        "com.apple.securityd",
-        "com.apple.security.keychaind",
-        "com.apple.secd",
-        "com.apple.security.agent",
-    ] {
-        writeln!(
-            &mut profile,
-            "(deny mach-lookup (global-name \"{}\"))",
-            service
-        )
-        .expect("write profile");
-    }
-    writeln!(&mut profile, "(allow mach-per-user-lookup)").expect("write profile");
-    writeln!(&mut profile, "(allow mach-task-name)").expect("write profile");
-    writeln!(&mut profile, "(deny mach-priv*)").expect("write profile");
-
-    writeln!(&mut profile, "(allow ipc-posix-shm-read-data)").expect("write profile");
-    writeln!(&mut profile, "(allow ipc-posix-shm-write-data)").expect("write profile");
-    writeln!(&mut profile, "(allow ipc-posix-shm-write-create)").expect("write profile");
-
-    // dyld/path traversal needs root metadata plus every ancestor of an
-    // explicitly granted path. Ancestors receive metadata only.
-    writeln!(&mut profile, "(allow file-read* (literal \"/\"))").expect("write profile");
-    let mut ancestors = BTreeSet::new();
-    for path in read_paths.iter().chain(write_paths.iter()) {
-        let mut current = path.parent();
-        while let Some(parent) = current {
-            if parent == Path::new("/") || parent.as_os_str().is_empty() {
-                break;
-            }
-            ancestors.insert(parent.to_path_buf());
-            current = parent.parent();
-        }
-    }
-    for ancestor in ancestors {
-        append_path_filter_rule(&mut profile, "file-read-metadata", "literal", &ancestor)?;
-    }
-
-    for path in &read_paths {
-        append_existing_path_rule(&mut profile, "file-read*", path)?;
-        append_existing_path_rule(&mut profile, "file-map-executable", path)?;
-        append_existing_path_rule(&mut profile, "process-exec*", path)?;
-    }
-    for path in &write_paths {
-        append_existing_path_rule(&mut profile, "file-read*", path)?;
-        append_existing_path_rule(&mut profile, "file-write*", path)?;
-        append_existing_path_rule(&mut profile, "file-map-executable", path)?;
-        append_existing_path_rule(&mut profile, "process-exec*", path)?;
-    }
-
-    if pty {
-        writeln!(&mut profile, "(allow pseudo-tty)").expect("write profile");
-        writeln!(&mut profile, "(allow file-read* (literal \"/dev/tty\"))").expect("write profile");
-        writeln!(&mut profile, "(allow file-write* (literal \"/dev/tty\"))")
-            .expect("write profile");
-        writeln!(&mut profile, "(allow file-ioctl (literal \"/dev/tty\"))").expect("write profile");
-        writeln!(
-            &mut profile,
-            "(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"
-        )
-        .expect("write profile");
-        writeln!(
-            &mut profile,
-            "(allow file-ioctl (regex #\"^/dev/pty[a-z][0-9a-f]+$\"))"
-        )
-        .expect("write profile");
-    }
-
-    match policy.network() {
-        NetworkMode::Disabled => {}
-        NetworkMode::Outbound => append_outbound_network_profile(&mut profile)?,
-    }
-
-    Ok(profile)
-}
-
-fn append_outbound_network_profile(profile: &mut String) -> Result<(), LaunchError> {
-    // Client-only TCP: no network-bind/network-inbound rule is emitted.
-    writeln!(
-        profile,
-        "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))"
-    )
-    .expect("write profile");
-    writeln!(
-        profile,
-        "(allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))"
-    )
-    .expect("write profile");
-    writeln!(
-        profile,
-        "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))"
-    )
-    .expect("write profile");
-    writeln!(profile, "(allow network-outbound (remote tcp))").expect("write profile");
-    writeln!(
-        profile,
-        "(allow network-outbound (path \"/private/var/run/mDNSResponder\"))"
-    )
-    .expect("write profile");
-    writeln!(
-        profile,
-        "(allow network-outbound (path \"/var/run/mDNSResponder\"))"
-    )
-    .expect("write profile");
-
-    // Network.framework / CFNetwork consult these files on current macOS.
-    for path in [
-        Path::new("/Library/Preferences/com.apple.networkd.plist"),
-        Path::new("/private/var/db/nsurlstoraged/dafsaData.bin"),
-    ] {
-        if path.exists() {
-            append_existing_path_rule(profile, "file-read*", path)?;
-        }
-    }
-    Ok(())
-}
-
-fn append_existing_path_rule(
-    profile: &mut String,
-    operation: &str,
-    path: &Path,
-) -> Result<(), LaunchError> {
-    let metadata = fs::metadata(path)
-        .map_err(|_| LaunchError::new("sandbox Seatbelt path became unavailable"))?;
-    let filter = if metadata.is_dir() {
-        "subpath"
-    } else {
-        "literal"
+/// The engine keeps filesystem tiers distinct on macOS. Promote only the
+/// shell and curated executable/runtime paths from the policy adapter's
+/// read-only list; operator-provided data paths remain read-only.
+fn promote_runtime_grants(config: &mut EngineConfig, policy: &SandboxLaunchPolicy) {
+    let shbox_sandbox::FilesystemPolicy::Restricted {
+        read_only, execute, ..
+    } = &mut config.filesystem
+    else {
+        return;
     };
-    append_path_filter_rule(profile, operation, filter, path)
-}
 
-fn append_path_filter_rule(
-    profile: &mut String,
-    operation: &str,
-    filter: &str,
-    path: &Path,
-) -> Result<(), LaunchError> {
-    let escaped = seatbelt_escape_path(path)?;
-    writeln!(
-        profile,
-        "(allow {} ({} \"{}\"))",
-        operation, filter, escaped
-    )
-    .expect("write profile");
-    Ok(())
-}
-
-fn seatbelt_escape_path(path: &Path) -> Result<String, LaunchError> {
-    let value = path
-        .to_str()
-        .ok_or_else(|| LaunchError::new("sandbox path is not valid UTF-8 for Seatbelt"))?;
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                return Err(LaunchError::new(
-                    "sandbox path contains a control character unsupported by Seatbelt",
-                ));
-            }
-            character => escaped.push(character),
+    let shell = fs::canonicalize(policy.shell()).unwrap_or_else(|_| policy.shell().to_path_buf());
+    let read_rules = std::mem::take(read_only);
+    for rule in read_rules {
+        let is_runtime = rule.path == shell
+            || CURATED_READ_PATHS.iter().any(|(path, class)| {
+                *class == ReadPathClass::ExecutableRuntime
+                    && fs::canonicalize(path).is_ok_and(|runtime| runtime == rule.path)
+            });
+        if is_runtime {
+            execute.push(rule);
+        } else {
+            read_only.push(rule);
         }
     }
-    Ok(escaped)
 }
 
-/// Single-quote a value so `/bin/sh` passes it through verbatim inside the
-/// login wrapper command string.
-fn sh_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn make_pipe(message: &'static str) -> Result<(OwnedFd, OwnedFd), LaunchError> {
-    let (read, write) = nix::unistd::pipe().map_err(|_| LaunchError::new(message))?;
-    set_cloexec(&read, message)?;
-    set_cloexec(&write, message)?;
-    Ok((read, write))
-}
-
-fn set_cloexec(fd: &OwnedFd, message: &'static str) -> Result<(), LaunchError> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: fcntl operates on the owned descriptor and only changes FD flags.
-    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
-    if flags == -1 {
-        return Err(LaunchError::new(message));
+/// Render an engine failure for the SSH-facing launch error.
+fn describe_engine_error(error: &SandboxError) -> String {
+    match error {
+        SandboxError::Setup {
+            stage,
+            detail,
+            errno,
+        } => format!(
+            "sandbox child setup failed at {stage:?} (detail {detail}, errno {})",
+            errno
+                .map(|errno| errno.to_string())
+                .unwrap_or_else(|| "n/a".into())
+        ),
+        other => format!("sandbox launch failed: {other}"),
     }
-    // SAFETY: raw is still owned and valid for this call.
-    if unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(LaunchError::new(message));
-    }
-    Ok(())
 }
 
 fn wait_process(
-    mut child: Child,
+    mut child: shbox_sandbox::SandboxChild,
     control: Arc<MacosProcessControl>,
     launch_temp: LaunchTemp,
     wait_tx: tokio::sync::oneshot::Sender<Result<ProcessExit, LaunchError>>,
 ) {
     let result = match child.wait() {
-        Ok(status) => {
-            control.finished.store(true, Ordering::Release);
-            kill_process_group(control.pid, libc::SIGKILL);
-            wait_process_group_gone(control.pid, PROCESS_GROUP_SETTLE);
-            let exit = if let Some(code) = status.code() {
-                ProcessExit::Code(code)
-            } else if let Some(number) = status.signal() {
-                ProcessExit::Signal {
-                    number,
-                    core_dumped: status.core_dumped(),
-                }
-            } else {
-                ProcessExit::Code(255)
-            };
-            Ok(exit)
-        }
-        Err(_) => {
-            control.finished.store(true, Ordering::Release);
-            kill_process_group(control.pid, libc::SIGKILL);
-            wait_process_group_gone(control.pid, PROCESS_GROUP_SETTLE);
-            Err(LaunchError::new("sandbox process wait failed"))
-        }
+        Ok(status) => Ok(if let Some(code) = status.code() {
+            ProcessExit::Code(code)
+        } else if let Some(number) = status.signal() {
+            ProcessExit::Signal {
+                number,
+                core_dumped: status.core_dumped(),
+            }
+        } else {
+            ProcessExit::Code(255)
+        }),
+        Err(_) => Err(LaunchError::new("sandbox process wait failed")),
     };
+    kill_process_group(control.pid, libc::SIGKILL);
+    wait_process_group_gone(control.pid, PROCESS_GROUP_SETTLE);
     drop(launch_temp);
     control.mark_cleanup_complete();
     let _ = wait_tx.send(result);
@@ -526,7 +286,8 @@ fn kill_process_group(pid: u32, signal: i32) {
     if pid <= 1 {
         return;
     }
-    // SAFETY: child calls setsid before exec, so its PID is its process-group ID.
+    // SAFETY: child calls setsid before exec, so its PID is its
+    // process-group ID.
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);
     }
@@ -537,16 +298,11 @@ fn wait_process_group_gone(pid: u32, timeout: Duration) {
     while Instant::now() < deadline {
         // SAFETY: signal zero only probes group existence/permission.
         let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-        if result == -1 && raw_errno() == libc::ESRCH {
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn raw_errno() -> i32 {
-    // SAFETY: __error returns the calling thread's errno slot on Darwin.
-    unsafe { *libc::__error() }
 }
 
 struct MacosProcessControl {
@@ -673,13 +429,11 @@ impl RunningProcess for MacosProcessControl {
     }
 }
 
-fn async_reader(fd: OwnedFd) -> ProcessReader {
-    let file: std::fs::File = fd.into();
+fn async_reader(file: std::fs::File) -> ProcessReader {
     Box::new(tokio::fs::File::from_std(file))
 }
 
-fn async_writer(fd: OwnedFd) -> ProcessWriter {
-    let file: std::fs::File = fd.into();
+fn async_writer(file: std::fs::File) -> ProcessWriter {
     Box::new(tokio::fs::File::from_std(file))
 }
 
@@ -687,17 +441,43 @@ fn async_writer(fd: OwnedFd) -> ProcessWriter {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::Path;
     use tokio::io::AsyncReadExt;
 
     fn test_policy(root: &Path, network: NetworkMode) -> SandboxLaunchPolicy {
+        test_policy_with_resources(root, network, SandboxResources::default())
+    }
+
+    fn test_policy_with_resources(
+        root: &Path,
+        network: NetworkMode,
+        resources: SandboxResources,
+    ) -> SandboxLaunchPolicy {
         SandboxLaunchPolicy::from_parts(
-            PathBuf::from("/bin/sh"),
+            "/bin/sh".into(),
             network,
             Vec::new(),
             BTreeMap::new(),
             root.to_path_buf(),
+            resources,
+            None,
         )
+    }
+
+    #[test]
+    fn supported_rlimit_resources_are_accepted_by_launcher() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let resources = SandboxResources {
+            memory_bytes: Some(2 * 1024 * 1024 * 1024),
+            pids: Some(64),
+            ..SandboxResources::default()
+        };
+        MacosLauncher::new(test_policy_with_resources(
+            root.path(),
+            NetworkMode::Disabled,
+            resources,
+        ))
+        .expect("memory and PID RLIMITs are supported on macOS");
     }
 
     fn request(workspace: &Path, command: &str, pty: bool) -> LaunchRequest {
@@ -713,48 +493,6 @@ mod tests {
                 window_revision: 7,
             }),
         }
-    }
-
-    #[test]
-    fn profile_is_deny_default_and_scopes_write_and_network() {
-        let root = tempfile::tempdir().expect("runtime root");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let temp = tempfile::tempdir().expect("launch temp");
-        let disabled = build_seatbelt_profile(
-            &test_policy(root.path(), NetworkMode::Disabled),
-            workspace.path(),
-            temp.path(),
-            true,
-        )
-        .expect("disabled profile");
-        assert!(disabled.contains("(deny default)"));
-        assert!(disabled.contains("(allow pseudo-tty)"));
-        assert!(disabled.contains("(allow signal (target same-sandbox))"));
-        assert!(!disabled.contains("(allow file-write* (subpath \"/\"))"));
-        assert!(!disabled.contains("(allow network-outbound (remote tcp))"));
-
-        let outbound = build_seatbelt_profile(
-            &test_policy(root.path(), NetworkMode::Outbound),
-            workspace.path(),
-            temp.path(),
-            false,
-        )
-        .expect("outbound profile");
-        assert!(outbound.contains("(allow network-outbound (remote tcp))"));
-        assert!(!outbound.contains("(allow network-bind)"));
-        assert!(!outbound.contains("(allow network-inbound)"));
-    }
-
-    #[test]
-    fn seatbelt_path_escaping_cannot_inject_a_rule() {
-        let escaped =
-            seatbelt_escape_path(Path::new("/tmp/x\"\n(allow default)")).expect("escaped path");
-        assert!(escaped.contains("\\\""), "escaped path: {escaped:?}");
-        assert!(escaped.contains("\\n"), "escaped path: {escaped:?}");
-        assert!(
-            !escaped.contains('\n'),
-            "escaped path contains a raw newline"
-        );
     }
 
     #[tokio::test]
@@ -982,23 +720,6 @@ mod tests {
             }
         );
         assert!(launched.control.wait_for_cleanup(Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn wrapper_is_fixed_to_system_sandbox_exec() {
-        assert_eq!(SANDBOX_EXEC, "/usr/bin/sandbox-exec");
-        assert!(Path::new(SANDBOX_EXEC).is_absolute());
-    }
-
-    #[test]
-    fn login_wrapper_quotes_values_for_bin_sh() {
-        assert_eq!(sh_single_quote("-sh"), "'-sh'");
-        assert_eq!(
-            sh_single_quote("/opt/sh'ells/zsh"),
-            "'/opt/sh'\\''ells/zsh'"
-        );
-        assert_eq!(LOGIN_WRAPPER_SHELL, "/bin/sh");
-        assert!(Path::new(LOGIN_WRAPPER_SHELL).is_absolute());
     }
 
     /// The exec payload is an opaque byte string: a non-UTF-8 command must

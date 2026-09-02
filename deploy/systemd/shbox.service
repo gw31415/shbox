@@ -13,7 +13,12 @@ ExecStart=/usr/local/bin/shbox --listen tcp://0.0.0.0:22 --log-level info
 Restart=on-failure
 RestartSec=2s
 # KillMode=control-group is a systemd service-manager cleanup choice only.
-# shbox itself neither requires delegated controllers nor writes cgroupfs.
+# shbox writes cgroupfs solely when [sandbox] resource limits are configured;
+# delegate the unit subtree so shbox can own its sandbox cgroups. The service
+# process stays in a leaf while the delegated unit cgroup remains an internal
+# node for shbox's sandbox subtree.
+Delegate=yes
+DelegateSubgroup=daemon
 KillMode=control-group
 TimeoutStopSec=10s
 UMask=0077

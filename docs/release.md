@@ -31,7 +31,7 @@ Fly Machinesでのproduction acceptanceは2026-09-02に実施したが、ゲス�
 
 Linux native jobs reported:
 
-- nono `0.74.0`
+- landlock `0.4` / seccompiler `0.5`（shbox-sandbox engine）
 - Landlock ABI V6
 - network support available
 - signal/IPC scoping available
@@ -68,13 +68,13 @@ scriptは次をfail-closedで確認する。
 - native target
 - non-root execution
 - Rust 1.95
-- pinned nono 0.74.0
+- pinned landlock 0.4 / seccompiler 0.5
 - real Landlock capability probe
 - locked release build
 - full OpenSSH/PTTY acceptance
 - `cargo check --all-targets`
 
-control-group delegationは前提ではない。`/proc/self/cgroup` は任意の環境診断としてのみ表示する。
+resource limit を設定しない sandbox launch では control-group delegation は前提ではない。resource limit を設定する場合は、書き込み可能な cgroup v2 parent が必要で、`/proc/self/cgroup` はその capability 診断として表示する。
 
 ### macOS
 
@@ -119,7 +119,7 @@ release-blocking項目:
 
 ## 6. Linux confinement release contract
 
-Linux sandboxはnono `0.74.0`をlibraryとして利用する。nono executableはdeploy artifactに不要である。
+Linux sandboxはworkspace内crate `shbox-sandbox`（landlock `0.4` / seccompiler `0.5`）を利用する。外部sandbox executableはdeploy artifactに不要である。
 
 release時に確認する契約:
 
@@ -127,11 +127,11 @@ release時に確認する契約:
 - workspaceとlaunch tempだけがrequest-local write grantを持つ
 - selected outside readが拒否される
 - outside writeが拒否される
-- `network = "disabled"` で実TCP connectが拒否される
+- `network = "disabled"` でfresh network namespaceが使われ、実TCP `connect()`と実UDP送信のhost/external reachabilityが拒否される
 - `network = "outbound"` でcontrolled client endpointへの接続が成功する（portableなinbound behaviorは要求しない）
-- sandbox launchはcontrol-group delegationを必要としない
+- resource limit 無指定時は sandbox launch が control-group delegation を必要としない
 
-shboxはCPU/memory/PID quotaをsandbox featureとして提供しない。process group cleanupを完全なprocess-tree containmentとして表現しない。
+Linuxでは設定した memory/swap/PID/CPU limit を cgroup v2 で適用し、macOSでは memory/PID limit をそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` で適用する。macOSのCPU quota/swap limitは指定時にfail closedする。process group cleanupを完全なprocess-tree containmentとして表現しない。
 
 ## 7. macOS confinement release contract
 
@@ -142,6 +142,7 @@ release時に確認する契約:
 - `sandbox-exec`が対象OSで利用可能
 - deny/allow smokeが実際にenforceされる
 - workspace/temp writeとsystem runtime readが必要最小限で成立する
+- `memory_max`/`pids_max` は rlimit として適用され、`cpu_quota_micros`/`swap_max` は fail closed する
 - PTY allocation/session/job-controlはshbox-owned pathで成立する
 - self-exec wrapperは存在しない
 
@@ -181,9 +182,9 @@ runtime proof:
 12. PTY/session non-reuse isolation
 13. SSH disconnect cleanup
 14. graceful shbox shutdown cleanup
-15. Linux daemon SIGKILL時のdirect child parent-death behavior
+15. Linux daemon SIGKILL時のengine-owned direct child parent-death behavior（clone ownerがprocess-lifetime threadであることを含む）
 16. deliberately detached new-session descendantの挙動記録
-17. sandbox launchがwritable control-group controller filesを必要としないこと
+17. resource limit 無指定の sandbox launch が writable control-group controller files を必要とせず、resource limit 指定時だけ delegated cgroup v2 files を使うこと
 
 このacceptanceはfilesystem/network grantを文書化されたpolicyより広げて通してはならない。
 
@@ -196,7 +197,7 @@ Fly Machines上でproduction acceptanceを試みたが、成功しなかった�
 結果:
 
 - ゲストカーネルは `6.12.105-fly`。`landlock_create_ruleset` が `ENOSYS` を返す（`Seccomp: 0`でフィルタによる隠蔽ではない）。Landlock LSMが無効なため `production_launcher` preflightは失敗し、sandbox launchはすべてfail-closedになった。設計どおりfallbackやpolicy拡張は行わず、この事実を記録として確定させた。
-- 実測できた項目: 非root startup、admin keyによる正規OpenSSH認証（host mode `_`）、cgroup controller fileを一切使わない起動パス。sandbox launchを要するproof item（PTY suite、永続化、network mode検証等）は実行不能。
+- 実測できた項目: 非root startup、admin keyによる正規OpenSSH認証（host mode `_`）、resource limit 無指定時に cgroup controller file を使わない起動パス。sandbox launchを要するproof item（PTY suite、永続化、network mode検証等）は実行不能。
 - 非特権コンテキストでの実測: `unshare(CLONE_NEWUSER)` とseccomp filterは利用可能、`chroot` と単独のmount nsは不可。usernsベースのsandboxは技術的には成立しうるが、nono/Landlockとは別の新backend実装であり、現行releaseの範囲外。
 - 公開networkの制約: Flyのshared IPv4はraw TCP（SSH）をedgeで切断するため、公開SSHにはdedicated IPv4が必要。検証はprivate network（`fly proxy`）で実施した。
 
@@ -221,8 +222,8 @@ CIはproduction source/deployに次の種類のarchitecture regressionが戻っ�
 - retired sandbox backend
 - sibling sandbox launcher helper
 - launcher control/self-exec environment path
-- external sandbox CLI invocation
-- sandbox用control-group filesystem writes/delegation requirements
+- project-owned external sandbox CLI invocation（macOSの固定OS component `/usr/bin/sandbox-exec` は許可）
+- resource limit 無指定時の sandbox 用 control-group filesystem writes/delegation requirements（resource limit 指定時の cgroup v2 操作は許可）
 
 これらのstatic guardに加え、native behavior gateも必須である。
 
@@ -237,7 +238,7 @@ release evidenceには最低限次を保存する。
 - architecture
 - executing username/uid
 - OpenSSH version
-- nono/Landlock capability diagnostics on Linux
+- Landlock/cgroup capability diagnostics on Linux
 - Seatbelt smoke result on macOS
 - platform script exit status
 - full OpenSSH/PTTY test result

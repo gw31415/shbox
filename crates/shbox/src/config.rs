@@ -46,6 +46,8 @@ pub struct Config {
     sandbox_shell: Option<PathBuf>,
     read_paths: Vec<PathBuf>,
     sandbox_env: BTreeMap<String, String>,
+    resources: SandboxResources,
+    cgroup_parent: Option<PathBuf>,
 }
 
 impl Config {
@@ -111,6 +113,18 @@ impl Config {
     pub fn sandbox_env(&self) -> &BTreeMap<String, String> {
         &self.sandbox_env
     }
+
+    /// Resource limits each durable sandbox applies through one shared cgroup
+    /// v2 resource domain on Linux.
+    pub fn resources(&self) -> &SandboxResources {
+        &self.resources
+    }
+
+    /// Operator-specified cgroup directory to create sandbox cgroups under
+    /// (overriding auto-discovery).
+    pub fn cgroup_parent(&self) -> Option<&Path> {
+        self.cgroup_parent.as_deref()
+    }
 }
 
 /// Parse a config file, enforcing the size limit and file safety first.
@@ -167,6 +181,8 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
     let sandbox_shell = validate_configured_path(sandbox.shell.as_deref(), "sandbox.shell")?;
     let read_paths = validate_read_paths(sandbox.read_paths.as_deref(), paths)?;
     let sandbox_env = validate_sandbox_env(sandbox.env.as_ref())?;
+    let resources = validate_resources(&sandbox)?;
+    let cgroup_parent = validate_cgroup_parent(sandbox.cgroup_parent.as_deref())?;
     Ok(Config {
         listen,
         log_level,
@@ -174,7 +190,118 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
         sandbox_shell,
         read_paths,
         sandbox_env,
+        resources,
+        cgroup_parent,
     })
+}
+
+/// Per-sandbox resource limits, resolved from the `[sandbox]` table. Every
+/// field is optional; an absent field inherits. If all fields inherit, shbox
+/// does not create a Linux resource-domain cgroup for the sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxResources {
+    /// `memory.max` in bytes.
+    pub memory_bytes: Option<u64>,
+    /// `memory.swap.max` in bytes.
+    pub swap_bytes: Option<u64>,
+    /// `pids.max`.
+    pub pids: Option<u32>,
+    /// `cpu.max` quota in microseconds of CPU time per period.
+    pub cpu_quota_micros: Option<u64>,
+    /// `cpu.max` period in microseconds (defaults to 100000).
+    pub cpu_period_micros: Option<u64>,
+}
+
+impl SandboxResources {
+    /// Whether any limit asks for a dedicated per-sandbox cgroup.
+    #[cfg(target_os = "linux")]
+    pub fn wants_cgroup(&self) -> bool {
+        self.memory_bytes.is_some()
+            || self.swap_bytes.is_some()
+            || self.pids.is_some()
+            || self.cpu_quota_micros.is_some()
+    }
+}
+
+fn validate_resources(sandbox: &RawSandbox) -> Result<SandboxResources, Error> {
+    let reject = |field: &'static str, why: String| -> Error {
+        Error::Invalid {
+            field,
+            message: why,
+        }
+    };
+    let memory_bytes = match sandbox.memory_max {
+        Some(0) => {
+            return Err(reject(
+                "sandbox.memory_max",
+                "must be greater than zero bytes".into(),
+            ));
+        }
+        other => other,
+    };
+    let swap_bytes = match sandbox.swap_max {
+        Some(0) => {
+            return Err(reject(
+                "sandbox.swap_max",
+                "must be greater than zero bytes".into(),
+            ));
+        }
+        other => other,
+    };
+    let pids = match sandbox.pids_max {
+        Some(0) => {
+            return Err(reject(
+                "sandbox.pids_max",
+                "must be greater than zero".into(),
+            ));
+        }
+        other => other,
+    };
+    let cpu_quota_micros = match sandbox.cpu_quota_micros {
+        Some(0) => {
+            return Err(reject(
+                "sandbox.cpu_quota_micros",
+                "must be greater than zero".into(),
+            ));
+        }
+        other => other,
+    };
+    let cpu_period_micros = match sandbox.cpu_period_micros {
+        Some(period) if !(1000..=1_000_000).contains(&period) => {
+            return Err(reject(
+                "sandbox.cpu_period_micros",
+                "must be between 1000 and 1000000".into(),
+            ));
+        }
+        other => other,
+    };
+    if cpu_period_micros.is_some() && cpu_quota_micros.is_none() {
+        return Err(reject(
+            "sandbox.cpu_period_micros",
+            "requires sandbox.cpu_quota_micros".into(),
+        ));
+    }
+    Ok(SandboxResources {
+        memory_bytes,
+        swap_bytes,
+        pids,
+        cpu_quota_micros,
+        cpu_period_micros,
+    })
+}
+
+fn validate_cgroup_parent(raw: Option<&str>) -> Result<Option<PathBuf>, Error> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(Error::Invalid {
+            field: "sandbox.cgroup_parent",
+            message: format!("must be an absolute cgroup v2 directory, got {value:?}"),
+        });
+    }
+    Ok(Some(path))
 }
 
 /// The listener the daemon binds when the config file names none: the
@@ -606,6 +733,12 @@ pub struct RawSandbox {
     #[serde_as(as = "Option<OneOrMany<_>>")]
     read_paths: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
+    memory_max: Option<u64>,
+    swap_max: Option<u64>,
+    pids_max: Option<u32>,
+    cpu_quota_micros: Option<u64>,
+    cpu_period_micros: Option<u64>,
+    cgroup_parent: Option<String>,
 }
 
 /// Configuration errors.
@@ -837,6 +970,13 @@ mod tests {
         ] {
             assert!(build_toml(text).is_ok(), "{text}");
         }
+    }
+
+    #[test]
+    fn cpu_period_requires_cpu_quota() {
+        let message = build_err("[sandbox]\ncpu_period_micros = 50000");
+        assert!(message.contains("sandbox.cpu_period_micros"), "{message}");
+        assert!(message.contains("cpu_quota_micros"), "{message}");
     }
 
     #[test]

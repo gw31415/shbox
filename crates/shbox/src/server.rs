@@ -259,7 +259,10 @@ impl Drop for LimiterSlot {
 /// The running SSH server.
 pub struct SshServer {
     shared: crate::ssh::Shared,
-    host_key: russh::keys::PrivateKey,
+    /// Transport configuration, identical for every connection: built once
+    /// here so each accepted connection shares one `Arc` instead of
+    /// re-copying the host key.
+    transport: Arc<Config>,
     limiter: Arc<Limiter>,
     host_process_limiter: Arc<HostProcessLimiter>,
     host_tasks: Arc<HostTaskRegistry>,
@@ -273,9 +276,25 @@ impl SshServer {
     /// [`crate::auth::KeyStore`] at authentication time.
     pub fn new(shared: crate::ssh::Shared, host_key: russh::keys::PrivateKey) -> SshServer {
         let caps = Caps::default();
+        let mut methods = MethodSet::empty();
+        // Public-key only: none/password/keyboard-interactive and everything
+        // else are refused before they can even be attempted.
+        methods.push(MethodKind::PublicKey);
+        let transport = Arc::new(Config {
+            methods,
+            keys: vec![host_key],
+            max_auth_attempts: caps.max_auth_attempts as usize,
+            // No idle timeout: authenticated connections may sit idle.
+            inactivity_timeout: None,
+            // Fail visibly when a rejected client idles through the
+            // handshake window; the rejection delay applies per attempt.
+            auth_rejection_time: Duration::from_millis(250),
+            auth_rejection_time_initial: Some(Duration::from_millis(0)),
+            ..Default::default()
+        });
         SshServer {
             shared,
-            host_key,
+            transport,
             limiter: Arc::new(Limiter::new(&caps)),
             host_process_limiter: Arc::new(HostProcessLimiter::new(&caps)),
             host_tasks: Arc::new(HostTaskRegistry::default()),
@@ -289,25 +308,6 @@ impl SshServer {
     pub(crate) fn force_stop_host_tasks(&self) {
         self.host_tasks.close();
         self.host_tasks.force_stop();
-    }
-
-    fn transport_config(&self, caps: &Caps) -> Arc<Config> {
-        let mut methods = MethodSet::empty();
-        // Public-key only: none/password/keyboard-interactive and everything
-        // else are refused before they can even be attempted.
-        methods.push(MethodKind::PublicKey);
-        Arc::new(Config {
-            methods,
-            keys: vec![self.host_key.clone()],
-            max_auth_attempts: caps.max_auth_attempts as usize,
-            // No idle timeout: authenticated connections may sit idle.
-            inactivity_timeout: None,
-            // Fail visibly when a rejected client idles through the
-            // handshake window; the rejection delay applies per attempt.
-            auth_rejection_time: Duration::from_millis(250),
-            auth_rejection_time_initial: Some(Duration::from_millis(0)),
-            ..Default::default()
-        })
     }
 
     /// Serve until the shutdown signal fires. `listeners` are already bound,
@@ -407,7 +407,7 @@ impl SshServer {
         let handler = ConnHandler::new(shared, conn.clone());
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(caps.handshake_timeout_secs as u64);
-        let transport_config = self.transport_config(&caps);
+        let transport_config = Arc::clone(&self.transport);
         let session = tokio::select! {
             result = tokio::time::timeout_at(
                 deadline,

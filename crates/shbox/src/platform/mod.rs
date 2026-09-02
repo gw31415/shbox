@@ -1,9 +1,11 @@
 //! Private process-launch seam.
 //!
-//! Production owns process/PTY lifecycle directly: Linux applies nono prepared
-//! confinement and macOS execs the system Seatbelt wrapper with a parent-built
-//! profile. Tests use a deterministic fake launcher; backend details never leak
-//! into configuration or SSH surfaces.
+//! Production owns process/PTY lifecycle directly on top of the
+//! `shbox-sandbox` engine: Linux runs clone3/Landlock/seccomp/cgroup
+//! confinement and macOS runs a generated Seatbelt profile, both driven by
+//! the per-launch policy snapshot this module builds. Tests use a
+//! deterministic fake launcher; backend details never leak into
+//! configuration or SSH surfaces.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -140,6 +142,13 @@ impl fmt::Debug for LaunchedProcess {
 /// Private production/test seam. It is not a configurable backend surface.
 pub(crate) trait ProcessLauncher: fmt::Debug + Send + Sync {
     fn launch(&self, request: LaunchRequest) -> Result<LaunchedProcess, LaunchError>;
+
+    /// Release resources whose lifetime belongs to the durable sandbox rather
+    /// than to one launched process. Called only after runtime cleanup has
+    /// completed for the sandbox.
+    fn release_sandbox_resources(&self, _sandbox_id: &SandboxId) -> Result<(), LaunchError> {
+        Ok(())
+    }
 }
 
 /// Build the single production launcher for this target from the immutable
@@ -217,16 +226,22 @@ pub(crate) struct FakeLauncher {
 #[derive(Debug, Default)]
 struct FakeState {
     fail_next: bool,
+    fail_release_next: bool,
     launches: usize,
     barrier: Option<Arc<std::sync::Barrier>>,
     last_request: Option<LaunchRequest>,
     last_process: Option<Arc<FakeProcess>>,
+    released_sandboxes: Vec<SandboxId>,
 }
 
 #[cfg(test)]
 impl FakeLauncher {
     pub(crate) fn fail_next(&self) {
         self.state.lock().expect("fake launcher").fail_next = true;
+    }
+
+    pub(crate) fn fail_release_next(&self) {
+        self.state.lock().expect("fake launcher").fail_release_next = true;
     }
 
     pub(crate) fn set_barrier(&self, barrier: Arc<std::sync::Barrier>) {
@@ -250,6 +265,14 @@ impl FakeLauncher {
             .lock()
             .expect("fake launcher")
             .last_process
+            .clone()
+    }
+
+    pub(crate) fn released_sandboxes(&self) -> Vec<SandboxId> {
+        self.state
+            .lock()
+            .expect("fake launcher")
+            .released_sandboxes
             .clone()
     }
 }
@@ -293,6 +316,16 @@ impl ProcessLauncher for FakeLauncher {
             window_revision: request.pty.as_ref().map_or(0, |pty| pty.window_revision),
             wait: wait_rx,
         })
+    }
+
+    fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
+        let mut state = self.state.lock().expect("fake launcher");
+        state.released_sandboxes.push(sandbox_id.clone());
+        if state.fail_release_next {
+            state.fail_release_next = false;
+            return Err(LaunchError::new("injected fake resource release failure"));
+        }
+        Ok(())
     }
 }
 

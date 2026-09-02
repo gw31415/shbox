@@ -28,7 +28,7 @@ shbox は SSH authentication/authorization、durable sandbox ownership、workspa
 - shbox config/state/host key
 - daemon processとhost mode
 - host filesystemの未許可path
-- disabled network policyでのnetwork reachability
+- disabled network policyでのhost/external network reachability
 - authentication/ownership metadata integrity
 - PTY/process descriptor ownership
 
@@ -111,21 +111,22 @@ policyには:
 - curated/configured read paths
 - operator environment
 - private launch temp root
+- configured resource limits with platform-specific enforcement
 
-だけを持ち、sandbox CPU/memory/PID/file quotaは持たない。
+file-size、open-file、workspace disk quota は持たない。
 
 ### 5.2 Linux
 
-Linuxはnono 0.74.0 libraryでprepared Landlock policyを構築する。
+Linuxはshbox-sandbox engineでprepared Landlock policyを構築する（clone3+pidfd生成、no_new_privs、capability drop、close_range FD hygieneがinvariant）。
 
 security-critical rules:
 
 - path resolution/policy constructionはparentで完了
 - post-fork childはallocation-heavy builderを呼ばない
 - Landlock policy apply前にworkspace/session/PTTY setupをfixed raw operationで行う
-- disabled networkはLandlock network mediationまたはnono-selected seccomp fallbackでfail closed
+- disabled networkはfresh user+network namespaceでhost/external reachabilityを切り離し、Landlock network mediation（ABI 4+）でもTCP `bind`/`connect`を拒否する。namespace/capability setupに失敗した場合はfail closedする
 - signal/IPC scopingはkernel ABIが提供する範囲でrequestする
-- external sandbox executableへshell outしない
+- project-owned external sandbox executable、sibling helper、self-exec pathへshell outしない
 
 Landlock confinementはdescendantへinheritされる。
 
@@ -135,13 +136,15 @@ macOSはparentがdeny-default Seatbelt profileを生成し、固定system execut
 
 profile生成はchild fork前に完了する。PTY setupはshbox自身が行い、Seatbelt適用toolにterminal ownershipを任せない。
 
+macOSの`memory_max`は`RLIMIT_AS`、`pids_max`は`RLIMIT_NPROC`としてexec前に適用する。CPU quotaとswap limitは表現できず、指定時はfail closedする。`/usr/bin/sandbox-exec`は固定OS componentとして許可される唯一の外部 launcher であり、project-owned helperではない。
+
 formal supportはfixed macOS major/arm64 native gateでenforcement smokeを通したtupleだけに付与する。
 
 ## 6. Network policy
 
 ### 6.1 `disabled`
 
-network accessをblocking policyで拒否する。release testsでは実TCP connectが失敗することを確認する。
+全platformのpublic contractはhost/external network reachabilityを拒否することである。Linuxではfresh user+network namespaceに隔離したうえでLandlockがTCP `bind`/`connect`も拒否する。sandboxed programはcapability drop後にexecされるため、初期状態でdownのloopbackを再構成できない。macOSではdeny-default Seatbelt profileがnetwork operationを許可しない。release testsではTCPに加えてUDPの外部到達不能も確認する。
 
 ### 6.2 `outbound`
 
@@ -149,7 +152,7 @@ outbound client connectionを利用可能にするmodeである。remote destina
 
 ### 6.3 Fail closed
 
-network enforcement prerequisiteが不足し、required fallbackもprepare/applyできない場合launchを拒否する。network isolationを外してcommandを実行しない。
+platform-specific な network enforcement prerequisite（Linux の Landlock ABI 4+、macOS の Seatbelt launcher）が不足する場合 launch を拒否する。required enforcementを外してcommandを実行しない。network namespace isolationを使う構成では、必要な namespace setup（user namespace または適切な privilege を含む）の作成・設定に失敗した場合も fail closed する。
 
 ## 7. Environment protection
 
@@ -184,7 +187,7 @@ concurrent sessionsでterminal device、foreground process group、window size�
 
 ## 9. Process lifecycle and cleanup
 
-normal process completionではdirect childをexactly once reapし、残るowned process groupをcleanupする。
+normal process completionではengine-owned direct childをexactly once reapする。PID namespace無しではreap前に残るowned process groupをcleanupする。PID namespace有りでは内部PID1 supervisorがlogical user PID2をreapし、そのstatusをparentへ返した後にnamespace内の残processを停止して終了する。
 
 abnormal teardown:
 
@@ -197,7 +200,7 @@ abnormal teardown:
 
 connection handler drop時はchannel registry senderをclearし、bridge taskがdisconnectを確実に観測する。bridgeがconnection stateの`Arc`を保持しているだけでprocessが残り続けないようにする。
 
-Linux direct childにはparent-death signalを設定し、daemon abrupt death時のdirect-child orphaningを防ぐ方向に補強する。
+Linux の engine-owned direct child には parent-death signal を設定し、その clone は process-lifetime の専用 spawn-owner thread が実行する。PID namespace 有りでは direct child は内部 PID1 supervisor で user command は PID2 として実行される。ただし daemon abrupt death時のorphan processやdurable resource domainをcleanupする保証とは扱わない。
 
 ### 9.1 Detached descendant limitation
 
@@ -214,19 +217,20 @@ production-provider acceptanceではこのdetached behaviorを明示的に観測
 
 ## 10. Resource control
 
-shbox v0.1はper-sandbox resource quotaを提供しない。
+shbox v0.1は、設定された resource limit を sandbox ごとに platform ごとの primitive で適用する。Linux は cgroup v2、macOS は `memory_max` を `RLIMIT_AS`、`pids_max` を `RLIMIT_NPROC` として扱う。macOS の rlimit は Linux のような sandbox process-tree cgroup accounting ではない。
+
+Linux の public shbox adapter では、明示 limit を持つ `SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch が共有する。child はその domain に直接生成され、child exit では domain を削除しない。sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。limit を省略した分野は `Inherit` であり、sandbox-local の制限を書き換えない。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。
+
+limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。daemon crash 時の orphan process や durable resource domain の自動 cleanup は、この lifecycle contract に含めない。
 
 提供しないもの:
 
-- CPU quota
-- memory ceiling
-- PID/process-tree quota
 - file-size/open-file quota
 - workspace disk quota
 
-built-in connection/channel/process count capsはdaemon admission protectionであり、sandbox内process treeのresource controlではない。
+macOS の CPU quota と swap limit は unsupported で、指定時は黙って無視せず fail closed する。built-in connection/channel/process count capsはdaemon admission protectionであり、sandbox内process treeのresource controlではない。
 
-service manager/providerがdaemon全体へresource policyを設定することは可能だが、その保証をshbox sandboxのsecurity claimへ転記しない。
+service manager/providerがdaemon全体へ追加のresource policyを設定することは可能だが、その保証をshbox sandboxのsecurity claimへ転記しない。
 
 ## 11. Host mode
 
@@ -287,10 +291,10 @@ SIGHUPはkey sourcesだけを再検証する。config/network/path policyをlive
 releaseには少なくとも:
 
 - Rust 1.95 fmt/clippy/test/build
-- Linux x86_64/aarch64 native nono/Landlock gate
+- Linux x86_64/aarch64 native engine/Landlock gate
 - macOS 15/26 arm64 native Seatbelt gate
 - workspace write + outside read/write denial
-- disabled network denial / outbound success
+- disabled network external TCP/UDP denial / outbound success
 - non-PTY streams/status
 - full PTY session/job-control suite
 - disconnect/delete/shutdown cleanup
@@ -308,7 +312,7 @@ releaseには少なくとも:
 - admin key compromise防御
 - covert/side-channel isolation
 - per-sandbox UID namespace
-- resource quota enforcement
+- documented resource limitsを超えるfile/workspace quotaや、ancestor cgroup restrictionの解除
 - deliberately detached process treeの完全回収保証
 
 これらが必要なdeploymentは別のVM/container/provider boundaryを追加する。
