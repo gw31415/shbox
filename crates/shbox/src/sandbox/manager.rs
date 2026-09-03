@@ -431,11 +431,42 @@ impl SandboxManager {
         self.launch_handle(&handle, operation, pty)
     }
 
+    /// Launch a process with daemon-authored connection metadata. The
+    /// environment is kept separate from the SSH client's rejected `env`
+    /// request so compatibility variables cannot be supplied by the client.
+    pub(crate) fn launch_with_environment(
+        &self,
+        principal: &Principal,
+        id: &SandboxId,
+        operation: platform::LaunchOperation,
+        pty: Option<platform::PtySpec>,
+        environment: BTreeMap<String, String>,
+    ) -> Result<ManagedProcess, Error> {
+        if self
+            .launch_admission_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable);
+        }
+        let handle = self.claim(principal, id)?;
+        self.launch_handle_with_environment(&handle, operation, pty, environment)
+    }
+
     fn launch_handle(
         &self,
         handle: &SandboxHandle,
         operation: platform::LaunchOperation,
         pty: Option<platform::PtySpec>,
+    ) -> Result<ManagedProcess, Error> {
+        self.launch_handle_with_environment(handle, operation, pty, BTreeMap::new())
+    }
+
+    fn launch_handle_with_environment(
+        &self,
+        handle: &SandboxHandle,
+        operation: platform::LaunchOperation,
+        pty: Option<platform::PtySpec>,
+        environment: BTreeMap<String, String>,
     ) -> Result<ManagedProcess, Error> {
         let lease = self.begin_launch(handle)?;
         let request = LaunchRequest {
@@ -443,6 +474,7 @@ impl SandboxManager {
             workspace: handle.workspace.clone(),
             operation,
             pty,
+            environment,
         };
         let process = match self.launcher.launch(request) {
             Ok(process) => process,
@@ -1668,6 +1700,7 @@ mod tests {
                     modes: Vec::new(),
                     window_revision: 0,
                 }),
+                environment: BTreeMap::new(),
             })
         );
         assert_eq!(manager.runtime_count(), 1);

@@ -9,6 +9,8 @@
 pub(crate) mod channel;
 pub(crate) mod host;
 
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use russh::server::{Auth, Session};
@@ -36,6 +38,8 @@ pub(crate) struct Shared {
 #[derive(Debug)]
 pub(crate) struct ConnState {
     pub principal: std::sync::Mutex<Option<Principal>>,
+    /// Connection metadata supplied by the daemon, not by SSH env requests.
+    pub connection_environment: BTreeMap<String, String>,
     /// Fired exactly when authentication succeeds; the listener watchdog
     /// stops the handshake timer on this.
     pub authenticated: Arc<tokio::sync::Notify>,
@@ -48,6 +52,34 @@ pub(crate) struct ConnState {
     pub shutdown: tokio::sync::watch::Receiver<bool>,
     /// Tracks the connection in the unauthenticated bucket until auth.
     pub unauth_slot: std::sync::Arc<crate::server::LimiterSlot>,
+}
+
+/// Build the standard SSH connection variables for child processes. These
+/// are needed by compatible handoff tools such as tsshd, which use the
+/// server-side address from `SSH_CONNECTION` to select their UDP listener.
+pub(crate) fn connection_environment(
+    peer: Option<SocketAddr>,
+    local: Option<SocketAddr>,
+) -> BTreeMap<String, String> {
+    let (Some(peer), Some(local)) = (peer, local) else {
+        return BTreeMap::new();
+    };
+    BTreeMap::from([
+        (
+            "SSH_CONNECTION".into(),
+            format!(
+                "{} {} {} {}",
+                peer.ip(),
+                peer.port(),
+                local.ip(),
+                local.port()
+            ),
+        ),
+        (
+            "SSH_CLIENT".into(),
+            format!("{} {} {}", peer.ip(), peer.port(), local.port()),
+        ),
+    ])
 }
 
 impl ConnState {
@@ -152,8 +184,15 @@ impl ConnHandler {
                 window_revision,
             });
         let manager = Arc::clone(&self.shared.sandbox);
+        let connection_environment = self.conn.connection_environment.clone();
         let launch = tokio::task::spawn_blocking(move || {
-            manager.launch(&principal, &id, launch_operation, pty)
+            manager.launch_with_environment(
+                &principal,
+                &id,
+                launch_operation,
+                pty,
+                connection_environment,
+            )
         })
         .await;
         let managed = match launch {
@@ -858,3 +897,32 @@ const UNAVAILABLE_MESSAGE: &str = "shbox: request cannot be completed";
 /// Generic non-zero exit status for unavailable operations, matching the
 /// 255 sshd reports when it cannot run the requested program.
 pub(crate) const UNAVAILABLE_EXIT: u32 = 255;
+
+#[cfg(test)]
+mod tests {
+    use super::connection_environment;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn connection_environment_uses_peer_and_listener_addresses() {
+        let peer = SocketAddr::from(([192, 0, 2, 10], 4242));
+        let local = SocketAddr::from(([198, 51, 100, 20], 2222));
+        let environment = connection_environment(Some(peer), Some(local));
+
+        assert_eq!(
+            environment.get("SSH_CONNECTION"),
+            Some(&"192.0.2.10 4242 198.51.100.20 2222".to_string())
+        );
+        assert_eq!(
+            environment.get("SSH_CLIENT"),
+            Some(&"192.0.2.10 4242 2222".to_string())
+        );
+    }
+
+    #[test]
+    fn connection_environment_is_empty_without_complete_socket_metadata() {
+        let peer = SocketAddr::from(([192, 0, 2, 10], 4242));
+        assert!(connection_environment(Some(peer), None).is_empty());
+        assert!(connection_environment(None, Some(peer)).is_empty());
+    }
+}

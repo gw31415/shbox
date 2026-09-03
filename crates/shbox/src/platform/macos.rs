@@ -8,6 +8,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -103,10 +104,11 @@ impl ProcessLauncher for MacosLauncher {
         }
         let env = self
             .policy
-            .environment_for(
+            .environment_for_with_overrides(
                 &workspace,
                 request.pty.as_ref().map(|pty| pty.term.as_str()),
                 Some(&launch_temp_path),
+                &request.environment,
             )
             .into_iter()
             .map(|(name, value)| {
@@ -505,6 +507,7 @@ mod tests {
                 modes: vec![(russh::Pty::ECHO, 0)],
                 window_revision: 7,
             }),
+            environment: BTreeMap::new(),
         }
     }
 
@@ -753,6 +756,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             operation: super::super::LaunchOperation::Exec(command),
             pty: None,
+            environment: BTreeMap::new(),
         };
         let launcher = MacosLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("macos launcher");
@@ -787,6 +791,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             operation: super::super::LaunchOperation::Shell,
             pty: None,
+            environment: BTreeMap::new(),
         };
         let launcher = MacosLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("macos launcher");

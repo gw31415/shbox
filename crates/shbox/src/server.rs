@@ -352,7 +352,7 @@ impl SshServer {
                     tokio::select! {
                         _ = shutdown_rx.changed() => break,
                         accepted = listener.accept() => match accepted {
-                            Ok((stream, peer)) => {
+                            Ok((stream, peer, local)) => {
                                 if *shutdown_rx.borrow() {
                                     drop(stream);
                                     break;
@@ -361,7 +361,7 @@ impl SshServer {
                                 let connection_shutdown = shutdown_rx.clone();
                                 connection_tasks.spawn(async move {
                                     connection_server
-                                        .handle_connection(stream, peer, connection_shutdown)
+                                        .handle_connection(stream, peer, local, connection_shutdown)
                                         .await;
                                 });
                             }
@@ -411,6 +411,7 @@ impl SshServer {
         self: Arc<Self>,
         stream: S,
         peer: Option<std::net::SocketAddr>,
+        local: Option<std::net::SocketAddr>,
         mut shutdown: watch::Receiver<bool>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -426,6 +427,7 @@ impl SshServer {
         let caps = self.caps;
         let conn = Arc::new(crate::ssh::ConnState {
             principal: std::sync::Mutex::new(None),
+            connection_environment: crate::ssh::connection_environment(peer, local),
             authenticated: Arc::new(Notify::new()),
             registry: crate::ssh::channel::ChannelRegistry::new(),
             host_process_limiter: Arc::clone(&self.host_process_limiter),
@@ -534,12 +536,19 @@ impl BoundListener {
     /// Accept one connection and adapt it to the shared SSH byte stream.
     /// WebSocket connections complete their upgrade here; a failed upgrade
     /// is logged and surfaces as an accept error for that one connection.
-    pub async fn accept(&self) -> std::io::Result<(SshStream, Option<std::net::SocketAddr>)> {
+    pub async fn accept(
+        &self,
+    ) -> std::io::Result<(
+        SshStream,
+        Option<std::net::SocketAddr>,
+        Option<std::net::SocketAddr>,
+    )> {
         match self {
             #[cfg(feature = "tcp")]
             BoundListener::Tcp(listener) => {
                 let (stream, peer) = listener.accept().await?;
-                Ok((Box::new(stream), Some(peer)))
+                let local = stream.local_addr().ok();
+                Ok((Box::new(stream), Some(peer), local))
             }
             #[cfg(feature = "ws")]
             BoundListener::WebSocket { listener, path } => {
@@ -548,8 +557,11 @@ impl BoundListener {
                 // serving.
                 loop {
                     let (stream, peer) = listener.accept().await?;
+                    let local = stream.local_addr().ok();
                     match crate::ws::upgrade(stream, path, Some(peer)).await {
-                        Ok(stream) => return Ok((Box::new(stream), Some(peer))),
+                        Ok(stream) => {
+                            return Ok((Box::new(stream), Some(peer), local));
+                        }
                         Err(_) => continue,
                     }
                 }

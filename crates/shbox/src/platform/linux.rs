@@ -357,10 +357,11 @@ impl ProcessLauncher for LinuxLauncher {
         let mut command = self.command_spec(&request, &workspace)?;
         command.env = self
             .policy
-            .environment_for(
+            .environment_for_with_overrides(
                 &workspace,
                 request.pty.as_ref().map(|pty| pty.term.as_str()),
                 Some(&runtime_temp_path),
+                &request.environment,
             )
             .into_iter()
             .map(|(name, value)| {
@@ -932,6 +933,7 @@ mod tests {
                 modes: vec![(russh::Pty::ECHO, 0)],
                 window_revision: 7,
             }),
+            environment: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1713,6 +1715,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             operation: super::super::LaunchOperation::Exec(command),
             pty: None,
+            environment: std::collections::BTreeMap::new(),
         };
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
@@ -1750,6 +1753,7 @@ mod tests {
             workspace: workspace.path().to_path_buf(),
             operation: super::super::LaunchOperation::Shell,
             pty: None,
+            environment: std::collections::BTreeMap::new(),
         };
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
@@ -1779,6 +1783,74 @@ mod tests {
         assert!(
             output.contains("argv0=-sh"),
             "shell must observe login argv[0]: {output:?}"
+        );
+    }
+
+    /// M12 fallback acceptance: verify that the available tsshd server binary
+    /// exits naturally inside the durable process domain, then observe the
+    /// normal domain-drain transition.
+    #[tokio::test]
+    async fn available_tsshd_exits_naturally_inside_the_process_domain() {
+        if !Path::new("/usr/bin/tsshd").is_file() {
+            eprintln!("skipping: /usr/bin/tsshd is unavailable");
+            return;
+        }
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxLaunchPolicy::from_parts(
+            "/bin/sh".into(),
+            NetworkMode::Disabled,
+            vec!["/proc".into()],
+            BTreeMap::new(),
+            root.path().into(),
+            crate::config::SandboxResources::default(),
+            std::env::var_os("SHBOX_SANDBOX_TEST_CGROUP_PARENT").map(PathBuf::from),
+        );
+        let launcher = LinuxLauncher::new(policy).expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                "/usr/bin/tsshd -v >tsshd-stdout 2>tsshd-stderr; printf 'tsshd_status=%s\\n' \"$?\" >tsshd-status; cat /proc/self/cgroup > tsshd-cgroup",
+                false,
+            ))
+            .expect("tsshd bootstrap smoke");
+        let exit = launched.wait.await.expect("wait channel").expect("wait");
+        let status =
+            fs::read_to_string(workspace.path().join("tsshd-status")).expect("tsshd status marker");
+        let stdout =
+            fs::read_to_string(workspace.path().join("tsshd-stdout")).expect("tsshd stdout marker");
+        let stderr =
+            fs::read_to_string(workspace.path().join("tsshd-stderr")).expect("tsshd stderr marker");
+        assert_eq!(
+            exit,
+            ProcessExit::Code(0),
+            "tsshd bootstrap failed: status={status:?}, stdout={stdout:?}, stderr={stderr:?}"
+        );
+        assert_eq!(status, "tsshd_status=0\n");
+        let cgroup =
+            fs::read_to_string(workspace.path().join("tsshd-cgroup")).expect("tsshd cgroup marker");
+        assert!(
+            cgroup.contains("shbox-domain-"),
+            "tsshd must execute inside the durable process domain: {cgroup}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_dir(root.path())
+            .expect("runtime root listing")
+            .next()
+            .is_some()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("runtime root listing")
+                .count(),
+            0,
+            "natural tsshd exit must drain the empty process domain"
         );
     }
 }

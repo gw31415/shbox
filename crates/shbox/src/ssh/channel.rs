@@ -992,6 +992,7 @@ mod tests {
             workspace: std::path::PathBuf::from("/tmp/shbox-dev"),
             operation: LaunchOperation::Exec(b"fake command".to_vec()),
             pty,
+            environment: std::collections::BTreeMap::new(),
         }
     }
 

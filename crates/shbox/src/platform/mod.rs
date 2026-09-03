@@ -7,6 +7,7 @@
 //! deterministic fake launcher; backend details never leak into
 //! configuration or SSH surfaces.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -75,6 +76,9 @@ pub(crate) struct LaunchRequest {
     pub(crate) workspace: PathBuf,
     pub(crate) operation: LaunchOperation,
     pub(crate) pty: Option<PtySpec>,
+    /// Daemon-authored compatibility variables derived from the accepted SSH
+    /// connection. This is not a client-controlled environment channel.
+    pub(crate) environment: BTreeMap<String, String>,
 }
 
 /// A process handle owned by the runtime registry.  The adapter owns the
@@ -642,6 +646,7 @@ mod tests {
             workspace: PathBuf::from("/tmp/shbox-dev"),
             operation: LaunchOperation::Exec(b"printf fake".to_vec()),
             pty,
+            environment: BTreeMap::new(),
         }
     }
 

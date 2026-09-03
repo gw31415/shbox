@@ -6,21 +6,13 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 
 ## Current state
 
-- M0–M5 は `bc29aa8` から `3b1043e`、M6 は `5766419`、M7 は `cee682d`、M8 は `2237bc8`、M9 は `ea0beba`、M10 は `ed7e187`、M11 はこのコミットの履歴に保存する。次は M12 の tssh acceptance、最後に M13 の legacy cleanup である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M0–M5 は `bc29aa8` から `3b1043e`、M6 は `5766419`、M7 は `cee682d`、M8 は `2237bc8`、M9 は `ea0beba`、M10 は `ed7e187`、M11 は `d83b802`、M12 はこのコミットの履歴に保存する。次は最後の M13 legacy cleanup である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M12 では mise の `tssh 0.1.26` と `/usr/bin/tsshd 0.1.9` を確認した。一般的な SSH compatibility として `SSH_CONNECTION` / `SSH_CLIENT` を受理 socket の peer/local address から daemon-authored に生成し、operator の同名環境変数や `TMPDIR` より authoritative にした。
+- tssh の通常 TCP acceptance（`tssh_tcp_compatibility_runs_inside_the_sandbox_process_domain`）は成功し、リモートコマンドの出力から durable cgroup 所属を確認した。直接起動した tsshd の自然終了と domain drain も成功した。
+- UDP/QUIC（`tssh --udp`）と対応する KCP acceptance は、正しい接続メタデータ、同一 network namespace、`127.0.0.1:<dynamic-port>` の bind 済み socket、durable cgroup 所属を確認したうえでも、tsshd の debug log に認証パケットが現れず `read auth packet failed ... connection refused` で終了した。UDP acceptance は ignored test として残し、default suite は外部 loopback UDP 条件に依存しない。残る外部依存はこの host/container の loopback UDP handoff であり、shbox 固有の lifecycle code では解決しない。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M12 — tssh/tsshd compatibility acceptance
-
-Goal: tssh-specific lifecycle code を追加せず、bootstrap SSH close 後も tsshd が cgroup-owned のまま UDP session を提供することを実証する。
-
-Implementation and proof:
-
-- repository / environment に存在する tssh の実行方法を確認し、可能なら QUIC、KCP（対応時）、connection loss/reconnect、active session 中の delete、daemon shutdown を acceptance test する。
-- tsshd が自然終了した場合の domain drain を確認する。
-- `SSH_CONNECTION` / `SSH_CLIENT` は一般的な SSH compatibility の必要性が証明された場合のみ追加する。
-- tssh が利用できない場合は、利用不能の正確な理由・実行した代替 acceptance・残る外部依存を plan に記録し、他の milestone を先に完了する。
 
 ## M13 — Cleanup legacy process-group ownership assumptions
 

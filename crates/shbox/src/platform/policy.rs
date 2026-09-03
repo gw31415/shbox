@@ -387,13 +387,28 @@ impl SandboxLaunchPolicy {
     ///
     /// A `pty-req` is authoritative for `TERM`, and the runtime temp directory
     /// is authoritative for `TMPDIR`; neither can be shadowed by an operator
-    /// `sandbox.env` entry. Passing `None` for the temp directory is the
-    /// callers that omit a temp directory leave `TMPDIR` untouched.
+    /// `sandbox.env` entry. Callers that omit a temp directory leave `TMPDIR`
+    /// untouched.
+    #[cfg(test)]
     pub(crate) fn environment_for(
         &self,
         workspace: &Path,
         term: Option<&str>,
         temp_dir: Option<&Path>,
+    ) -> Vec<(String, String)> {
+        self.environment_for_with_overrides(workspace, term, temp_dir, &BTreeMap::new())
+    }
+
+    /// Extend the immutable policy environment with daemon-authored values
+    /// that describe the accepted connection. These values are inserted
+    /// before launch-authoritative `TERM` and `TMPDIR` so request metadata
+    /// cannot shadow managed process settings.
+    pub(crate) fn environment_for_with_overrides(
+        &self,
+        workspace: &Path,
+        term: Option<&str>,
+        temp_dir: Option<&Path>,
+        overrides: &BTreeMap<String, String>,
     ) -> Vec<(String, String)> {
         let workspace = workspace.to_string_lossy().into_owned();
         let shell = self.shell.to_string_lossy().into_owned();
@@ -407,6 +422,10 @@ impl SandboxLaunchPolicy {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        for (name, value) in overrides {
+            env.retain(|(existing, _)| existing != name);
+            env.push((name.clone(), value.clone()));
+        }
         if let Some(term) = term {
             env.retain(|(name, _)| name != "TERM");
             env.push(("TERM".to_string(), term.to_string()));
@@ -1050,6 +1069,40 @@ mod tests {
                 .find(|(name, _)| name == "TMPDIR")
                 .map(|(_, value)| value.as_str()),
             Some("/operator/tmp")
+        );
+
+        let mut connection_env = BTreeMap::new();
+        connection_env.insert(
+            "SSH_CONNECTION".to_string(),
+            "127.0.0.1 40000 127.0.0.1 22".to_string(),
+        );
+        connection_env.insert("TMPDIR".to_string(), "/client/tmp".to_string());
+        let with_connection = policy.environment_for_with_overrides(
+            directory.path(),
+            None,
+            Some(temp),
+            &connection_env,
+        );
+        assert_eq!(
+            with_connection
+                .iter()
+                .filter(|(name, _)| name == "SSH_CONNECTION")
+                .count(),
+            1
+        );
+        assert_eq!(
+            with_connection
+                .iter()
+                .find(|(name, _)| name == "SSH_CONNECTION")
+                .map(|(_, value)| value.as_str()),
+            Some("127.0.0.1 40000 127.0.0.1 22")
+        );
+        assert_eq!(
+            with_connection
+                .iter()
+                .find(|(name, _)| name == "TMPDIR")
+                .map(|(_, value)| value.as_str()),
+            Some("/state/runtime/launch-abc")
         );
     }
 

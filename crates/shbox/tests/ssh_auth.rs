@@ -1742,6 +1742,105 @@ fn sandbox_pty_disconnect_preserves_detached_process_until_delete() {
     }
 }
 
+/// M12: the real mise-provided tssh client must complete ordinary TCP SSH
+/// compatibility against the sandbox listener.
+#[test]
+fn tssh_tcp_compatibility_runs_inside_the_sandbox_process_domain() {
+    if Command::new("tssh").arg("--version").output().is_err() {
+        eprintln!("skipping tssh acceptance: tssh is unavailable");
+        return;
+    }
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let mut daemon = TestDaemon::start_with_config(
+        &["admin"],
+        "[sandbox]\nnetwork = \"outbound\"\nread_paths = [\"/proc\"]\n",
+    );
+    let tssh = Command::new("timeout")
+        .args(["20s", "tssh"])
+        .args(["-F", daemon.ssh_config.to_str().expect("ssh config path")])
+        .args(["-i", daemon.normal_key.private.to_str().expect("key path")])
+        .args(["-p", &daemon.port.to_string(), "-4", "--tcp"])
+        .arg("m12-tssh@127.0.0.1")
+        .arg("printf __M12_TSSH_BEGIN__; cat /proc/self/cgroup; printf __M12_TSSH_END__")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("timeout/tssh starts");
+    let output = tssh.wait_with_output().expect("timeout/tssh waits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let daemon_stderr = daemon.stop_and_collect_stderr();
+    assert!(
+        output.status.success(),
+        "tssh TCP acceptance failed: status={:?}, stdout={stdout:?}, stderr={stderr:?}, daemon_stderr={daemon_stderr:?}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("__M12_TSSH_BEGIN__") && stdout.contains("__M12_TSSH_END__"),
+        "tssh did not return the remote command output: stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("shbox-domain-"),
+        "tssh session escaped the durable sandbox process domain: stdout={stdout:?}"
+    );
+}
+
+/// M12 external acceptance: the real tssh client can replace the bootstrap
+/// SSH transport with tsshd's UDP transport when the host permits loopback
+/// UDP delivery. This host binds tsshd successfully but returns ECONNREFUSED
+/// before any authentication packet reaches it, so keep this probe available
+/// for explicitly provisioned UDP-capable environments without making the
+/// default workspace test suite depend on that external condition.
+#[test]
+#[ignore = "requires host loopback UDP delivery to the tsshd child"]
+fn tssh_udp_bootstrap_runs_inside_the_sandbox_process_domain() {
+    if Command::new("tssh").arg("--version").output().is_err() {
+        eprintln!("skipping tssh acceptance: tssh is unavailable");
+        return;
+    }
+    if !sandbox_integration_enabled() {
+        return;
+    }
+
+    let mut daemon = TestDaemon::start_with_config(
+        &["admin"],
+        "[sandbox]\nnetwork = \"outbound\"\nread_paths = [\"/proc\"]\n",
+    );
+    let tssh = Command::new("timeout")
+        .args(["20s", "tssh"])
+        .args(["-F", daemon.ssh_config.to_str().expect("ssh config path")])
+        .args(["-i", daemon.normal_key.private.to_str().expect("key path")])
+        .args(["-p", &daemon.port.to_string(), "-4", "--udp"])
+        .args(["--tsshd-path", "/usr/bin/tsshd"])
+        .arg("--debug")
+        .arg("m12-tssh@127.0.0.1")
+        .arg("printf __M12_TSSH_BEGIN__; cat /proc/self/cgroup; printf __M12_TSSH_END__")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("timeout/tssh starts");
+    let output = tssh.wait_with_output().expect("timeout/tssh waits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let daemon_stderr = daemon.stop_and_collect_stderr();
+    assert!(
+        output.status.success(),
+        "tssh UDP acceptance failed: status={:?}, stdout={stdout:?}, stderr={stderr:?}, daemon_stderr={daemon_stderr:?}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("__M12_TSSH_BEGIN__") && stdout.contains("__M12_TSSH_END__"),
+        "tssh did not return the remote command output: stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("shbox-domain-"),
+        "tssh session escaped the durable sandbox process domain: stdout={stdout:?}"
+    );
+}
+
 /// PTY allocation must not leak the slave into the daemon, and repeated real
 /// OpenSSH PTY sessions must return the daemon descriptor table to baseline.
 #[test]
