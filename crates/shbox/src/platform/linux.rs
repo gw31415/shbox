@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use shbox_sandbox::{
     Stdio,
 };
 
-use super::policy::{LaunchTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
+use super::policy::{RuntimeTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
 use super::terminal::{PtyIo, PtyPair, duplicate_fd};
 use super::{
     LaunchError, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessReader,
@@ -56,19 +56,33 @@ enum DomainPhase {
 #[derive(Debug, Default)]
 struct DomainSlot {
     phase: DomainPhase,
-    /// Bumped each time a domain is removed; names the runtime generation.
+    /// Names the runtime-domain generation held by this slot.
     generation: u64,
     /// Launches between "domain acquired" and "waiter finished".
     in_flight: usize,
     domain: Option<Arc<ProcessDomain>>,
+    /// Runtime-scoped `TMPDIR` retained while this generation is populated or
+    /// has a launch in flight.
+    runtime_temp: Option<RuntimeTemp>,
 }
 
 /// Shared per-sandbox domain registry: the state machine guarding the
 /// launch / empty-cleanup / delete races.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DomainRegistry {
     slots: Mutex<HashMap<SandboxId, DomainSlot>>,
     changed: Condvar,
+    next_generation: AtomicU64,
+}
+
+impl Default for DomainRegistry {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+            changed: Condvar::new(),
+            next_generation: AtomicU64::new(1),
+        }
+    }
 }
 
 impl DomainRegistry {
@@ -93,11 +107,31 @@ impl DomainRegistry {
                 .domain
                 .as_ref()
                 .is_some_and(|domain| !domain.is_populated().unwrap_or(true))
-            && let Some(domain) = slot.domain.take()
-            && domain.remove_empty().is_ok()
         {
-            slot.generation += 1;
-            slots.remove(sandbox_id);
+            let Some(domain) = slot.domain.take() else {
+                self.changed.notify_all();
+                return;
+            };
+            if domain.remove_empty().is_ok() {
+                let temp_removed = slot
+                    .runtime_temp
+                    .as_ref()
+                    .is_none_or(|runtime_temp| runtime_temp.remove().is_ok());
+                if temp_removed {
+                    slot.runtime_temp.take();
+                    slots.remove(sandbox_id);
+                } else {
+                    // The cgroup is already empty, but a transient
+                    // filesystem failure left the runtime tree owned by this
+                    // idle slot. Keep it so the next launch can retry cleanup
+                    // before creating a new generation.
+                    slot.phase = DomainPhase::Idle;
+                }
+            } else {
+                // Removal raced with an observation failure; retain the
+                // domain so deletion or a later cleanup can retry safely.
+                slot.domain = Some(domain);
+            }
         }
         self.changed.notify_all();
     }
@@ -243,8 +277,8 @@ impl LinuxLauncher {
     fn process_domain(
         &self,
         sandbox_id: &SandboxId,
-        config: &EngineConfig,
-    ) -> Result<(Arc<ProcessDomain>, DomainLease), LaunchError> {
+        workspace: &Path,
+    ) -> Result<(Arc<ProcessDomain>, DomainLease, PathBuf), LaunchError> {
         let mut slots = self
             .registry
             .slots
@@ -257,6 +291,21 @@ impl LinuxLauncher {
             ));
         }
         if slot.domain.is_none() {
+            if let Some(runtime_temp) = slot.runtime_temp.take()
+                && let Err(error) = runtime_temp.remove()
+            {
+                slot.runtime_temp = Some(runtime_temp);
+                return Err(error);
+            }
+            let generation = self
+                .registry
+                .next_generation
+                .fetch_add(1, Ordering::Relaxed);
+            let runtime_temp = self.policy.create_runtime_temp(generation)?;
+            let runtime_temp_path = fs::canonicalize(runtime_temp.path()).map_err(|_| {
+                LaunchError::new("sandbox runtime temp directory became unavailable")
+            })?;
+            let config = self.policy.engine_config(workspace, &runtime_temp_path);
             let parent = config
                 .cgroup_parent
                 .as_deref()
@@ -266,16 +315,24 @@ impl LinuxLauncher {
                     .create_process_domain(config.resources, parent)
                     .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
             );
+            slot.generation = generation;
             slot.domain = Some(domain);
+            slot.runtime_temp = Some(runtime_temp);
             slot.phase = DomainPhase::Active;
         }
         slot.in_flight += 1;
         let domain = Arc::clone(slot.domain.as_ref().expect("domain just ensured"));
+        let runtime_temp_path = slot
+            .runtime_temp
+            .as_ref()
+            .ok_or_else(|| LaunchError::new("sandbox runtime temp state is unavailable"))?
+            .path()
+            .to_path_buf();
         let lease = DomainLease {
             registry: Arc::clone(&self.registry),
             sandbox_id: sandbox_id.clone(),
         };
-        Ok((domain, lease))
+        Ok((domain, lease, runtime_temp_path))
     }
 }
 
@@ -286,13 +343,9 @@ impl ProcessLauncher for LinuxLauncher {
         if !workspace.is_dir() {
             return Err(LaunchError::new("sandbox workspace is unavailable"));
         }
-        let launch_temp = self.policy.create_launch_temp()?;
-        // Resolve through symlinks once: the confinement rules and the
-        // TMPDIR the child sees must name the same canonical directory.
-        let launch_temp_path = fs::canonicalize(launch_temp.path())
-            .map_err(|_| LaunchError::new("sandbox launch temp directory became unavailable"))?;
-        let config: EngineConfig = self.policy.engine_config(&workspace, &launch_temp_path);
-        let (process_domain, domain_lease) = self.process_domain(&request.sandbox_id, &config)?;
+        let (process_domain, domain_lease, runtime_temp_path) =
+            self.process_domain(&request.sandbox_id, &workspace)?;
+        let config: EngineConfig = self.policy.engine_config(&workspace, &runtime_temp_path);
 
         let mut command = self.command_spec(&request, &workspace)?;
         command.env = self
@@ -300,7 +353,7 @@ impl ProcessLauncher for LinuxLauncher {
             .environment_for(
                 &workspace,
                 request.pty.as_ref().map(|pty| pty.term.as_str()),
-                Some(&launch_temp_path),
+                Some(&runtime_temp_path),
             )
             .into_iter()
             .map(|(name, value)| {
@@ -394,7 +447,7 @@ impl ProcessLauncher for LinuxLauncher {
         let wait_control = Arc::clone(&control);
         let spawn_result = std::thread::Builder::new()
             .name("shbox-linux-sandbox-wait".to_string())
-            .spawn(move || wait_process(child, wait_control, launch_temp, wait_tx, domain_lease));
+            .spawn(move || wait_process(child, wait_control, wait_tx, domain_lease));
         if spawn_result.is_err() {
             control.force_terminate();
             control.mark_cleanup_complete();
@@ -416,7 +469,7 @@ impl ProcessLauncher for LinuxLauncher {
     fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
         // Deleting transition: reject new launches first, then wait out the
         // in-flight barrier before touching the cgroup (plan M5).
-        let domain = {
+        let (domain, runtime_temp) = {
             let mut slots = self
                 .registry
                 .slots
@@ -424,11 +477,6 @@ impl ProcessLauncher for LinuxLauncher {
                 .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
             match slots.get_mut(sandbox_id) {
                 None => return Ok(()),
-                Some(slot) if slot.phase == DomainPhase::Deleting => {
-                    return Err(LaunchError::new(
-                        "sandbox process domain deletion is already in progress",
-                    ));
-                }
                 Some(slot) => {
                     slot.phase = DomainPhase::Deleting;
                     // Kill every member now: still-running launches keep an
@@ -462,9 +510,10 @@ impl ProcessLauncher for LinuxLauncher {
                     ));
                 }
             }
-            slots
-                .get_mut(sandbox_id)
-                .and_then(|slot| slot.domain.take())
+            let Some(slot) = slots.get_mut(sandbox_id) else {
+                return Err(LaunchError::new("sandbox process registry is unavailable"));
+            };
+            (slot.domain.take(), slot.runtime_temp.take())
         };
         // Cgroup-authoritative teardown outside the registry lock: kill every
         // member (including detached `setsid()`/double-fork descendants no
@@ -491,13 +540,26 @@ impl ProcessLauncher for LinuxLauncher {
         };
         match teardown() {
             Ok(()) => {
+                if let Some(runtime_temp_ref) = runtime_temp.as_ref()
+                    && let Err(error) = runtime_temp_ref.remove()
+                {
+                    // The cgroup is already gone, but preserve the runtime
+                    // owner in Deleting so the next delete attempt can retry
+                    // filesystem cleanup before durable tree removal.
+                    if let Ok(mut slots) = self.registry.slots.lock() {
+                        if let Some(slot) = slots.get_mut(sandbox_id) {
+                            slot.phase = DomainPhase::Deleting;
+                            slot.domain = None;
+                            slot.runtime_temp = runtime_temp;
+                        }
+                        self.registry.changed.notify_all();
+                    }
+                    return Err(error);
+                }
                 let Ok(mut slots) = self.registry.slots.lock() else {
                     return Ok(());
                 };
                 if let Some(slot) = slots.get_mut(sandbox_id) {
-                    // A launch cannot have recreated a domain: Deleting
-                    // rejects them. Bump the generation for the next runtime.
-                    slot.generation += 1;
                     slot.phase = DomainPhase::Idle;
                     slots.remove(sandbox_id);
                 }
@@ -510,6 +572,7 @@ impl ProcessLauncher for LinuxLauncher {
                 if let Ok(mut slots) = self.registry.slots.lock() {
                     if let Some(slot) = slots.get_mut(sandbox_id) {
                         slot.domain = domain;
+                        slot.runtime_temp = runtime_temp;
                         slot.phase = DomainPhase::Active;
                     }
                     self.registry.changed.notify_all();
@@ -555,7 +618,6 @@ fn kernel_release() -> String {
 fn wait_process(
     mut child: shbox_sandbox::SandboxChild,
     control: Arc<LinuxProcessControl>,
-    launch_temp: LaunchTemp,
     wait_tx: tokio::sync::oneshot::Sender<Result<ProcessExit, LaunchError>>,
     // Held for the waiter's lifetime: dropping it after the launch completes
     // decrements the domain's in-flight count and may retire an empty
@@ -579,7 +641,6 @@ fn wait_process(
     // (docs/lifecycle.md §2.1). They stay owned by the sandbox process
     // domain, which is released only by sandbox deletion or daemon
     // shutdown — never by the direct child's exit.
-    drop(launch_temp);
     control.mark_cleanup_complete();
     let _ = wait_tx.send(result);
 }
@@ -1382,7 +1443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_temp_cleanup_removes_child_created_entries() {
+    async fn runtime_temp_cleanup_removes_child_created_entries() {
         let root = tempfile::tempdir().expect("runtime root");
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
@@ -1401,12 +1462,110 @@ mod tests {
             launched.wait.await.expect("wait channel").expect("wait"),
             ProcessExit::Code(0)
         );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_dir(root.path())
+            .expect("runtime root listing")
+            .next()
+            .is_some()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             fs::read_dir(root.path())
                 .expect("runtime root listing")
                 .count(),
             0,
-            "per-launch temp directory leaked after child exit"
+            "runtime temp directory leaked after the domain became empty"
+        );
+    }
+
+    /// M8: runtime temp belongs to the populated sandbox domain rather than
+    /// the direct-child waiter. A detached descendant can therefore keep
+    /// using the same private `TMPDIR` until explicit domain teardown.
+    #[tokio::test]
+    async fn runtime_temp_survives_direct_child_exit_and_domain_teardown() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                r#"mkdir -p "$TMPDIR/nested"; printf residue > "$TMPDIR/nested/file"; setsid sh -c 'exec sleep 30' & printf '%s' "$!" > "$HOME/keeper.pid"; printf '%s' "$TMPDIR" > "$HOME/tmp.path""#,
+                false,
+            ))
+            .expect("launch");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+
+        let temp_path = std::path::PathBuf::from(
+            fs::read_to_string(workspace.path().join("tmp.path")).expect("runtime temp path"),
+        );
+        assert!(
+            temp_path.starts_with(root.path()),
+            "runtime temp must stay below the shbox runtime root: {}",
+            temp_path.display()
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&temp_path)
+                .expect("runtime temp metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read(temp_path.join("nested/file")).expect("descendant temp file"),
+            b"residue"
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("runtime root listing")
+                .count(),
+            1,
+            "populated runtime must retain exactly one generation tree"
+        );
+
+        let keeper_pid: libc::pid_t = fs::read_to_string(workspace.path().join("keeper.pid"))
+            .expect("keeper pid")
+            .trim()
+            .parse()
+            .expect("numeric keeper pid");
+        assert!(
+            process_alive(keeper_pid),
+            "detached descendant must keep the runtime domain populated"
+        );
+        let runtime_retained_before_release = temp_path.exists();
+
+        launcher
+            .release_sandbox_resources(&"linux-test".parse().expect("sandbox id"))
+            .expect("release runtime domain");
+        assert!(
+            runtime_retained_before_release,
+            "direct-child exit must not remove runtime temp while descendant lives"
+        );
+        assert!(
+            !process_alive(keeper_pid),
+            "domain teardown must kill descendant"
+        );
+        assert!(
+            !temp_path.exists(),
+            "runtime temp must be removed with domain"
+        );
+        assert!(workspace.path().is_dir(), "workspace is durable state");
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("runtime root listing")
+                .count(),
+            0,
+            "runtime root must be empty after domain teardown"
         );
     }
 

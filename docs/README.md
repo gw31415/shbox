@@ -25,7 +25,7 @@
 - **Principal**: 認証済み Ed25519 public key fingerprint と role の組。
 - **Sandbox**: durable metadata と workspace を持つ shbox resource。ID は `[A-Za-z0-9][A-Za-z0-9-]{0,63}`。
 - **Workspace**: sandbox に永続する唯一の writable project tree。
-- **Launch**: shell/exec 一回に対応する disposable process lifecycle。process、PTY、private `TMPDIR` は durable ではない。
+- **Launch**: shell/exec 一回に対応する disposable process lifecycle。process と PTY は durable ではない。Linux の private `TMPDIR` は sandbox runtime-domain generation の寿命を持つ。
 - **ProcessLauncher**: backend-neutral な private launch seam。SSH 層は OS confinement implementation を知らない。
 - **PTY**: shbox が直接 allocate/own する pseudo-terminal。OS confinement layer の責務ではない。
 - **Host mode**: admin key が username `_` を使ったときだけ利用できる daemon account 上の非-sandbox route。
@@ -42,7 +42,7 @@ SSH/session layer
             macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
 ```
 
-Linux では workspace 内の shbox-sandbox crate が confinement engine を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（cgroup は resource limits を設定した場合のみ、delegation が必要）。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
+Linux では workspace 内の shbox-sandbox crate が confinement engine と sandbox process domain cgroup を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（Linux launch には writable な cgroup delegation が必要）。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
 
 ## Change discipline
 

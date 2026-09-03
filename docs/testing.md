@@ -103,19 +103,19 @@ Linux production backendはworkspace内の`shbox-sandbox` engine（landlock 0.4 
 - full native OpenSSH/PTTY suite
 - `cargo check --all-targets`
 
-resource limit 無指定の sandbox availability には control-group delegation は不要である。resource limit を検証する場合は、書き込み可能な cgroup v2 parent が必要であり、無い場合はその launch が fail closed する。環境診断として `/proc/self/cgroup` を表示する。
+Linux sandbox availability には、resource limit の有無にかかわらず書き込み可能な cgroup v2 parent が必要である。無い場合は launch が fail closed する。環境診断として `/proc/self/cgroup` を表示する。
 
 ### 5.1 Filesystem proof
 
 実launcherで最低限次を証明する。
 
 - workspace read/write成功
-- per-launch `TMPDIR` read/write成功
+- sandbox-runtime-scoped `TMPDIR` read/write成功（Linux）
 - sandbox外write拒否
 - 選択したsensitive sandbox外read拒否
 - configured read-only pathはreadのみ許可
 - sibling workspace / sibling launch-tempにgrantがない
-- child-created temp entriesを含めlaunch tempがcleanupされる
+- child-created temp entriesを含め、runtime domain drain後にLinux runtime tempがcleanupされる
 
 ### 5.2 Network proof
 
@@ -280,7 +280,7 @@ GitHub native gateがgreenでも、Fly production tupleのacceptanceを代用し
 - graceful daemon shutdown
 - Linux daemon SIGKILL時のdirect-child parent-death behavior
 - deliberately detached descendantの明示的な制約確認
-- resource limit 無指定時に sandbox launch が control-group filesystem write を要求せず、指定時だけ delegated cgroup v2 files を使うこと
+- resource limit の有無にかかわらず sandbox launch が delegated cgroup v2 process domain を使い、指定 limit が同じ domain に適用されること
 
 このproduction acceptanceがないtupleを「Fly verified」と記載してはならない。
 

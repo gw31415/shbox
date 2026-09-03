@@ -122,7 +122,7 @@ validation:
 - duplicate canonical path 禁止
 - shbox config/data/state roots 自身やその subtree を expose しないこと
 
-この値は write permission を与えない。workspace/private launch temp の write grant は request-local policy からのみ作る。
+この値は write permission を与えない。workspace/private runtime temp の write grant は shbox の launch policy からのみ作る。
 
 OS が ordinary command runtime に必要とする system/runtime path は implementation の curated set として別途追加され、public config には列挙しない。
 
@@ -137,13 +137,13 @@ OS が ordinary command runtime に必要とする system/runtime path は imple
 | `pids_max` | `pids.max`、process count | `RLIMIT_NPROC`、OS/user-scope の process limit |
 | `cpu_quota_micros` | `cpu.max` の quota、microseconds of CPU per period | unsupported。指定時は fail closed |
 | `cpu_period_micros` | `cpu.max` の period、1000..=1000000（quota 指定時だけ有効。default 100000） | CPU quota が unsupported のため、quota なしでは効果なし |
-| `cgroup_parent` | per-`SandboxId` resource domain cgroup の作成先となる absolute cgroup v2 directory | 使用しない |
+| `cgroup_parent` | per-`SandboxId` process domain cgroup の作成先となる absolute cgroup v2 directory | 使用しない |
 
-`memory_max`、`swap_max`、`pids_max`、`cpu_quota_micros` の省略は `Inherit` であり、その controller に対する sandbox-local の変更を行わない。public shbox adapter でこれらのいずれかを指定すると、`SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch はその domain を共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初から domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。daemon crash 時の orphan process や resource domain を自動 cleanup する保証ではない。明示 limit は ancestor cgroup の制限に追加される制限であり、child が親・祖先 cgroup の制限を解除または引き上げることはできない。
+`memory_max`、`swap_max`、`pids_max`、`cpu_quota_micros` の省略は `Inherit` であり、その controller に対する sandbox-local の変更を行わない。public shbox adapter は設定の有無にかかわらず `SandboxId` ごとに一つの durable な process domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch はその domain を共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初から domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。daemon crash 時の orphan process や resource domain を自動 cleanup する保証ではない。明示 limit は ancestor cgroup の制限に追加される制限であり、child が親・祖先 cgroup の制限を解除または引き上げることはできない。
 
 なお、`shbox-sandbox::Sandbox::spawn` を直接利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。これは public shbox adapter の `SandboxId` 共有 domain とは別の lifecycle である。
 
-`cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、必要な controller（`memory` / `cpu` / `pids`）を `subtree_control` に有効化できる最初の階層を使う。書き込み可能な階層が無ければ resource-limit launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=yes` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。
+`cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、process domain を作成できる階層を使う。書き込み可能な階層が無ければ Linux sandbox launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=yes` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。
 
 macOS の `memory_max` は `RLIMIT_AS`、`pids_max` は `RLIMIT_NPROC` として child の exec 前に設定され、descendant に継承される。これらは Linux cgroup tree quota ではない。
 
@@ -197,7 +197,7 @@ SSH client の `env` request は受理して sandbox environment に加えない
 HOME=<sandbox workspace>
 PWD=<sandbox workspace>
 SHELL=<validated configured/resolved shell>
-TMPDIR=<unique private launch directory>
+TMPDIR=<private sandbox-runtime directory on Linux; unique launch directory on macOS>
 ```
 
 PTY request 時:
@@ -208,7 +208,7 @@ TERM=<pty-req term>
 
 これらは `[sandbox.env]` より authoritative であり shadow できない。
 
-private `TMPDIR` は launch ごとに unique、owner-only directory とし、launch cleanup で recursive に削除する。host-wide `/tmp` を writable sandbox path として自動 grant しない。
+Linux の private `TMPDIR` は sandbox runtime-domain generation ごとに一つ、macOS では launch ごとに一つ作る。いずれも owner-only directory とし、Linux では cgroup が空になり in-flight launch がなくなった後、macOS では launch cleanup で recursive に削除する。host-wide `/tmp` を writable sandbox path として自動 grant しない。
 
 ## 6. Built-in concurrency caps
 

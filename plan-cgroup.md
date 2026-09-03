@@ -7,28 +7,10 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 ## Current state
 
 - M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
-- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam として履歴に保存済み。M7 は Linux/macOS の PTY master close と実 SSH acceptance まで完了し、このコミットで保存する。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance まで履歴に保存済み。M8 の runtime temp generation ownership がこのコミットで保存され、次は M9 の cgroup-authoritative delete である。delete・shutdown・publication 前失敗は terminate path を維持する。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M8 — Move transient runtime resources to sandbox-runtime scope
-
-Goal: Linux の `TMPDIR` を per-launch から runtime-domain generation 所有へ移し、direct child 終了後も detached descendant が使えるようにする。
-
-Implementation:
-
-- `crates/shbox/src/platform/linux.rs` の `LinuxLauncher` / domain slot に、active generation 固有の runtime temp owner または同等の明示的 cleanup state を追加する。
-- `crates/shbox/src/platform/policy.rs` と `crates/shbox/src/paths.rs` の runtime tree を使い、`sandbox-<opaque-id>-<generation>/tmp` を mode `0700` で作る。user の sandbox ID をそのまま control-group/path 名にしない。
-- Linux launch は同一 generation の全 launch に同じ runtime temp を渡し、direct-child waiter の終了時には削除しない。
-- cgroup が `populated=0` かつ `in_flight=0` になり generation が idle になった時だけ temp を削除し、次の launch では新しい generation を作る。workspace は削除しない。
-- child-created entries、canonical path、作成失敗、delete/shutdown cleanup の retry/error policy を明示する。
-
-Proof:
-
-- detached descendant が `TMPDIR` の下に作った file を direct child 終了後も読めることを integration test で確認する。
-- domain が空になった後に runtime temp が消え、workspace が残ることを確認する。
-- `cargo fmt --package shbox`（自動修正）後に `cargo fmt --package shbox -- --check`、`cargo check --workspace --all-targets`、対象テスト、workspace clippy を実行する。
 
 ## M9 — Make sandbox delete cgroup-authoritative
 

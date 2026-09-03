@@ -35,11 +35,11 @@ sandbox は次の durable state を持つ。
 - lifecycle metadata
 - workspace
 
-process、PTY、environment、launch temp は durable sandbox stateではない。
+process、PTY、environment、runtime temp は durable sandbox stateではない。
 
 ### 3.3 Launch
 
-一回の shell または exec request は一つの disposable launch を作る。同じ sandbox の複数 launch は workspace を共有できるが、process/session/PTY/TMPDIR はそれぞれ独立する。
+一回の shell または exec request は一つの disposable launch を作る。同じ sandbox の複数 launch は workspace と（Linuxでは）同じ runtime-domain generation の `TMPDIR` を共有できるが、process/session/PTY はそれぞれ独立する。
 
 ### 3.4 SSH connection と channel
 
@@ -130,7 +130,7 @@ workspace と metadata は明示deleteまで残る。session切断やprocess終�
 - process/session/process group
 - PTY
 - pipe endpoints
-- private per-launch `TMPDIR`
+- private runtime-scoped `TMPDIR` (Linux); private per-launch temp (macOS)
 - runtime lease
 
 shbox は同じworkspaceを使う複数process間のapplication-level file lock/single-writer semanticsを提供しない。
@@ -170,7 +170,7 @@ Linux の engine-owned direct sandbox child には parent-death behavior が設�
 sandbox launchは次のwrite surfaceだけを意図する。
 
 - own workspace
-- own private launch temp
+- own private runtime temp on Linux; own private launch temp on macOS
 - `/dev/null`
 
 curated runtime/system pathsとoperatorの`read_paths`はread-onlyである。他sandbox workspace、shbox config/state/metadata、host-shared temporary treeを自動で公開しない。
@@ -191,7 +191,7 @@ sandbox launchは最低限次をshboxが管理する。
 - `HOME=<workspace>`
 - `PWD=<workspace>`
 - `SHELL=<validated shell>`
-- `TMPDIR=<private launch temp>`
+- `TMPDIR=<private runtime temp>` on Linux; per-launch private temp on macOS
 - PTY時の`TERM=<pty-req value>`
 
 operatorは`[sandbox.env]`から追加environmentを与えられるが、loader/interpreter/proxy/launcher injectionに使えるreserved names/prefixesは拒否する。SSH `env` requestはsandbox環境へ反映しない。

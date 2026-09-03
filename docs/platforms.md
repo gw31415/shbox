@@ -16,7 +16,7 @@ SSH/session layer
                    via /usr/bin/sandbox-exec
 ```
 
-`ProcessLauncher` は private test seam であり public backend selector ではない。shbox の policy 層は backend-neutral で、shell、network mode、read-only paths、environment、private launch temp root、resource limits を表現し、launch ごとに explicit な engine `SandboxConfig` へ解決する。engine crate 自体は preset/profile を持たない（[crates/shbox-sandbox](../crates/shbox-sandbox/README.md)）。
+`ProcessLauncher` は private test seam であり public backend selector ではない。shbox の policy 層は backend-neutral で、shell、network mode、read-only paths、environment、private runtime temp root、resource limits を表現し、launch ごとに explicit な engine `SandboxConfig` へ解決する。engine crate 自体は preset/profile を持たない（[crates/shbox-sandbox](../crates/shbox-sandbox/README.md)）。
 
 両 platform とも shbox 自身が次を所有する。
 
@@ -26,7 +26,7 @@ SSH/session layer
 - controlling terminal
 - terminal modes/size
 - signal/resize forwarding
-- launch temp cleanup
+- runtime temp cleanup
 
 confinement library/tool に PTY ownership を委譲しない。
 
@@ -41,10 +41,10 @@ parent process は child を作る前に:
 - Landlock ABI を detect
 - filesystem/network policy を Landlock ruleset として構築（path fd はこの時点で open・pin される）
 - seccomp policy があれば BPF program まで compile
-- resource limit が設定されていれば、direct engine spawn では one-shot cgroup、public shbox adapter では `SandboxId` 共有 resource domain cgroup を child 生成前に準備し limit を書き込む
+- public shbox adapter は resource limit の有無にかかわらず `SandboxId` 共有 process domain cgroup を child 生成前に準備し、explicit limit があれば同じ domain に書き込む
 - argv/envp/cwd を C string まで marshal
 
-する。実際の `clone3` は process-lifetime の専用 spawn-owner thread が担当するため、`PR_SET_PDEATHSIG` の親 thread は短命な Tokio blocking worker にならない。PID namespace 無しでは user child を `clone3(CLONE_PIDFD | … | CLONE_INTO_CGROUP)`（limit 時）で直接生成する。PID namespace 有りでは outer clone を内部 PID1 supervisor/reaper とし、resource limit があれば PID1 が nested `clone3(CLONE_INTO_CGROUP)` で user PID2 を quota cgroup 内へ直接生成する。post-clone path は固定順序・allocation-free で、path lookup、policy allocation、filter compile を行わない。
+する。実際の `clone3` は process-lifetime の専用 spawn-owner thread が担当するため、`PR_SET_PDEATHSIG` の親 thread は短命な Tokio blocking worker にならない。PID namespace 無しでは user child を `clone3(CLONE_PIDFD | … | CLONE_INTO_CGROUP)` で直接生成する。PID namespace 有りでは outer clone を内部 PID1 supervisor/reaper とし、user PID2 を同じ process domain cgroup 内へ直接生成する。post-clone path は固定順序・allocation-free で、path lookup、policy allocation、filter compile を行わない。
 
 engine の invariant（no_new_privs、capability drop、FD hygiene、setup 失敗時の fail-closed、pidfd supervision）は shbox policy からは弱められない。
 
@@ -53,7 +53,7 @@ engine の invariant（no_new_privs、capability drop、FD hygiene、setup 失�
 per launch write access:
 
 - current sandbox workspace
-- unique private launch temp
+- sandbox-runtime-scoped private temp on Linux; unique private launch temp on macOS
 - `/dev/null`
 
 curated read-only baseline は ordinary command runtime に必要な system binaries/libraries、select TLS/resolver/account data、entropy devices、`/dev/tty` に限定する。
@@ -88,9 +88,9 @@ non-PTY childもnew sessionを作り、pipesをfd0/1/2へ接続して同じconfi
 
 setup failureはstatus pipeでparentへ返し、partially configured childを公開しない。
 
-### 2.6 cgroup v2（resource limits を設定した場合のみ）
+### 2.6 cgroup v2 process domain
 
-`[sandbox]` に resource limit（`memory_max` / `swap_max` / `pids_max` / `cpu_quota_micros`）を設定すると、public shbox adapter は `SandboxId` ごとに一つの durable resource domain cgroup を作り、同じ sandbox の全 concurrent launch を `clone3(CLONE_INTO_CGROUP)` で最初からその cgroup に入れる（limit 適用前の window が存在しない）。child exit では shared domain を削除せず、sandbox deletion が runtime cleanup を完了した後に release/remove する。これらを 1 つも設定しなければ cgroup は不要で、cgroupfs は変更しない。`cpu_period_micros` 単独では cgroup を作らず、CPU quota と組み合わせた場合だけ有効である。direct `shbox-sandbox::Sandbox::spawn` は resource limit 指定時に one-shot per-launch cgroup を所有する。
+public shbox adapter は resource limit の有無にかかわらず `SandboxId` ごとに一つの durable process domain cgroup を作り、同じ sandbox の全 concurrent launch を `clone3(CLONE_INTO_CGROUP)` で最初からその cgroup に入れる（limit 適用前の window が存在しない）。explicit limit があれば同じ domain に適用し、すべて `Inherit` でも process ownership boundary として cgroup を保持する。child exit では shared domain を削除せず、sandbox deletion が runtime cleanup を完了した後に release/remove する。`cpu_period_micros` 単独では cgroup limit を変更しない。direct `shbox-sandbox::Sandbox::spawn` は resource limit 指定時に one-shot per-launch cgroup を所有する。
 
 cgroup parent は auto-discovery（自身の cgroup から上位へ、必要 controller を `subtree_control` に有効化できる最初の階層）または `[sandbox] cgroup_parent` で明示指定できる。書き込み可能な cgroup 階層が無い場合、resource limit がある構成は fail closed する。
 

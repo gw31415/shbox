@@ -93,7 +93,7 @@ workspace/metadata操作はsafe directory/file primitiveとdurable lifecycle sta
 sandbox processの意図したwrite surface:
 
 - own workspace
-- own private per-launch temp directory
+- own private runtime temp directory on Linux; per-launch temp on macOS
 - `/dev/null`
 
 system/runtimeのcurated pathとconfigured `read_paths`はread-only。other sandbox、shbox config/data/state、host shared tempをbroad write grantしない。
@@ -110,7 +110,7 @@ policyには:
 - network mode
 - curated/configured read paths
 - operator environment
-- private launch temp root
+- private runtime temp root (Linux generation-scoped; per-launch on macOS)
 - configured resource limits with platform-specific enforcement
 
 file-size、open-file、workspace disk quota は持たない。
@@ -215,7 +215,7 @@ production-provider acceptanceではこのdetached behaviorを明示的に観測
 
 shbox v0.1は、設定された resource limit を sandbox ごとに platform ごとの primitive で適用する。Linux は cgroup v2、macOS は `memory_max` を `RLIMIT_AS`、`pids_max` を `RLIMIT_NPROC` として扱う。macOS の rlimit は Linux のような sandbox process-tree cgroup accounting ではない。
 
-Linux の public shbox adapter では、明示 limit を持つ `SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch が共有する。child はその domain に直接生成され、child exit では domain を削除しない。sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。limit を省略した分野は `Inherit` であり、sandbox-local の制限を書き換えない。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。
+Linux の public shbox adapter では、limit の有無にかかわらず `SandboxId` ごとに一つの durable な process domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch が共有する。child はその domain に直接生成され、child exit では domain を削除しない。sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。limit を省略した分野は `Inherit` であり、その controller の sandbox-local 制限を書き換えない。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。
 
 limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。daemon crash 時の orphan process や durable resource domain の自動 cleanup は、この lifecycle contract に含めない。
 

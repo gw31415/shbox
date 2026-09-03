@@ -75,7 +75,7 @@ $XDG_DATA_HOME/shbox/sandboxes/<id>/     metadata + workspace
 
 $XDG_STATE_HOME/shbox/host_key
 $XDG_STATE_HOME/shbox/lock
-$XDG_STATE_HOME/shbox/runtime/           per-launch private temp root
+$XDG_STATE_HOME/shbox/runtime/           sandbox-runtime private temp root
 ```
 
 shbox が作成する directory は owner-only を要求し、symlink や group/world writable path を拒否する。config directory は operator input なので自動作成しない。
@@ -105,7 +105,7 @@ backend-neutral policy は一度だけ構築し、以下を保持する。
 - `disabled` / `outbound` network policy
 - curated + configured read-only paths
 - operator sandbox environment
-- per-launch private temp root
+- private runtime temp root (Linux generation-scoped; per-launch on macOS)
 - configured per-sandbox resource limits with platform-specific enforcement
 
 file-size、open-file、workspace disk quota は policy に存在しない。
@@ -137,7 +137,7 @@ PTY/session setup は shbox child setup が行い、その後固定 OS コンポ
 
 現在の shbox Linux adapter は `network = "disabled"` を fresh user+network namespace に写像し、host/external network reachability を切り離す。child は exec 前に capability を drop するため、sandboxed program は初期状態で down の loopback を有効化できない。さらに Landlock の network rights（ABI 4+）で TCP `bind`/`connect` も deny する。`outbound` は host network namespace を共有する。
 
-resource limit を指定した public shbox Linux launch は、`SandboxId` ごとに一つの durable な resource domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch で共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初からその domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に release/remove する。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。明示 limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。macOS は `memory_max` を `RLIMIT_AS`、`pids_max` を `RLIMIT_NPROC` として exec 前に適用し、CPU quota と swap limit は unsupported として fail closed する。
+すべての public shbox Linux launch は、resource limit の有無にかかわらず `SandboxId` ごとに一つの durable な process domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch で共有する。child は `clone3(CLONE_INTO_CGROUP)` で最初からその domain 内に生成されるため、limit 適用前の window は存在しない。child が終了しても domain は削除せず、sandbox deletion が runtime cancellation と child cleanup を完了した後に release/remove する。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。明示 limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。macOS は `memory_max` を `RLIMIT_AS`、`pids_max` を `RLIMIT_NPROC` として exec 前に適用し、CPU quota と swap limit は unsupported として fail closed する。
 
 ## 5. Startup and readiness
 
@@ -173,10 +173,10 @@ launch ごとの disposable state:
 - engine-owned direct child + logical user process group/session（PID namespace 有りでは direct child は内部 PID1、user process は PID2）
 - PTY master/slave（PTY request 時）
 - stdin/stdout/stderr pipes（non-PTY 時）
-- private `TMPDIR`
+- sandbox-runtime-scoped private `TMPDIR` (Linux); per-launch private temp on macOS
 - runtime lease
 
-workspace は `HOME` と initial `PWD` になる。shell は `SHELL`。PTY request があると `TERM` は request 値が authoritative で、`TMPDIR` は shbox の private launch directory が authoritative である。
+workspace は `HOME` と initial `PWD` になる。shell は `SHELL`。PTY request があると `TERM` は request 値が authoritative で、`TMPDIR` は shbox の private runtime directory が authoritative である。Linux では同じ sandbox runtime-domain generation の launch が同じ `TMPDIR` を共有し、domain が空になった後にだけ削除する。
 
 ## 8. PTY lifecycle
 

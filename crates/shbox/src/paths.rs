@@ -138,7 +138,7 @@ impl Paths {
         &self.state_lock
     }
 
-    /// Root of per-launch private temp directories used as sandbox `TMPDIR`.
+    /// Root of private runtime temp trees used as sandbox `TMPDIR`.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
     }

@@ -2,16 +2,16 @@
 //!
 //! This module is the single owner of "what shbox allows": the configured
 //! shell, the network mode, the curated readable system paths, the per-launch
-//! writable workspace, and the private per-launch temporary directory. It
+//! writable workspace, and the private runtime temporary directory. It
 //! deliberately contains no resource limits (CPU, memory, file size, open
 //! files, PID counts) and no confinement-backend types: Linux maps this
 //! snapshot into an explicit `shbox-sandbox` engine configuration, and no
 //! backend detail leaks back through this interface.
 //!
 //! Every writable location is granted per launch, never in the base policy:
-//! the sandbox workspace, `/dev/null` on Linux, and the launch temp
+//! the sandbox workspace, `/dev/null` on Linux, and the runtime temp
 //! directory. A launch therefore cannot grant a sibling sandbox workspace or
-//! a sibling launch temp by construction.
+//! a sibling runtime temp by construction.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -259,7 +259,8 @@ impl SandboxLaunchPolicy {
         self.cgroup_parent.as_deref()
     }
 
-    /// The shbox-owned runtime temp root; each launch creates a unique
+    /// The shbox-owned runtime temp root; Linux creates one directory per
+    /// sandbox runtime-domain generation and macOS creates one per launch.
     // Consumed by the Linux/macOS launchers (Milestones 3-4).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn temp_root(&self) -> &Path {
@@ -283,8 +284,9 @@ impl SandboxLaunchPolicy {
     /// Build the engine sandbox configuration for one launch.
     ///
     /// This is the single place where shbox's own policy — the curated
-    /// readable system paths, the per-launch writable workspace and temp
-    /// directory, the operator's network mode, and the operator's resource
+    /// readable system paths, the per-launch writable workspace and
+    /// runtime-scoped temp directory, the operator's network mode, and the
+    /// operator's resource
     /// limits — is resolved into an explicit
     /// [`shbox_sandbox::SandboxConfig`]. The engine crate itself ships no
     /// profiles: every restriction here is deliberate shbox policy.
@@ -383,10 +385,10 @@ impl SandboxLaunchPolicy {
     /// The environment for one sandbox process: workspace-scoped basics, the
     /// operator sandbox env, and the request-authoritative overrides.
     ///
-    /// A `pty-req` is authoritative for `TERM`, and the launch temp directory
+    /// A `pty-req` is authoritative for `TERM`, and the runtime temp directory
     /// is authoritative for `TMPDIR`; neither can be shadowed by an operator
     /// `sandbox.env` entry. Passing `None` for the temp directory is the
-    /// callers that omit a launch temp leave `TMPDIR` untouched.
+    /// callers that omit a temp directory leave `TMPDIR` untouched.
     pub(crate) fn environment_for(
         &self,
         workspace: &Path,
@@ -466,6 +468,68 @@ impl SandboxLaunchPolicy {
             "sandbox launch temp directory could not be allocated",
         ))
     }
+
+    /// Create a private Linux runtime temp tree for one process-domain
+    /// generation. The random component is the opaque runtime identity; the
+    /// generation is diagnostic and prevents an idle runtime from reusing an
+    /// earlier tree name.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_runtime_temp(&self, generation: u64) -> Result<RuntimeTemp, LaunchError> {
+        const RANDOM_BYTES: usize = 16;
+        for _ in 0..32 {
+            let random: [u8; RANDOM_BYTES] = rand::random();
+            let hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            let root = self.temp_root.join(format!("sandbox-{hex}-{generation}"));
+            let path = root.join("tmp");
+            let created_root = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&root)
+            };
+            match created_root {
+                Ok(()) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+                    if let Err(error) = crate::paths::validate_dir(&root) {
+                        let _ = fs::remove_dir(&root);
+                        return Err(LaunchError::new(format!(
+                            "sandbox runtime temp root is not private: {error}"
+                        )));
+                    }
+                    let created_tmp = {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let mut builder = fs::DirBuilder::new();
+                        builder.mode(0o700);
+                        builder.create(&path)
+                    };
+                    if let Err(error) = created_tmp {
+                        let _ = remove_launch_temp_tree(&root);
+                        return Err(LaunchError::new(format!(
+                            "sandbox runtime temp directory could not be created: {error}"
+                        )));
+                    }
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+                    if let Err(error) = crate::paths::validate_dir(&path) {
+                        let _ = remove_launch_temp_tree(&root);
+                        return Err(LaunchError::new(format!(
+                            "sandbox runtime temp directory is not private: {error}"
+                        )));
+                    }
+                    return Ok(RuntimeTemp { root, path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    return Err(LaunchError::new(
+                        "sandbox runtime temp root could not be created",
+                    ));
+                }
+            }
+        }
+        Err(LaunchError::new(
+            "sandbox runtime temp could not be allocated",
+        ))
+    }
 }
 
 fn canonicalize_existing_paths(paths: &mut Vec<PathBuf>) {
@@ -540,6 +604,45 @@ fn remove_launch_temp_tree(path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
     } else {
         fs::remove_dir_all(path)
+    }
+}
+
+/// An owned Linux runtime temp tree. Its lifetime is the process-domain
+/// generation, not one direct child launch.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct RuntimeTemp {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeTemp {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove the generation root while retaining ownership for a retry if
+    /// the filesystem temporarily refuses the operation.
+    pub(crate) fn remove(&self) -> Result<(), LaunchError> {
+        remove_launch_temp_tree(&self.root).map_err(|error| {
+            LaunchError::new(format!(
+                "sandbox runtime temp directory could not be removed: {error}"
+            ))
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RuntimeTemp {
+    fn drop(&mut self) {
+        if let Err(error) = remove_launch_temp_tree(&self.root) {
+            tracing::warn!(
+                path = %self.root.display(),
+                error = %error,
+                "could not remove sandbox runtime temp directory"
+            );
+        }
     }
 }
 

@@ -74,7 +74,7 @@ scriptは次をfail-closedで確認する。
 - full OpenSSH/PTTY acceptance
 - `cargo check --all-targets`
 
-resource limit を設定しない sandbox launch では control-group delegation は前提ではない。resource limit を設定する場合は、書き込み可能な cgroup v2 parent が必要で、`/proc/self/cgroup` はその capability 診断として表示する。
+Linux sandbox launch では resource limit の有無にかかわらず書き込み可能な cgroup v2 parent が必要で、`/proc/self/cgroup` はその capability 診断として表示する。
 
 ### macOS
 
@@ -124,7 +124,7 @@ Linux sandboxはworkspace内crate `shbox-sandbox`（landlock `0.4` / seccompiler
 release時に確認する契約:
 
 - Landlock filesystem confinementが実kernelでprepare/applyできる
-- workspaceとlaunch tempだけがrequest-local write grantを持つ
+- workspaceとruntime tempだけがsandbox launchのwrite grantを持つ
 - selected outside readが拒否される
 - outside writeが拒否される
 - `network = "disabled"` でfresh network namespaceが使われ、実TCP `connect()`と実UDP送信のhost/external reachabilityが拒否される
@@ -184,7 +184,7 @@ runtime proof:
 14. graceful shbox shutdown cleanup
 15. Linux daemon SIGKILL時のengine-owned direct child parent-death behavior（clone ownerがprocess-lifetime threadであることを含む）
 16. deliberately detached new-session descendantの挙動記録
-17. resource limit 無指定の sandbox launch が writable control-group controller files を必要とせず、resource limit 指定時だけ delegated cgroup v2 files を使うこと
+17. resource limit の有無にかかわらず delegated cgroup v2 process domain を使い、指定 limit が同じ domain に適用されること
 
 このacceptanceはfilesystem/network grantを文書化されたpolicyより広げて通してはならない。
 
@@ -223,7 +223,7 @@ CIはproduction source/deployに次の種類のarchitecture regressionが戻っ�
 - sibling sandbox launcher helper
 - launcher control/self-exec environment path
 - project-owned external sandbox CLI invocation（macOSの固定OS component `/usr/bin/sandbox-exec` は許可）
-- resource limit 無指定時の sandbox 用 control-group filesystem writes/delegation requirements（resource limit 指定時の cgroup v2 操作は許可）
+- sandbox process domain の control-group filesystem writes/delegation requirements
 
 これらのstatic guardに加え、native behavior gateも必須である。
 
