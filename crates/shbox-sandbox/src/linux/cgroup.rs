@@ -70,10 +70,9 @@ impl Cgroup {
     /// would risk stranding live processes in a removed domain.
     pub fn is_populated(&self) -> io::Result<bool> {
         let events = read_control(&self.dir, "cgroup.events")?;
-        Ok(events
-            .lines()
-            .any(|line| line.trim_start().starts_with("populated ")
-                && line.trim_start().ends_with('1')))
+        Ok(events.lines().any(|line| {
+            line.trim_start().starts_with("populated ") && line.trim_start().ends_with('1')
+        }))
     }
 
     /// Block until `populated` reads `0` or `timeout` elapses.
@@ -92,8 +91,7 @@ impl Cgroup {
             if !self.is_populated()? {
                 return Ok(true);
             }
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
-            else {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return Ok(false);
             };
             let slice = remaining.min(std::time::Duration::from_millis(50));
@@ -127,10 +125,7 @@ impl Cgroup {
     /// Removal never kills: a populated domain is the caller's explicit
     /// problem (`kill_all` first, then wait, then remove). Idempotent.
     pub fn remove_empty(&self) -> io::Result<()> {
-        if self
-            .removed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.removed.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         if self.is_populated().unwrap_or(true) {
@@ -139,9 +134,7 @@ impl Cgroup {
                 "sandbox cgroup still contains processes",
             ));
         }
-        let already_removed =
-            self.removed
-                .swap(true, std::sync::atomic::Ordering::AcqRel);
+        let already_removed = self.removed.swap(true, std::sync::atomic::Ordering::AcqRel);
         if already_removed {
             return Ok(());
         }
@@ -151,10 +144,7 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        if !self
-            .removed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !self.removed.load(std::sync::atomic::Ordering::Acquire) {
             // Best-effort cleanup of an unreleased cgroup. It never kills:
             // processes still inside are somebody's live sandbox members.
             let _ = self.remove_empty();

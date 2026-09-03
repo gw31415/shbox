@@ -184,17 +184,17 @@ pub struct NamespacePolicy {
 
 /// Resource limits applied per sandbox.
 ///
-/// Every field is independent and tri-state. If *any* field is not
-/// [`Limit::Inherit`], the Linux backend requires a writable cgroup v2
-/// hierarchy and places the user process into a cgroup via
-/// `clone3(CLONE_INTO_CGROUP)`. With a PID namespace, the internal PID 1
-/// supervisor stays outside that user resource cgroup and creates PID 2 into
-/// it atomically. [`Sandbox::spawn`](crate::Sandbox::spawn)
-/// uses a one-shot cgroup whose lifetime follows that child; callers that
-/// need a durable aggregate quota can create a shared Linux resource domain
-/// and launch multiple children into it. On macOS, `memory_bytes` maps to
-/// `RLIMIT_AS` and `pids` maps to `RLIMIT_NPROC`; `swap_bytes` and `cpu_max`
-/// are unsupported and fail closed.
+/// Every field is independent and tri-state. A direct
+/// [`Sandbox::spawn`](crate::Sandbox::spawn) requires a writable cgroup v2
+/// hierarchy only when a field contributes a limit and uses a one-shot cgroup
+/// whose lifetime follows that child. A [`ProcessDomain`](crate::ProcessDomain)
+/// always owns a cgroup, including when every field is [`Limit::Inherit`], so
+/// callers can enforce aggregate process ownership across multiple launches.
+/// Linux children are created in their domain via `clone3(CLONE_INTO_CGROUP)`;
+/// with a PID namespace, the internal PID 1 supervisor creates user PID 2 in
+/// the same domain atomically. On macOS, `memory_bytes` maps to `RLIMIT_AS`
+/// and `pids` maps to `RLIMIT_NPROC`; `swap_bytes` and `cpu_max` are
+/// unsupported and fail closed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Linux `memory.max`; macOS `RLIMIT_AS`: hard address-space ceiling in
@@ -219,10 +219,12 @@ pub struct CpuMax {
 }
 
 impl ResourceLimits {
-    /// Whether the Linux backend needs a dedicated sandbox cgroup.
+    /// Whether a direct spawn needs a dedicated resource cgroup.
     ///
-    /// The macOS backend does not use this query: its supported fields are
-    /// applied with `setrlimit`.
+    /// The public Linux process-domain adapter creates a cgroup regardless of
+    /// this query; it is retained for direct one-shot engine spawns. The
+    /// macOS backend does not use this query: its supported fields are applied
+    /// with `setrlimit`.
     pub fn requires_cgroup(&self) -> bool {
         self.memory_bytes.requires_own_cgroup()
             || self.swap_bytes.requires_own_cgroup()

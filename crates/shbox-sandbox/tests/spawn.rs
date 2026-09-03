@@ -1114,15 +1114,15 @@ mod linux_only {
             command.stdin = Stdio::Null;
             command.stdout = Stdio::Pipe;
             command.stderr = Stdio::Null;
-            let mut child =
-                match sandbox.spawn_in_process_domain(command, config.clone(), &domain) {
-                    Ok(child) => child,
-                    Err(SandboxError::Unsupported { feature, reason }) => {
-                        eprintln!("skipping: {feature} unsupported here: {reason}");
-                        return None;
-                    }
-                    Err(error) => panic!("unexpected {label} spawn error: {error}"),
-                };
+            let mut child = match sandbox.spawn_in_process_domain(command, config.clone(), &domain)
+            {
+                Ok(child) => child,
+                Err(SandboxError::Unsupported { feature, reason }) => {
+                    eprintln!("skipping: {feature} unsupported here: {reason}");
+                    return None;
+                }
+                Err(error) => panic!("unexpected {label} spawn error: {error}"),
+            };
             let mut stdout = String::new();
             if let Some(mut pipe) = child.take_stdout() {
                 pipe.read_to_string(&mut stdout).expect("read stdout");
@@ -1193,15 +1193,15 @@ mod linux_only {
 
         let mut first_command = CommandSpec::new("/bin/sleep");
         first_command = first_command.arg("30");
-        let mut first = match sandbox.spawn_in_process_domain(first_command, config.clone(), &domain)
-        {
-            Ok(child) => child,
-            Err(SandboxError::Unsupported { feature, reason }) => {
-                eprintln!("skipping: {feature} unsupported here: {reason}");
-                return;
-            }
-            Err(error) => panic!("unexpected first domain spawn error: {error}"),
-        };
+        let mut first =
+            match sandbox.spawn_in_process_domain(first_command, config.clone(), &domain) {
+                Ok(child) => child,
+                Err(SandboxError::Unsupported { feature, reason }) => {
+                    eprintln!("skipping: {feature} unsupported here: {reason}");
+                    return;
+                }
+                Err(error) => panic!("unexpected first domain spawn error: {error}"),
+            };
 
         // A populated domain refuses removal: the live child is the kernel's
         // authoritative membership, not the Rust handle count.
@@ -1228,7 +1228,6 @@ mod linux_only {
         assert_eq!(second.wait().expect("wait second child").code(), Some(0));
         domain.remove_empty().expect("remove idle resource domain");
     }
-
 
     /// `docs/lifecycle.md` §2.1: a normally-exiting direct child must not
     /// terminate its descendants. This is the engine-level contract test for
@@ -1423,11 +1422,8 @@ mod linux_only {
                 Err(error) => panic!("unexpected first spawn error: {error}"),
             };
 
-        let same_domain = sandbox.spawn_in_process_domain(
-            CommandSpec::new("/bin/true"),
-            config.clone(),
-            &domain,
-        );
+        let same_domain =
+            sandbox.spawn_in_process_domain(CommandSpec::new("/bin/true"), config.clone(), &domain);
         assert!(
             same_domain.is_err(),
             "a second process in the same pids.max=1 domain must be rejected"
@@ -1454,6 +1450,80 @@ mod linux_only {
             .expect("remove independent resource domain");
     }
 
+    #[test]
+    fn process_domain_pids_limit_counts_forked_descendants() {
+        if !landlock_ready() {
+            eprintln!("skipping: kernel has no Landlock");
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = restricted_to(workspace.path());
+        config.resources = ResourceLimits {
+            // The shell and its one background child consume the complete
+            // aggregate budget. A second launch must not bypass it merely
+            // because the manager would see only one direct launch.
+            pids: Limit::Value(2),
+            ..ResourceLimits::default()
+        };
+        let sandbox = Sandbox::detect();
+        let domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
+            Ok(domain) => domain,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("unexpected resource-domain error: {error}"),
+        };
+
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command
+            .arg("-c")
+            .arg("sleep 30 & printf '%s' $! > child.pid; wait")
+            .cwd(workspace.path());
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Null;
+        command.stderr = Stdio::Null;
+        let mut first = sandbox
+            .spawn_in_process_domain(command, config.clone(), &domain)
+            .expect("shell and one forked child fit pids.max=2");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !workspace.path().join("child.pid").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid: libc::pid_t = std::fs::read_to_string(workspace.path().join("child.pid"))
+            .expect("forked child pid")
+            .trim()
+            .parse()
+            .expect("numeric forked child pid");
+        assert!(process_is_alive(child_pid), "forked child must be alive");
+
+        let second =
+            sandbox.spawn_in_process_domain(CommandSpec::new("/bin/true"), config, &domain);
+        let second_rejected = second.is_err();
+
+        domain.kill_all().expect("kill process domain");
+        assert!(
+            domain
+                .wait_until_empty(Duration::from_secs(2))
+                .expect("wait domain empty")
+        );
+        let _ = first.wait().expect("wait shell");
+        if let Ok(mut second) = second {
+            let _ = second.wait();
+        }
+        domain.remove_empty().expect("remove process domain");
+        assert!(
+            second_rejected,
+            "a forked descendant must consume the shared pids.max budget"
+        );
+    }
+
     /// `plan-cgroup.md` M2: `cgroup.events` `populated` is the membership
     /// authority; `kill_all` is the only terminating operation and an empty
     /// domain's removal must not disturb processes in other domains.
@@ -1466,20 +1536,18 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let make_domain = || {
-            match sandbox.create_process_domain(
+        let make_domain = || match sandbox.create_process_domain(
             config.resources,
             delegated_cgroup_parent()
                 .as_deref()
                 .map(shbox_sandbox::CgroupParent::new),
         ) {
-                Ok(domain) => Some(domain),
-                Err(SandboxError::Unsupported { feature, reason }) => {
-                    eprintln!("skipping: {feature} unsupported here: {reason}");
-                    None
-                }
-                Err(error) => panic!("unexpected process-domain error: {error}"),
+            Ok(domain) => Some(domain),
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                None
             }
+            Err(error) => panic!("unexpected process-domain error: {error}"),
         };
         let Some(domain) = make_domain() else {
             return;
@@ -1490,18 +1558,15 @@ mod linux_only {
 
         let mut witness_command = CommandSpec::new("/bin/sleep");
         witness_command = witness_command.arg("30");
-        let mut witness = match sandbox.spawn_in_process_domain(
-            witness_command,
-            config.clone(),
-            &other,
-        ) {
-            Ok(child) => child,
-            Err(SandboxError::Unsupported { feature, reason }) => {
-                eprintln!("skipping: {feature} unsupported here: {reason}");
-                return;
-            }
-            Err(error) => panic!("unexpected witness spawn error: {error}"),
-        };
+        let mut witness =
+            match sandbox.spawn_in_process_domain(witness_command, config.clone(), &other) {
+                Ok(child) => child,
+                Err(SandboxError::Unsupported { feature, reason }) => {
+                    eprintln!("skipping: {feature} unsupported here: {reason}");
+                    return;
+                }
+                Err(error) => panic!("unexpected witness spawn error: {error}"),
+            };
 
         // An empty domain removes cleanly and does not touch other domains.
         assert!(!domain.is_populated().expect("empty domain population"));

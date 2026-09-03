@@ -7,25 +7,10 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 ## Current state
 
 - M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
-- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance、M8 は runtime temp generation ownership まで履歴に保存済み。M9 の cgroup-authoritative delete と double-fork acceptance がこのコミットで保存され、次は M10 の process-count semantics である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance、M8 は runtime temp generation ownership、M9 は cgroup-authoritative delete と double-fork acceptance、M10 は launch admission と kernel `pids.max` の分離までこのコミットで保存する。次は M11 の shutdown/reconciliation である。delete・shutdown・publication 前失敗は terminate path を維持する。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M10 — Move process-count enforcement to cgroup
-
-Goal: manager の launch 数制限と kernel process 数制限を区別し、fork/descendant を含む aggregate PID budget を cgroup `pids.max` に任せる。
-
-Implementation:
-
-- `crates/shbox/src/config.rs`、`crates/shbox/src/sandbox/manager.rs`、`docs/configuration.md` の `max_sandbox_processes` を launch admission/concurrency の名前と説明に改める（互換性が必要なら serde alias を維持）。
-- Linux の `ResourceLimits::pids` / `pids.max` が同じ sandbox domain の全 child・fork・detached descendant を数えることを確認し、manager count を kernel process limit の代替にしない。
-- macOS の `RLIMIT_NPROC` との意味の違いを docs に残す。
-
-Proof:
-
-- 一つの launch 内の fork が `pids.max` を消費し、manager の lease 数を増やさずに bypass できない test を追加する。
-- detached descendant と同時 launch が同一 PID budget を共有する test を追加する。
 
 ## M11 — Daemon shutdown and stale-domain reconciliation
 

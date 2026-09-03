@@ -219,14 +219,14 @@ Linux の private `TMPDIR` は sandbox runtime-domain generation ごとに一つ
 | unauthenticated connections | 32 |
 | total connections | 128 |
 | channels per connection | 16 |
-| concurrent processes per sandbox | 128 |
+| concurrent launch operations per sandbox | 128 |
 | concurrent host-mode processes | 16 |
 | auth attempts per connection | 6 |
 | total sandboxes | 1024 |
 | sandboxes per owner | 128 |
 | SSH handshake timeout | 30 s |
 
-これらは admission/concurrency limit であり、§4.4 の per-sandbox resource limits の代替ではない。file-size/open-file quota を設定する機能でもない。`concurrent processes per sandbox`（`max_sandbox_processes`）は `SandboxId` ごとの launch 数に対して数えられる（daemon 全体での global cap ではない）。
+これらは admission/concurrency limit であり、§4.4 の per-sandbox resource limits の代替ではない。file-size/open-file quota を設定する機能でもない。`concurrent launch operations per sandbox`（内部 cap 名 `max_concurrent_launches_per_sandbox`）は `SandboxId` ごとの launch 数に対して数えられ、Linux の実 process 数は `pids.max` が cgroup 全体で数える（daemon 全体での global cap ではない）。
 
 ## 7. Unsupported resource controls
 

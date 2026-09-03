@@ -454,13 +454,13 @@ impl SandboxManager {
         if metadata.state() != State::Active || metadata.owner() != handle.owner() {
             return Err(Error::Unavailable);
         }
-        let max_sandbox_processes = self.caps.max_sandbox_processes as usize;
-        let sandbox_processes = ledger
+        let max_concurrent_launches = self.caps.max_concurrent_launches_per_sandbox as usize;
+        let concurrent_launches = ledger
             .runtime_by_sandbox
             .get(handle.id())
             .map_or(0, |tokens| tokens.len());
-        if sandbox_processes >= max_sandbox_processes {
-            return Err(Error::Limit(CapacityLimit::SandboxProcesses));
+        if concurrent_launches >= max_concurrent_launches {
+            return Err(Error::Limit(CapacityLimit::SandboxLaunches));
         }
         let token = next_runtime_token(&mut ledger);
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1089,8 +1089,9 @@ pub(crate) enum CapacityLimit {
     Sandboxes,
     /// Sandboxes per owner.
     SandboxesPerOwner,
-    /// Concurrent processes within one sandbox.
-    SandboxProcesses,
+    /// Concurrent launch operations within one sandbox. Linux process counts
+    /// are enforced separately by the process-domain cgroup's `pids.max`.
+    SandboxLaunches,
 }
 
 impl fmt::Display for CapacityLimit {
@@ -1098,7 +1099,7 @@ impl fmt::Display for CapacityLimit {
         match self {
             CapacityLimit::Sandboxes => f.write_str("max_sandboxes"),
             CapacityLimit::SandboxesPerOwner => f.write_str("max_sandboxes_per_owner"),
-            CapacityLimit::SandboxProcesses => f.write_str("max_sandbox_processes"),
+            CapacityLimit::SandboxLaunches => f.write_str("max_concurrent_launches_per_sandbox"),
         }
     }
 }
@@ -1787,10 +1788,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_process_cap_is_atomic_across_parallel_launches() {
+    fn sandbox_launch_cap_is_atomic_across_parallel_launches() {
         let launcher = FakeLauncher::default();
         let caps = Caps {
-            max_sandbox_processes: 1,
+            max_concurrent_launches_per_sandbox: 1,
             ..Caps::default()
         };
         let (_root, manager) = manager_with_fake(caps, &launcher);
@@ -1802,7 +1803,7 @@ mod tests {
             .expect("first launch");
         assert!(matches!(
             manager.launch_handle(&handle, platform::LaunchOperation::Shell, None),
-            Err(Error::Limit(CapacityLimit::SandboxProcesses))
+            Err(Error::Limit(CapacityLimit::SandboxLaunches))
         ));
         first.process.control.terminate();
         manager.clear_runtime(&first.lease);
@@ -1810,10 +1811,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_process_cap_applies_independently_to_each_sandbox() {
+    fn sandbox_launch_cap_applies_independently_to_each_sandbox() {
         let launcher = FakeLauncher::default();
         let caps = Caps {
-            max_sandbox_processes: 1,
+            max_concurrent_launches_per_sandbox: 1,
             ..Caps::default()
         };
         let (_root, manager) = manager_with_fake(caps, &launcher);

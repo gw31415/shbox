@@ -672,7 +672,10 @@ pub struct Caps {
     pub max_unauthenticated_connections: u32,
     pub max_connections: u32,
     pub max_channels_per_connection: u32,
-    pub max_sandbox_processes: u32,
+    /// Maximum concurrent launch operations admitted for one sandbox. This
+    /// is not the kernel process-count limit; Linux enforces that with
+    /// `sandbox.pids_max` in the shared process-domain cgroup.
+    pub max_concurrent_launches_per_sandbox: u32,
     pub max_host_processes: u32,
     pub max_auth_attempts: u32,
     pub max_sandboxes: u32,
@@ -686,7 +689,7 @@ impl Default for Caps {
             max_unauthenticated_connections: 32,
             max_connections: 128,
             max_channels_per_connection: 16,
-            max_sandbox_processes: 128,
+            max_concurrent_launches_per_sandbox: 128,
             max_host_processes: 16,
             max_auth_attempts: 6,
             max_sandboxes: 1024,
@@ -890,7 +893,7 @@ mod tests {
         assert_eq!(caps.max_unauthenticated_connections, 32);
         assert_eq!(caps.max_connections, 128);
         assert_eq!(caps.max_channels_per_connection, 16);
-        assert_eq!(caps.max_sandbox_processes, 128);
+        assert_eq!(caps.max_concurrent_launches_per_sandbox, 128);
         assert_eq!(caps.max_host_processes, 16);
         assert_eq!(caps.max_auth_attempts, 6);
         assert_eq!(caps.max_sandboxes, 1024);
