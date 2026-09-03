@@ -7,26 +7,10 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 ## Current state
 
 - M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
-- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance まで履歴に保存済み。M8 の runtime temp generation ownership がこのコミットで保存され、次は M9 の cgroup-authoritative delete である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance、M8 は runtime temp generation ownership まで履歴に保存済み。M9 の cgroup-authoritative delete と double-fork acceptance がこのコミットで保存され、次は M10 の process-count semantics である。delete・shutdown・publication 前失敗は terminate path を維持する。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M9 — Make sandbox delete cgroup-authoritative
-
-Goal: explicit deletion を hard process-lifecycle boundary にし、runtime lease の一覧に依存せず cgroup 全体を回収する。
-
-Implementation:
-
-1. durable metadata を `Deleting` にして新規 launch を拒否する。
-2. publication 前 launch を cancel/wait し、`in_flight == 0` の barrier を待つ。
-3. `ProcessDomain::kill_all()`、`wait_until_empty()`、`remove_empty()` をこの順で実行する。
-4. runtime temp を除去してから workspace / durable metadata を消す。失敗時は安全側の state と cleanup retry が可能な error を返す。
-
-Proof:
-
-- foreground、background、`setsid()`、double-fork daemon、複数 concurrent launch、active tsshd を delete で回収する integration test を追加する。
-- delete と launch の race で process escape がないことを確認する。
 
 ## M10 — Move process-count enforcement to cgroup
 

@@ -1198,9 +1198,10 @@ mod tests {
 
     /// `docs/lifecycle.md` §2.4: releasing a sandbox's resources (the
     /// launcher seam under sandbox delete) must remove every sandbox process,
-    /// including a `setsid()` descendant no process group signal can reach.
+    /// including a double-fork `setsid()` descendant no process group signal
+    /// can reach.
     #[tokio::test]
-    async fn sandbox_release_kills_detached_descendants() {
+    async fn sandbox_release_kills_double_fork_descendants() {
         let root = tempfile::tempdir().expect("runtime root");
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
@@ -1211,9 +1212,8 @@ mod tests {
         let launched = launcher
             .launch(request(
                 workspace.path(),
-                "setsid sh -c 'printf ok > detached-ready; exec sleep 30' & B=$!; \
-                 until [ -f detached-ready ]; do sleep 0.01; done; \
-                 printf '%s' $B > detached-pid; exit 0",
+                r#"setsid sh -c 'sh -c "sleep 30 & echo \$! > detached-pid; exit 0" >/dev/null 2>&1 & exit 0' &
+                 until [ -s detached-pid ]; do sleep 0.01; done; exit 0"#,
                 false,
             ))
             .expect("launch");
