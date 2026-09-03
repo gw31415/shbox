@@ -31,7 +31,6 @@ use super::{
 use crate::config::NetworkMode;
 use crate::sandbox::SandboxId;
 
-const PROCESS_GROUP_SETTLE: Duration = Duration::from_secs(1);
 /// Deadline for a killed process domain to report `populated 0`.
 const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -386,17 +385,18 @@ fn wait_process(
         }),
         Err(_) => Err(LaunchError::new("sandbox process wait failed")),
     };
-    // The engine reaped the direct child. A one-shot engine spawn may have
-    // cleaned its cgroup; shbox resource-domain cgroups deliberately outlive
-    // individual children and are released only when the durable sandbox is
-    // deleted. Remaining descendants still belong to the owned session group.
-    kill_process_group(control.pid, libc::SIGKILL);
-    wait_process_group_gone(control.pid, PROCESS_GROUP_SETTLE);
+    // The engine reaped the direct child; descendants deliberately survive
+    // (docs/lifecycle.md §2.1). They stay owned by the sandbox process
+    // domain, which is released only by sandbox deletion or daemon
+    // shutdown — never by the direct child's exit.
     drop(launch_temp);
     control.mark_cleanup_complete();
     let _ = wait_tx.send(result);
 }
 
+/// Signal one launch's session process group. Reserved for job-control
+/// semantics (user-requested signals, terminate paths) — never for normal
+/// completion, where descendants must survive (docs/lifecycle.md §3).
 fn kill_process_group(pid: u32, signal: i32) {
     if pid <= 1 {
         return;
@@ -404,18 +404,6 @@ fn kill_process_group(pid: u32, signal: i32) {
     // SAFETY: session leader PID is also its initial process-group ID.
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);
-    }
-}
-
-fn wait_process_group_gone(pid: u32, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        // SAFETY: signal 0 performs existence/permission checking only.
-        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -954,157 +942,6 @@ mod tests {
             launched.wait.await.expect("wait channel").expect("wait"),
             ProcessExit::Code(0)
         );
-    }
-
-    #[tokio::test]
-    async fn direct_child_exit_cleans_remaining_process_group() {
-        let root = tempfile::tempdir().expect("runtime root");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
-            .expect("linux launcher");
-        let launched = launcher
-            .launch(request(
-                workspace.path(),
-                "sleep 30 & printf '%s' $! > background-pid; exit 0",
-                false,
-            ))
-            .expect("launch");
-        assert_eq!(
-            launched.wait.await.expect("wait channel").expect("wait"),
-            ProcessExit::Code(0)
-        );
-        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("background-pid"))
-            .expect("background pid")
-            .parse()
-            .expect("numeric pid");
-        // A descendant that is already a zombie has been killed and cannot
-        // retain files or execute; only PID 1 can reap it after it has been
-        // orphaned. Accept either an already-reaped PID or the zombie state so
-        // this test does not depend on whether the surrounding container uses
-        // an init process.
-        // SAFETY: signal zero only checks whether this exact PID still exists.
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == 0 {
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("descendant stat");
-            let state = stat
-                .rfind(')')
-                .and_then(|end| stat.as_bytes().get(end + 2))
-                .copied();
-            assert_eq!(
-                state,
-                Some(b'Z'),
-                "background descendant {pid} remained live"
-            );
-        } else {
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
-        }
-    }
-
-    /// `docs/lifecycle.md` §2.1: a normally-exiting shell must not terminate
-    /// the background process it started. Expected to fail until the launcher
-    /// stops killing the owned process group after the direct child is
-    /// reaped.
-    #[tokio::test]
-    async fn background_process_survives_shell_exit() {
-        let root = tempfile::tempdir().expect("runtime root");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
-            .expect("linux launcher");
-        let launched = launcher
-            .launch(request(
-                workspace.path(),
-                "sleep 30 >/dev/null 2>&1 & printf '%s' $! > background-pid; exit 0",
-                false,
-            ))
-            .expect("launch");
-        assert_eq!(
-            launched.wait.await.expect("wait channel").expect("wait"),
-            ProcessExit::Code(0)
-        );
-        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("background-pid"))
-            .expect("background pid")
-            .trim()
-            .parse()
-            .expect("numeric pid");
-        assert!(
-            process_alive(pid),
-            "background process {pid} must survive the shell's normal exit"
-        );
-        // Test cleanup: the contract under test leaves this process running,
-        // so the test itself owns its disposal.
-        kill_test_process(pid);
-    }
-
-    /// `docs/lifecycle.md` §2.4: releasing a sandbox's resources (the
-    /// launcher seam under sandbox delete) must remove every sandbox process,
-    /// including a `setsid()` descendant no process group signal can reach.
-    /// Expected to fail until the launcher owns a process domain even without
-    /// configured resource limits and removes it cgroup-authoritatively.
-    #[tokio::test]
-    async fn sandbox_release_kills_detached_descendants() {
-        let root = tempfile::tempdir().expect("runtime root");
-        let workspace = tempfile::tempdir().expect("workspace");
-        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
-            .expect("linux launcher");
-        let launched = launcher
-            .launch(request(
-                workspace.path(),
-                "setsid sh -c 'printf ok > detached-ready; exec sleep 30' & B=$!; \
-                 until [ -f detached-ready ]; do sleep 0.01; done; \
-                 printf '%s' $B > detached-pid; exit 0",
-                false,
-            ))
-            .expect("launch");
-        assert_eq!(
-            launched.wait.await.expect("wait channel").expect("wait"),
-            ProcessExit::Code(0)
-        );
-        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("detached-pid"))
-            .expect("detached pid")
-            .trim()
-            .parse()
-            .expect("numeric pid");
-        assert!(process_alive(pid), "detached process must start alive");
-        launcher
-            .release_sandbox_resources(&"linux-test".parse().expect("sandbox id"))
-            .expect("release sandbox resources");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !process_alive(pid),
-            "sandbox release must kill the detached descendant {pid}"
-        );
-    }
-
-    /// Whether `pid` exists and is not a zombie.
-    fn process_alive(pid: libc::pid_t) -> bool {
-        // SAFETY: signal zero performs existence/permission checking only.
-        let result = unsafe { libc::kill(pid, 0) };
-        if result == 0 {
-            fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    stat.rfind(')')
-                        .and_then(|end| stat.as_bytes().get(end + 2).copied())
-                })
-                .is_none_or(|state| state != b'Z')
-        } else {
-            false
-        }
-    }
-
-    /// Direct test-side disposal of a process the lifecycle contract
-    /// deliberately leaves running.
-    fn kill_test_process(pid: libc::pid_t) {
-        // SAFETY: signal delivery to a process the test spawned.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
     }
 
     /// The exec payload is an opaque byte string: a non-UTF-8 command must

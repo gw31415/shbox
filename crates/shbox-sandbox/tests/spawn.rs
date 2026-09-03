@@ -804,7 +804,7 @@ mod linux_only {
     }
 
     #[test]
-    fn normal_completion_cleans_owned_process_group_descendants() {
+    fn normal_completion_leaves_owned_process_group_descendants_running() {
         let mut command = CommandSpec::new("/bin/sh");
         command = command.arg("-c").arg("sleep 30 & read ignored; exit 0");
         command.stdin = Stdio::Pipe;
@@ -817,13 +817,16 @@ mod linux_only {
         drop(child.take_stdin().expect("stdin pipe"));
         assert_eq!(child.wait().expect("wait").code(), Some(0));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !process_is_gone_or_zombie(descendant) {
-            assert!(
-                Instant::now() < deadline,
-                "owned process-group descendant {descendant} survived normal completion"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        // Normal completion reaps the direct child and leaves the
+        // process-group descendant running (docs/lifecycle.md §2.1);
+        // killing it is reserved for explicit teardown paths.
+        assert!(
+            !process_is_gone_or_zombie(descendant),
+            "owned process-group descendant {descendant} must survive normal completion"
+        );
+        // SAFETY: test-side disposal of the process this test spawned.
+        unsafe {
+            libc::kill(descendant as libc::pid_t, libc::SIGKILL);
         }
     }
 
@@ -1249,8 +1252,14 @@ mod linux_only {
         // exists and could be (wrongly) cleaned up on wait.
         command.session = SessionSetup::NewSession;
         let mut child = sandbox.spawn(command, config).expect("spawn");
+        let child_pid = child.id().expect("child pid");
         let status = child.wait().expect("wait");
         assert_eq!(status.code(), Some(0));
+        // The direct child is reaped, not left as a zombie.
+        assert!(
+            std::fs::read_to_string(format!("/proc/{child_pid}/stat")).is_err(),
+            "direct child {child_pid} must be reaped after wait"
+        );
         let pid: libc::pid_t = std::fs::read_to_string(workspace.path().join("descendant.pid"))
             .expect("descendant pid marker")
             .trim()

@@ -473,41 +473,6 @@ fn kill_and_reap(pidfd: &OwnedFd) {
     let _ = pidfd_wait(pidfd, false);
 }
 
-/// Observe whether the direct child has exited without reaping it.
-///
-/// Keeping an exited group leader unreaped until after the group signal closes
-/// the small PID-reuse window that a raw process-group ID would otherwise
-/// have after `waitid(WEXITED)` reaps the direct child.
-fn pidfd_has_exited(pidfd: &OwnedFd, nohang: bool) -> std::io::Result<bool> {
-    // SAFETY: `siginfo_t` is a C struct of integers, fixed-size arrays, and
-    // raw pointers — all-zero is a valid value, and `waitid` only writes to
-    // it.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let mut options = libc::WEXITED | libc::WNOWAIT;
-    if nohang {
-        options |= libc::WNOHANG;
-    }
-    // SAFETY: `info` is initialized writable storage and the pidfd belongs to
-    // this direct child. WNOWAIT observes the exit without consuming it.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PIDFD as libc::idtype_t,
-            pidfd.as_raw_fd() as libc::id_t,
-            &mut info,
-            options,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if nohang {
-        // SAFETY: siginfo field access on an initialized structure.
-        Ok(unsafe { info.si_pid() } != 0)
-    } else {
-        Ok(true)
-    }
-}
-
 fn read_child_failure(fd: &OwnedFd) -> Outcome {
     let mut record = [0_u8; 12];
     let mut offset = 0_usize;
@@ -956,12 +921,9 @@ impl BackendChild for LinuxChild {
         if let Some(status) = self.status {
             return Ok(status);
         }
-        if self.owns_process_group && !self.pid_namespace_init {
-            // Observe without reaping so the direct child still reserves its
-            // PID while the owned process group is cleaned up.
-            pidfd_has_exited(&self.pidfd, false)?;
-            let _ = self.signal_process_group(libc::SIGKILL);
-        }
+        // Normal completion reaps exactly the direct child. Descendants —
+        // background jobs, `setsid()` escapees, daemons — belong to the
+        // sandbox's process domain, not to this handle, and survive.
         let waited = pidfd_wait(&self.pidfd, false)?
             .map(|result| result.exit)
             .unwrap_or_else(|| ExitStatus::from_code(255));
@@ -983,15 +945,6 @@ impl BackendChild for LinuxChild {
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         if let Some(status) = self.status {
             return Ok(Some(status));
-        }
-        if self.owns_process_group
-            && !self.pid_namespace_init
-            && !pidfd_has_exited(&self.pidfd, true)?
-        {
-            return Ok(None);
-        }
-        if self.owns_process_group && !self.pid_namespace_init {
-            let _ = self.signal_process_group(libc::SIGKILL);
         }
         let Some(waited) = pidfd_wait(&self.pidfd, true)? else {
             return Ok(None);
