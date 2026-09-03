@@ -992,6 +992,108 @@ mod tests {
         }
     }
 
+    /// `docs/lifecycle.md` §2.1: a normally-exiting shell must not terminate
+    /// the background process it started. Expected to fail until the launcher
+    /// stops killing the owned process group after the direct child is
+    /// reaped.
+    #[tokio::test]
+    async fn background_process_survives_shell_exit() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                "sleep 30 >/dev/null 2>&1 & printf '%s' $! > background-pid; exit 0",
+                false,
+            ))
+            .expect("launch");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("background-pid"))
+            .expect("background pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(
+            process_alive(pid),
+            "background process {pid} must survive the shell's normal exit"
+        );
+        // Test cleanup: the contract under test leaves this process running,
+        // so the test itself owns its disposal.
+        kill_test_process(pid);
+    }
+
+    /// `docs/lifecycle.md` §2.4: releasing a sandbox's resources (the
+    /// launcher seam under sandbox delete) must remove every sandbox process,
+    /// including a `setsid()` descendant no process group signal can reach.
+    /// Expected to fail until the launcher owns a process domain even without
+    /// configured resource limits and removes it cgroup-authoritatively.
+    #[tokio::test]
+    async fn sandbox_release_kills_detached_descendants() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                "setsid sleep 30 >/dev/null 2>&1 & printf '%s' $! > detached-pid; exit 0",
+                false,
+            ))
+            .expect("launch");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("detached-pid"))
+            .expect("detached pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(process_alive(pid), "detached process must start alive");
+        launcher
+            .release_sandbox_resources(&"linux-test".parse().expect("sandbox id"))
+            .expect("release sandbox resources");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_alive(pid),
+            "sandbox release must kill the detached descendant {pid}"
+        );
+    }
+
+    /// Whether `pid` exists and is not a zombie.
+    fn process_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal zero performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rfind(')')
+                        .and_then(|end| stat.as_bytes().get(end + 2).copied())
+                })
+                .is_none_or(|state| state != b'Z')
+        } else {
+            false
+        }
+    }
+
+    /// Direct test-side disposal of a process the lifecycle contract
+    /// deliberately leaves running.
+    fn kill_test_process(pid: libc::pid_t) {
+        // SAFETY: signal delivery to a process the test spawned.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
     /// The exec payload is an opaque byte string: a non-UTF-8 command must
     /// reach the shell byte-for-byte as the single `-c` argument instead of
     /// being rejected by a UTF-8 conversion (docs/ssh-protocol.md §5).

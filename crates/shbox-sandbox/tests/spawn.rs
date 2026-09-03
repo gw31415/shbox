@@ -673,6 +673,27 @@ mod linux_only {
         Sandbox::detect().capabilities().landlock_abi.unwrap_or(0) >= 1
     }
 
+    /// Whether `pid` exists and is not a zombie: the lifecycle contract's
+    /// definition of "still running" for a detached descendant.
+    fn process_is_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal zero performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            process_state(pid as u32).is_none_or(|state| state != b'Z')
+        } else {
+            false
+        }
+    }
+
+    /// Direct test-side disposal of a process the lifecycle contract
+    /// deliberately leaves running.
+    fn kill_process(pid: libc::pid_t) {
+        // SAFETY: signal delivery to a process the test spawned.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
     fn process_state(pid: u32) -> Option<u8> {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -1076,6 +1097,108 @@ mod linux_only {
             .expect("resource domain must remain reusable after child cleanup");
         assert_eq!(second.wait().expect("wait second child").code(), Some(0));
         domain.remove().expect("remove idle resource domain");
+    }
+
+
+    /// `docs/lifecycle.md` §2.1: a normally-exiting direct child must not
+    /// terminate its descendants. This is the engine-level contract test for
+    /// the background (same process group) case; it is expected to fail until
+    /// the engine stops killing the owned process group on wait.
+    #[test]
+    fn background_descendant_survives_direct_child_exit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = restricted_to(workspace.path());
+        let sandbox = Sandbox::detect();
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s' $! > descendant.pid; exit 0");
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Null;
+        command.stderr = Stdio::Null;
+        let mut child = sandbox.spawn(command, config).expect("spawn");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(0));
+        let pid: libc::pid_t = std::fs::read_to_string(workspace.path().join("descendant.pid"))
+            .expect("descendant pid marker")
+            .trim()
+            .parse()
+            .expect("numeric descendant pid");
+        assert!(
+            process_is_alive(pid),
+            "background descendant {pid} must survive the direct child's normal exit"
+        );
+        // Test cleanup: the contract under test deliberately leaves this
+        // process running, so the test itself owns its disposal.
+        kill_process(pid);
+    }
+
+    /// `docs/lifecycle.md` §2.1: a `setsid()` descendant leaves the owned
+    /// process group but stays inside the sandbox resource domain. Its
+    /// survival after the direct child exits — and after the child handle is
+    /// dropped — is the cgroup-ownership contract.
+    #[test]
+    fn setsid_descendant_survives_direct_child_exit_in_domain() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = restricted_to(workspace.path());
+        config.resources = ResourceLimits {
+            pids: Limit::Value(8),
+            ..ResourceLimits::default()
+        };
+        let sandbox = Sandbox::detect();
+        let mut domain = match sandbox.create_resource_domain(config.resources, None) {
+            Ok(domain) => domain,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("unexpected resource-domain error: {error}"),
+        };
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg(
+            "setsid sleep 30 >/dev/null 2>&1 & printf '%s' $! > setsid.pid; exit 0",
+        );
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Null;
+        command.stderr = Stdio::Null;
+        let mut child = match sandbox.spawn_in_resource_domain(command, config.clone(), &domain) {
+            Ok(child) => child,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("unexpected domain spawn error: {error}"),
+        };
+        assert_eq!(child.wait().expect("wait").code(), Some(0));
+        let pid: libc::pid_t = std::fs::read_to_string(workspace.path().join("setsid.pid"))
+            .expect("setsid pid marker")
+            .trim()
+            .parse()
+            .expect("numeric setsid pid");
+        assert!(
+            process_is_alive(pid),
+            "setsid descendant {pid} must survive the direct child's normal exit"
+        );
+        // Dropping the child handle must not affect surviving descendants
+        // either; only the durable domain owner may decide their fate.
+        drop(child);
+        assert!(
+            process_is_alive(pid),
+            "setsid descendant {pid} must survive the direct child handle being dropped"
+        );
+        // The domain release must not silently kill a populated domain's
+        // members: with the child handle gone, only an explicit kill can
+        // remove them today, and this test pins that removal attempts fail
+        // rather than terminate processes behind the caller's back.
+        assert!(
+            domain.remove().is_err() || !process_is_alive(pid),
+            "domain removal must not leave processes half-killed: it either fails \
+             on a populated domain or the members are gone"
+        );
+        if process_is_alive(pid) {
+            kill_process(pid);
+        }
+        let _ = domain.remove();
     }
 
     #[test]

@@ -1113,6 +1113,39 @@ mod tests {
         assert_eq!(fake.resizes(), vec![(30, 100)]);
     }
 
+    /// `docs/lifecycle.md` §2.2: once a launch is published, losing the
+    /// client transport (channel close, TCP disconnect, registry teardown)
+    /// must detach the bridge without terminating the sandbox process.
+    /// Expected to fail until the bridge stops treating transport loss as an
+    /// abnormal process teardown.
+    #[tokio::test]
+    async fn transport_loss_after_publication_does_not_terminate_the_process() {
+        let launcher = FakeLauncher::default();
+        let launched = launcher.launch(request(None)).expect("fake launch");
+        let fake = launcher.last_process().expect("fake process");
+        let sink = RecordingSink::default();
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let id = channel_id(3);
+        let bridge_sink = sink.clone();
+        let bridge = tokio::spawn(async move {
+            run_sandbox_process(id, &bridge_sink, launched, events_rx).await
+        });
+        // The fake process never exits: a detached process keeps running.
+        // Dropping the only event sender models the SSH connection
+        // disappearing underneath a published channel.
+        drop(events_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge returns after transport loss")
+            .expect("bridge join");
+        assert_eq!(result, ChannelResult::Aborted);
+        assert!(
+            !fake.terminated(),
+            "transport loss must not terminate a published sandbox process"
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_bridge_merges_pty_output_and_reports_exit_signal() {
         let launcher = FakeLauncher::default();
