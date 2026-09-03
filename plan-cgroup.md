@@ -7,26 +7,10 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 ## Current state
 
 - M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
-- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam として実装済み。M7 の Linux/macOS PTY master 実装と実 SSH acceptance が次のコミット対象である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam として履歴に保存済み。M7 は Linux/macOS の PTY master close と実 SSH acceptance まで完了し、このコミットで保存する。delete・shutdown・publication 前失敗は terminate path を維持する。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M7 — Define PTY detach semantics
-
-Goal: SSH transport が消えた後に daemon が PTY master を人工的に保持し続けないようにし、kernel の通常の hangup semantics を使う。
-
-Implementation:
-
-- `crates/shbox/src/platform/{mod,linux,macos}.rs` の process-control abstraction に明示的な `detach_transport` operation を実装する。
-- PTY launch では channel-owned PTY master を閉じ、resize と SSH-originated signal の受付を止める。process へ terminate signal は送らない。
-- non-PTY launch では channel-owned pipe ends を閉じるだけにし、pipe close を process signal とみなさない。
-- `crates/shbox/tests/ssh_auth.rs` に、公開済み PTY から `setsid()` した descendant が SSH client 終了後に残り、sandbox delete で cgroup 経由で消える実 SSH acceptance を置く。
-
-Proof:
-
-- channel unit tests が transport loss / sink failure で detach は行い terminate は行わないことを確認する。
-- native SSH PTY acceptance が pass し、PTY master の leak がない。
 
 ## M8 — Move transient runtime resources to sandbox-runtime scope
 

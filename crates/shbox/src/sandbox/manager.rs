@@ -1725,8 +1725,8 @@ mod tests {
         if !launcher.process_domain_ready(paths.runtime_dir()) {
             return;
         }
-        let manager = SandboxManager::open_with_launcher(&paths, Caps::default(), launcher)
-            .expect("manager");
+        let manager =
+            SandboxManager::open_with_launcher(&paths, Caps::default(), launcher).expect("manager");
         let owner = principal('A', Role::Normal);
         let id = SandboxId::parse("dev").expect("id");
         let handle = manager.claim(&owner, &id).expect("claim");

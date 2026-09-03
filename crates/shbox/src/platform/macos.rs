@@ -432,6 +432,14 @@ impl RunningProcess for MacosProcessControl {
         };
         super::terminal::apply_window_size(fd.as_raw_fd(), rows, cols).is_ok()
     }
+
+    fn detach_transport(&self) {
+        // Close this channel's PTY master; kernel hangup semantics decide
+        // what ends and what survives. No daemon-side signal is sent.
+        if let Ok(mut lifecycle_fd) = self.lifecycle_fd.lock() {
+            lifecycle_fd.take();
+        }
+    }
 }
 
 fn async_reader(file: std::fs::File) -> ProcessReader {

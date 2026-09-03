@@ -192,7 +192,7 @@ impl TestDaemon {
             output
         });
 
-        let daemon = TestDaemon {
+        let mut daemon = TestDaemon {
             child,
             stderr_reader: Some(stderr_reader),
             port,
@@ -261,7 +261,7 @@ impl TestDaemon {
     }
 
     /// Wait until the listener accepts TCP connections.
-    fn wait_ready(&self) {
+    fn wait_ready(&mut self) {
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -270,7 +270,13 @@ impl TestDaemon {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("daemon did not become reachable on {address}");
+        let status = self.child.try_wait().expect("poll daemon status");
+        let stderr = if status.is_some() {
+            self.read_stderr()
+        } else {
+            String::new()
+        };
+        panic!("daemon did not become reachable on {address}; status={status:?}; stderr={stderr}");
     }
 
     /// Run the real OpenSSH client against this daemon.
@@ -924,10 +930,9 @@ fn native_sandbox_supported() -> bool {
 /// native-launch acceptance path. Probe with the engine's own discovery.
 #[cfg(target_os = "linux")]
 fn linux_process_domain_supported() -> bool {
-    match shbox_sandbox::Sandbox::detect().create_process_domain(
-        shbox_sandbox::ResourceLimits::default(),
-        None,
-    ) {
+    match shbox_sandbox::Sandbox::detect()
+        .create_process_domain(shbox_sandbox::ResourceLimits::default(), None)
+    {
         Ok(domain) => {
             let _ = domain.remove_empty();
             true
@@ -1687,12 +1692,12 @@ fn sandbox_shutdown_cleans_up_descendants() {
     }
 }
 
-/// Killing the OpenSSH client closes the channel/connection. shbox must then
-/// tear down and reap the managed PTY shell rather than leaving a detached
-/// session behind. PTY EOF remains non-synthetic; channel close uses the
-/// documented TERM -> KILL cleanup path.
+/// Killing the OpenSSH client closes the channel/connection. A published
+/// sandbox launch must detach its transport without terminating a descendant
+/// that deliberately left the PTY session. The cgroup remains authoritative:
+/// an explicit delete below still removes that descendant.
 #[test]
-fn sandbox_pty_disconnect_reaps_managed_shell() {
+fn sandbox_pty_disconnect_preserves_detached_process_until_delete() {
     if !sandbox_integration_enabled() {
         return;
     }
@@ -1703,7 +1708,7 @@ fn sandbox_pty_disconnect_reaps_managed_shell() {
     let mut session = daemon.spawn_ssh_pty(
         &daemon.normal_key,
         id,
-        r#"printf '%s' "$$" > "$HOME/m6-disconnect.pid"; printf __M6_DISCONNECT_READY__; while :; do sleep 1; done"#,
+        r#"setsid sh -c 'printf "%s" "$$" > "$HOME/m6-disconnect.pid"; trap "" HUP; while :; do sleep 1; done' & until test -s "$HOME/m6-disconnect.pid"; do sleep 0.01; done; printf __M6_DISCONNECT_READY__; while :; do sleep 1; done"#,
         24,
         80,
     );
@@ -1714,6 +1719,12 @@ fn sandbox_pty_disconnect_reaps_managed_shell() {
             .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
     });
     session.kill_client();
+    retry_until("detached sandbox process survives transport loss", || {
+        (!pid_is_terminated(pid)).then_some(())
+    });
+
+    let delete = daemon.ssh(&daemon.normal_key, id, "delete", &["-T", "-s"]);
+    assert!(delete.ok(), "sandbox delete failed: {delete:?}");
     if !wait_for_pid_gone(pid, Duration::from_secs(12)) {
         let ps = Command::new("ps")
             .args([
@@ -1725,7 +1736,7 @@ fn sandbox_pty_disconnect_reaps_managed_shell() {
             .output()
             .expect("ps remote shell");
         panic!(
-            "sandbox PTY shell {pid} survived SSH disconnect: {}",
+            "sandbox detached process {pid} survived sandbox delete: {}",
             String::from_utf8_lossy(&ps.stdout)
         );
     }

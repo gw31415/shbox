@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
-    CommandSpec, ProcessDomain, Sandbox, SandboxConfig as EngineConfig, SandboxError,
-    SessionSetup, Stdio,
+    CommandSpec, ProcessDomain, Sandbox, SandboxConfig as EngineConfig, SandboxError, SessionSetup,
+    Stdio,
 };
 
 use super::policy::{LaunchTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
@@ -33,7 +33,6 @@ use crate::sandbox::SandboxId;
 
 /// Deadline for a killed process domain to report `populated 0`.
 const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
 
 /// One sandbox's runtime-domain state (plan M5).
 ///
@@ -395,9 +394,7 @@ impl ProcessLauncher for LinuxLauncher {
         let wait_control = Arc::clone(&control);
         let spawn_result = std::thread::Builder::new()
             .name("shbox-linux-sandbox-wait".to_string())
-            .spawn(move || {
-                wait_process(child, wait_control, launch_temp, wait_tx, domain_lease)
-            });
+            .spawn(move || wait_process(child, wait_control, launch_temp, wait_tx, domain_lease));
         if spawn_result.is_err() {
             control.force_terminate();
             control.mark_cleanup_complete();
@@ -446,19 +443,14 @@ impl ProcessLauncher for LinuxLauncher {
             }
             let deadline = Instant::now() + DOMAIN_TEARDOWN_TIMEOUT;
             loop {
-                let in_flight = slots
-                    .get(sandbox_id)
-                    .map_or(0, |slot| slot.in_flight);
+                let in_flight = slots.get(sandbox_id).map_or(0, |slot| slot.in_flight);
                 if in_flight == 0 {
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                let Ok((guard, timeout)) =
-                    self.registry.changed.wait_timeout(slots, remaining)
+                let Ok((guard, timeout)) = self.registry.changed.wait_timeout(slots, remaining)
                 else {
-                    return Err(LaunchError::new(
-                        "sandbox process registry is unavailable",
-                    ));
+                    return Err(LaunchError::new("sandbox process registry is unavailable"));
                 };
                 slots = guard;
                 if timeout.timed_out() {
@@ -729,6 +721,17 @@ impl RunningProcess for LinuxProcessControl {
         };
         super::terminal::apply_window_size(fd.as_raw_fd(), rows, cols).is_ok()
     }
+
+    fn detach_transport(&self) {
+        // Close this channel's PTY master. The kernel sends SIGHUP to the
+        // terminal's foreground process group, so an interactive shell ends
+        // by normal terminal semantics while a `nohup`/`setsid()` process
+        // survives — no daemon-side signal decides either way. After the
+        // close, resize and foreground-group lookups naturally fail.
+        if let Ok(mut lifecycle_fd) = self.lifecycle_fd.lock() {
+            lifecycle_fd.take();
+        }
+    }
 }
 
 fn async_reader(file: std::fs::File) -> ProcessReader {
@@ -932,8 +935,6 @@ mod tests {
     /// never share a domain.
     #[tokio::test]
     async fn launches_without_limits_share_one_domain_per_sandbox() {
-        use tokio::io::AsyncReadExt;
-
         let root = tempfile::tempdir().expect("runtime root");
         let workspace = tempfile::tempdir().expect("workspace");
         // /proc is readable so the probe command can observe its own cgroup.
@@ -955,7 +956,7 @@ mod tests {
 
         // A detached descendant keeps the domain populated across launch
         // boundaries (docs/lifecycle.md §2.1).
-        let mut keeper = launcher
+        let keeper = launcher
             .launch(request(
                 workspace.path(),
                 "setsid sh -c 'printf ok > keeper-ready; exec sleep 30' & B=$!; \
@@ -969,22 +970,19 @@ mod tests {
             ProcessExit::Code(0)
         );
 
-        let first_cgroup =
-            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        let first_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert!(
             first_cgroup.contains("sandbox-"),
             "launch must join a dedicated cgroup even without limits: {first_cgroup}"
         );
-        let second_cgroup =
-            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        let second_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert_eq!(
             first_cgroup, second_cgroup,
             "launches of one sandbox must share one domain while it is populated"
         );
 
         let other_workspace = tempfile::tempdir().expect("other workspace");
-        let other_cgroup =
-            read_cgroup(&launcher, "other-sandbox", other_workspace.path()).await;
+        let other_cgroup = read_cgroup(&launcher, "other-sandbox", other_workspace.path()).await;
         assert_ne!(
             first_cgroup, other_cgroup,
             "different sandbox IDs must use separate process domains"
@@ -1003,14 +1001,12 @@ mod tests {
         while process_alive(keeper_pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let drained_cgroup =
-            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        let drained_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert_eq!(
             drained_cgroup, first_cgroup,
             "the drained domain stays until a launch-finished transition"
         );
-        let fresh_cgroup =
-            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        let fresh_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert_ne!(
             fresh_cgroup, first_cgroup,
             "after the domain drains, the next launch must start a fresh generation"
@@ -1084,7 +1080,10 @@ mod tests {
             .expect("stress release");
         let long_exit = long_launch.await.expect("long launch task");
         assert!(
-            matches!(long_exit, Ok(ProcessExit::Signal { .. }) | Ok(ProcessExit::Code(_))),
+            matches!(
+                long_exit,
+                Ok(ProcessExit::Signal { .. }) | Ok(ProcessExit::Code(_))
+            ),
             "the racing launch must exit, not hang: {long_exit:?}"
         );
 
@@ -1185,7 +1184,12 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let mut launched = launcher
-            .launch(request_for(sandbox, workspace, "cat /proc/self/cgroup", false))
+            .launch(request_for(
+                sandbox,
+                workspace,
+                "cat /proc/self/cgroup",
+                false,
+            ))
             .expect("launch");
         drop(launched.stdin.take());
         let mut cgroup = String::new();
