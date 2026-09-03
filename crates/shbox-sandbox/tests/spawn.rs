@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
     CommandSpec, FilesystemPolicy, Limit, NetworkPolicy, PathRule, Sandbox, SandboxConfig,
-    SandboxError, SeccompAction, SessionSetup, Stdio, Syscall, SyscallPolicy, SyscallRule,
+    SandboxError, SeccompAction, Stdio, Syscall, SyscallPolicy, SyscallRule,
 };
 
 /// Run `/bin/sh -c <script>` under `config`, wait, and collect
@@ -679,7 +679,7 @@ fn unlimited_inexpressible_resource_limits_are_not_silently_ignored() {
 #[cfg(target_os = "linux")]
 mod linux_only {
     use super::*;
-    use shbox_sandbox::ResourceLimits;
+    use shbox_sandbox::{ProcessDomainScope, ResourceLimits, SessionSetup};
 
     fn landlock_ready() -> bool {
         Sandbox::detect().capabilities().landlock_abi.unwrap_or(0) >= 1
@@ -1183,6 +1183,51 @@ mod linux_only {
         assert_eq!(removed, 1, "one stale shbox domain must be removed");
         assert!(sibling.exists(), "unrelated cgroup must be preserved");
         std::fs::remove_dir(sibling).expect("remove test sibling cgroup");
+    }
+
+    /// Audit B3: a `ProcessDomainScope` binds creation and reconciliation to
+    /// one resolved parent. This explicit-parent integration fixture verifies
+    /// that a stale domain created through the scope is reclaimed through the
+    /// same scope; auto-discovery uses the same resolved object by construction.
+    #[test]
+    fn process_domain_scope_creation_and_reconciliation_share_one_parent() {
+        let Some(parent_path) = delegated_cgroup_parent() else {
+            eprintln!("skipping: no delegated cgroup parent");
+            return;
+        };
+        let parent = shbox_sandbox::CgroupParent::new(parent_path.clone());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = restricted_to(workspace.path());
+        let scope = ProcessDomainScope::resolve(Some(&parent), &ResourceLimits::default())
+            .expect("resolve process-domain scope");
+        assert_eq!(
+            scope.parent_path(),
+            parent_path.as_path(),
+            "an explicit parent must resolve to itself"
+        );
+
+        let domain = match scope.create_domain(&config.resources) {
+            Ok(domain) => domain,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("scope domain creation failed: {error}"),
+        };
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg("exec sleep 30");
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Null;
+        command.stderr = Stdio::Null;
+        let sandbox = Sandbox::detect_with(Some(parent));
+        let child = sandbox
+            .spawn_in_process_domain(command, config, &domain)
+            .expect("scope-domain child");
+        std::mem::forget(child);
+        std::mem::forget(domain);
+
+        let removed = scope.reconcile_stale().expect("scope reconciliation");
+        assert_eq!(removed, 1, "the scope must reclaim the domain it created");
     }
 
     #[test]

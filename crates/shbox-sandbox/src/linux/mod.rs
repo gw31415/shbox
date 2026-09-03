@@ -34,7 +34,9 @@ use crate::policy::{CgroupParent, NetworkNamespacePolicy, ResourceLimits, Sandbo
 use crate::{BackendChild, Platform, SandboxCapabilities, SandboxChild};
 
 use cgroup::{
-    Cgroup, create_process_domain_cgroup, create_sandbox_cgroup, reconcile_process_domain_cgroups,
+    Cgroup, ResolvedParent, create_process_domain_cgroup, create_process_domain_cgroup_under,
+    create_sandbox_cgroup, needed_controllers, reconcile_process_domain_cgroups,
+    resolve_creation_parent,
 };
 use clone3::{
     CLONE_INTO_CGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
@@ -98,13 +100,91 @@ pub(crate) fn raw_errno() -> i32 {
 }
 
 /// Detect the platform's sandbox facilities.
+///
+/// The reported cgroup path is a **candidate**, not a validated parent:
+/// writability, delegation, and controller availability are proven when a
+/// parent is resolved for use ([`ProcessDomainScope::resolve`] or a spawn
+/// with limits). An explicitly configured parent takes precedence over
+/// auto-discovery so configuration actually overrides the environment.
 pub fn detect_capabilities(explicit_parent: Option<&CgroupParent>) -> SandboxCapabilities {
     SandboxCapabilities {
         platform: Platform::Linux,
         landlock_abi: landlock::probe_abi(),
-        cgroup_v2_root: cgroup::current_cgroup_path()
-            .or_else(|| explicit_parent.map(|parent| parent.path().to_path_buf())),
+        cgroup_v2_root: explicit_parent
+            .map(|parent| parent.path().to_path_buf())
+            .or_else(cgroup::current_cgroup_path),
         seatbelt_available: false,
+    }
+}
+
+/// A cgroup parent resolved once from immutable configuration, binding
+/// process-domain creation and stale-domain reconciliation to one open
+/// directory descriptor.
+///
+/// Resolving the parent independently per operation could select different
+/// ancestors when auto-discovery walks toward the cgroup2 root (a nearer
+/// writable candidate without the needed controllers versus a farther one
+/// with them). One resolved scope makes that divergence impossible: every
+/// domain created through the scope lives below the same descriptor that
+/// reconciliation later enumerates.
+///
+/// A daemon should resolve exactly one scope for its resource policy at
+/// startup, call [`reconcile_stale`](Self::reconcile_stale) before accepting
+/// launches, and use [`create_domain`](Self::create_domain) for every
+/// sandbox's durable process domain.
+pub struct ProcessDomainScope {
+    parent: ResolvedParent,
+}
+
+impl std::fmt::Debug for ProcessDomainScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessDomainScope")
+            .field("parent", &self.parent.path().display().to_string())
+            .finish()
+    }
+}
+
+impl ProcessDomainScope {
+    /// Resolve the delegated cgroup parent for `limits`' controller
+    /// requirements. See [`detect_capabilities`] for detection semantics;
+    /// this is the operation that actually validates writability and
+    /// controllers.
+    pub fn resolve(
+        explicit_parent: Option<&CgroupParent>,
+        limits: &ResourceLimits,
+    ) -> Result<Self, SandboxError> {
+        Ok(Self {
+            parent: resolve_creation_parent(explicit_parent, &needed_controllers(limits))?,
+        })
+    }
+
+    /// The resolved parent's path, for diagnostics and logging.
+    pub fn parent_path(&self) -> &std::path::Path {
+        self.parent.path()
+    }
+
+    /// Create one durable process domain below the resolved parent.
+    ///
+    /// Limits may be entirely `Inherit`: the domain still exists as the
+    /// sandbox's process-containment boundary, leaving every controller file
+    /// at the parent's policy.
+    pub fn create_domain(&self, limits: &ResourceLimits) -> Result<ProcessDomain, SandboxError> {
+        Ok(ProcessDomain {
+            cgroup: Arc::new(create_process_domain_cgroup_under(
+                &self.parent,
+                limits,
+                &random_suffix()?,
+            )?),
+            resources: *limits,
+        })
+    }
+
+    /// Reclaim stale process domains left below this exact parent by a
+    /// previous daemon instance. Only the reserved `shbox-domain-` prefix is
+    /// considered owned; siblings and one-shot `sandbox-*` cgroups are never
+    /// inspected or changed.
+    pub fn reconcile_stale(&self) -> Result<usize, SandboxError> {
+        reconcile_process_domain_cgroups(&self.parent)
     }
 }
 
@@ -210,11 +290,17 @@ impl LinuxBackend {
         })
     }
 
+    /// Reconcile with an independently resolved parent. Prefer
+    /// [`ProcessDomainScope`], which binds creation and reconciliation to
+    /// one resolved parent; this per-call form resolves with no controller
+    /// requirements and is only correct when every domain was created below
+    /// the same explicit parent.
     pub(crate) fn reconcile_stale_process_domains(
         &self,
         explicit_parent: Option<&CgroupParent>,
     ) -> Result<usize, SandboxError> {
-        reconcile_process_domain_cgroups(explicit_parent)
+        let parent = resolve_creation_parent(explicit_parent, &[])?;
+        reconcile_process_domain_cgroups(&parent)
     }
 
     pub(crate) fn spawn_in_process_domain(
@@ -813,9 +899,7 @@ impl StdioFds {
                     let (child_end, parent_end) = pipe_end(index)?;
                     sources[index] = child_end.as_raw_fd();
                     owned.push(child_end);
-                    // SAFETY: parent_end is a fresh owned descriptor.
-                    parent_ends[index] = Some(unsafe { File::from_raw_fd(parent_end.as_raw_fd()) });
-                    std::mem::forget(parent_end);
+                    parent_ends[index] = Some(File::from(parent_end));
                 }
             }
         }

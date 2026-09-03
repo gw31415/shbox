@@ -260,16 +260,24 @@ impl ProcessLauncher for UnavailableLauncher {
 /// Deterministic fake adapter used by lifecycle and bridge tests. The barrier
 /// is optional and is deliberately controlled by the test, not by user config.
 #[cfg(test)]
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FakeLauncher {
     state: Arc<std::sync::Mutex<FakeState>>,
 }
 
 #[cfg(test)]
-#[derive(Debug, Default)]
+impl fmt::Debug for FakeLauncher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FakeLauncher").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
 struct FakeState {
     fail_next: bool,
     fail_release_next: bool,
+    fail_startup_next: bool,
     launches: usize,
     barrier: Option<Arc<std::sync::Barrier>>,
     last_request: Option<LaunchRequest>,
@@ -278,12 +286,24 @@ struct FakeState {
     startup_reconciliations: usize,
     shutdowns: usize,
     forced_shutdowns: usize,
+    /// Invoked during startup resource reconciliation so tests can assert
+    /// invariants that must hold at that exact point (e.g. a durable
+    /// `Deleting` workspace still being present).
+    startup_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(test)]
 impl FakeLauncher {
     pub(crate) fn fail_next(&self) {
         self.state.lock().expect("fake launcher").fail_next = true;
+    }
+
+    pub(crate) fn fail_startup_next(&self) {
+        self.state.lock().expect("fake launcher").fail_startup_next = true;
+    }
+
+    pub(crate) fn set_startup_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        self.state.lock().expect("fake launcher").startup_observer = Some(observer);
     }
 
     pub(crate) fn fail_release_next(&self) {
@@ -390,10 +410,22 @@ impl ProcessLauncher for FakeLauncher {
     }
 
     fn reconcile_startup_resources(&self) -> Result<(), LaunchError> {
-        self.state
-            .lock()
-            .expect("fake launcher")
-            .startup_reconciliations += 1;
+        let (fail, observer) = {
+            let mut state = self.state.lock().expect("fake launcher");
+            state.startup_reconciliations += 1;
+            (
+                std::mem::take(&mut state.fail_startup_next),
+                state.startup_observer.clone(),
+            )
+        };
+        if let Some(observer) = observer {
+            observer();
+        }
+        if fail {
+            return Err(LaunchError::new(
+                "injected fake startup reconciliation failure",
+            ));
+        }
         Ok(())
     }
 

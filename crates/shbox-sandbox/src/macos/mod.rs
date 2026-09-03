@@ -699,9 +699,7 @@ impl StdioFds {
                     let (child_end, parent_end) = pipe_end(index)?;
                     sources[index] = child_end.as_raw_fd();
                     owned.push(child_end);
-                    // SAFETY: parent_end is a fresh owned descriptor.
-                    parent_ends[index] = Some(unsafe { File::from_raw_fd(parent_end.as_raw_fd()) });
-                    std::mem::forget(parent_end);
+                    parent_ends[index] = Some(File::from(parent_end));
                 }
             }
         }

@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
-    CommandSpec, ProcessDomain, Sandbox, SandboxConfig as EngineConfig, SandboxError, SessionSetup,
-    Stdio,
+    CommandSpec, ProcessDomain, ProcessDomainScope, Sandbox, SandboxConfig as EngineConfig,
+    SandboxError, SessionSetup, Stdio,
 };
 
 use super::policy::{RuntimeTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
@@ -34,36 +34,44 @@ use crate::sandbox::SandboxId;
 /// Deadline for a killed process domain to report `populated 0`.
 const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One sandbox's runtime-domain state (plan M5).
+/// One sandbox's runtime-domain state (plan M5). The lifecycle is the enum:
+/// every state carries exactly the fields that exist in it, so contradictory
+/// combinations (`Idle` with a retained temp tree, `Active` without a
+/// domain) cannot be represented (audit S6).
 ///
 /// ```text
-/// Idle (absent)  -- first launch -->  Active  -- populated=0 && in_flight=0 -->  Idle
-/// Active/Idle    -- delete -->        Deleting  -- reject launches, wait in-flight,
-///                                             kill/remove the domain, then gone
+/// (absent) -- first launch --> Creating --resolve--> Active
+/// Active -- populated=0 && in_flight=0 --> (absent)          [empty cleanup]
+/// Active -- cleanup fs failure --> CleanupPending --> (absent) [retry on next launch]
+/// Active / CleanupPending -- delete --> Deleting --> (absent)
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum DomainPhase {
-    /// No domain exists; the slot is absent from the registry.
-    #[default]
-    Idle,
-    /// A domain exists and launches may join it.
-    Active,
-    /// Removal is in progress; launches are rejected.
-    Deleting,
-}
-
-/// The registry entry behind [`DomainPhase::Active`].
-#[derive(Debug, Default)]
-struct DomainSlot {
-    phase: DomainPhase,
-    /// Names the runtime-domain generation held by this slot.
-    generation: u64,
-    /// Launches between "domain acquired" and "waiter finished".
-    in_flight: usize,
-    domain: Option<Arc<ProcessDomain>>,
-    /// Runtime-scoped `TMPDIR` retained while this generation is populated or
-    /// has a launch in flight.
-    runtime_temp: Option<RuntimeTemp>,
+#[derive(Debug)]
+enum DomainSlot {
+    /// The first launch is resolving the domain outside the registry lock;
+    /// later launches and deletion wait on the condvar until it resolves.
+    Creating,
+    Active {
+        /// Names the runtime-domain generation held by this slot.
+        generation: u64,
+        /// Launches between "domain acquired" and "waiter finished".
+        in_flight: usize,
+        domain: Arc<ProcessDomain>,
+        /// Runtime-scoped `TMPDIR` retained while this generation is
+        /// populated or has a launch in flight.
+        runtime_temp: RuntimeTemp,
+    },
+    Deleting {
+        generation: u64,
+        in_flight: usize,
+        /// `None` once the cgroup is removed and only the runtime temp tree
+        /// still awaits a filesystem cleanup retry.
+        domain: Option<Arc<ProcessDomain>>,
+        runtime_temp: Option<RuntimeTemp>,
+    },
+    /// The domain cgroup is already removed but its runtime temp tree could
+    /// not be deleted; the next launch retries cleanup before creating a
+    /// fresh generation, and deletion retries it before completing.
+    CleanupPending { runtime_temp: RuntimeTemp },
 }
 
 /// Shared per-sandbox domain registry: the state machine guarding the
@@ -95,45 +103,57 @@ impl DomainRegistry {
         let Ok(mut slots) = self.slots.lock() else {
             return;
         };
-        let Some(slot) = slots.get_mut(sandbox_id) else {
-            return;
-        };
-        slot.in_flight = slot.in_flight.saturating_sub(1);
         // Empty cleanup is only allowed when everything agrees the domain is
         // unused: no in-flight launch (this lock serializes new launches'
         // increments), no member processes (so nothing can fork into it),
         // and the slot is still Active — not mid-deletion.
-        if slot.phase == DomainPhase::Active
-            && slot.in_flight == 0
-            && slot
-                .domain
-                .as_ref()
-                .is_some_and(|domain| !domain.is_populated().unwrap_or(true))
-        {
-            let Some(domain) = slot.domain.take() else {
-                self.changed.notify_all();
-                return;
-            };
-            if domain.remove_empty().is_ok() {
-                let temp_removed = slot
-                    .runtime_temp
-                    .as_ref()
-                    .is_none_or(|runtime_temp| runtime_temp.remove().is_ok());
-                if temp_removed {
-                    slot.runtime_temp.take();
+        let drained = match slots.get_mut(sandbox_id) {
+            Some(DomainSlot::Active {
+                in_flight, domain, ..
+            }) => {
+                *in_flight = in_flight.saturating_sub(1);
+                *in_flight == 0 && !domain.is_populated().unwrap_or(true)
+            }
+            Some(DomainSlot::Deleting { in_flight, .. }) => {
+                *in_flight = in_flight.saturating_sub(1);
+                false
+            }
+            _ => false,
+        };
+        if drained {
+            let retire = slots.get_mut(sandbox_id).is_some_and(|slot| {
+                let DomainSlot::Active { domain, .. } = slot else {
+                    return false;
+                };
+                domain.remove_empty().is_ok()
+            });
+            if retire {
+                // The cgroup is gone; the runtime tree follows it, or the
+                // slot degrades to CleanupPending for a retry.
+                let mut prior = DomainSlot::Creating;
+                let Some(slot) = slots.get_mut(sandbox_id) else {
+                    self.changed.notify_all();
+                    return;
+                };
+                std::mem::swap(slot, &mut prior);
+                let DomainSlot::Active { runtime_temp, .. } = prior else {
+                    self.changed.notify_all();
+                    return;
+                };
+                if runtime_temp.remove().is_ok() {
                     slots.remove(sandbox_id);
                 } else {
-                    // The cgroup is already empty, but a transient
-                    // filesystem failure left the runtime tree owned by this
-                    // idle slot. Keep it so the next launch can retry cleanup
-                    // before creating a new generation.
-                    slot.phase = DomainPhase::Idle;
+                    // A transient filesystem failure left the runtime tree
+                    // owned by this idle slot. Keep it so the next launch
+                    // can retry cleanup before creating a new generation.
+                    slots.insert(
+                        sandbox_id.clone(),
+                        DomainSlot::CleanupPending { runtime_temp },
+                    );
                 }
-            } else {
-                // Removal raced with an observation failure; retain the
-                // domain so deletion or a later cleanup can retry safely.
-                slot.domain = Some(domain);
             }
+            // A removal that raced with an observation failure just leaves
+            // the Active slot intact; deletion or a later cleanup retries.
         }
         self.changed.notify_all();
     }
@@ -156,6 +176,10 @@ impl Drop for DomainLease {
 pub(crate) struct LinuxLauncher {
     policy: SandboxLaunchPolicy,
     engine: Sandbox,
+    /// The delegated cgroup parent resolved once from the immutable policy
+    /// (audit B3): every domain creation and startup reconciliation below
+    /// this launcher uses the same open parent descriptor.
+    domain_scope: std::sync::OnceLock<Result<Arc<ProcessDomainScope>, String>>,
     registry: Arc<DomainRegistry>,
 }
 
@@ -223,8 +247,27 @@ impl LinuxLauncher {
         Ok(Self {
             policy,
             engine,
+            domain_scope: std::sync::OnceLock::new(),
             registry: Arc::new(DomainRegistry::default()),
         })
+    }
+
+    /// Resolve (once) the delegated cgroup parent for this policy's
+    /// controller requirements. Writability and controller availability are
+    /// proven here, not at capability detection.
+    fn domain_scope(&self) -> Result<Arc<ProcessDomainScope>, LaunchError> {
+        match self.domain_scope.get_or_init(|| {
+            let explicit = self
+                .policy
+                .cgroup_parent()
+                .map(shbox_sandbox::CgroupParent::new);
+            ProcessDomainScope::resolve(explicit.as_ref(), &self.policy.engine_resources())
+                .map(Arc::new)
+                .map_err(|error| describe_engine_error(&error))
+        }) {
+            Ok(scope) => Ok(Arc::clone(scope)),
+            Err(reason) => Err(LaunchError::new(reason.clone())),
+        }
     }
 
     fn command_spec(
@@ -253,13 +296,15 @@ impl LinuxLauncher {
     /// process domain. Test seams use this to self-skip on hosts without a
     /// delegated cgroup v2 parent, mirroring the engine's contract.
     #[cfg(test)]
-    pub(crate) fn process_domain_ready(&self, workspace: &Path) -> bool {
-        let config = self.policy.engine_config(workspace, workspace);
-        let parent = config
-            .cgroup_parent
-            .as_deref()
-            .map(shbox_sandbox::CgroupParent::new);
-        match self.engine.create_process_domain(config.resources, parent) {
+    pub(crate) fn process_domain_ready(&self, _workspace: &Path) -> bool {
+        let scope = match self.domain_scope() {
+            Ok(scope) => scope,
+            Err(error) => {
+                eprintln!("skipping: process-domain scope unavailable: {error}");
+                return false;
+            }
+        };
+        match scope.create_domain(&self.policy.engine_resources()) {
             Ok(domain) => {
                 let _ = domain.remove_empty();
                 true
@@ -276,70 +321,201 @@ impl LinuxLauncher {
     /// in-flight launch against it. The returned lease decrements the
     /// in-flight count on drop, so every exit path — success, failure, or a
     /// panicking waiter — keeps the registry exact.
+    ///
+    /// The registry map lock only guards slot membership and state
+    /// transitions: cgroup-parent resolution, temp-tree creation, and domain
+    /// creation are blocking filesystem/kernel operations performed **after**
+    /// publishing a `Creating` marker and dropping the lock, so a slow first
+    /// launch for one sandbox cannot block unrelated sandboxes' launches or
+    /// deletions (audit S5).
     fn process_domain(
         &self,
         sandbox_id: &SandboxId,
-        workspace: &Path,
     ) -> Result<(Arc<ProcessDomain>, DomainLease, PathBuf), LaunchError> {
         let mut slots = self
             .registry
             .slots
             .lock()
             .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
-        if !self.registry.accepting.load(Ordering::Acquire) {
-            return Err(LaunchError::new(
-                "sandbox process adapter is shutting down; new launches are rejected",
-            ));
-        }
-        let slot = slots.entry(sandbox_id.clone()).or_default();
-        if slot.phase == DomainPhase::Deleting {
-            return Err(LaunchError::new(
-                "sandbox process domain is being deleted; new launches are rejected",
-            ));
-        }
-        if slot.domain.is_none() {
-            if let Some(runtime_temp) = slot.runtime_temp.take()
-                && let Err(error) = runtime_temp.remove()
-            {
-                slot.runtime_temp = Some(runtime_temp);
-                return Err(error);
+        loop {
+            if !self.registry.accepting.load(Ordering::Acquire) {
+                return Err(LaunchError::new(
+                    "sandbox process adapter is shutting down; new launches are rejected",
+                ));
             }
-            let generation = self
-                .registry
-                .next_generation
-                .fetch_add(1, Ordering::Relaxed);
-            let runtime_temp = self.policy.create_runtime_temp(generation)?;
-            let runtime_temp_path = fs::canonicalize(runtime_temp.path()).map_err(|_| {
-                LaunchError::new("sandbox runtime temp directory became unavailable")
-            })?;
-            let config = self.policy.engine_config(workspace, &runtime_temp_path);
-            let parent = config
-                .cgroup_parent
-                .as_deref()
-                .map(shbox_sandbox::CgroupParent::new);
-            let domain = Arc::new(
-                self.engine
-                    .create_process_domain(config.resources, parent)
-                    .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
-            );
-            slot.generation = generation;
-            slot.domain = Some(domain);
-            slot.runtime_temp = Some(runtime_temp);
-            slot.phase = DomainPhase::Active;
+            enum Join {
+                StartCreating,
+                WaitCreating,
+                Joined,
+                Deleting,
+                CleanPending,
+            }
+            let join = match slots.get_mut(sandbox_id) {
+                None => Join::StartCreating,
+                Some(DomainSlot::Creating) => Join::WaitCreating,
+                Some(DomainSlot::Active { .. }) => Join::Joined,
+                Some(DomainSlot::Deleting { .. }) => Join::Deleting,
+                Some(DomainSlot::CleanupPending { .. }) => Join::CleanPending,
+            };
+            match join {
+                Join::StartCreating => {
+                    slots.insert(sandbox_id.clone(), DomainSlot::Creating);
+                    break;
+                }
+                Join::WaitCreating => {
+                    // Another launch is resolving the domain; wait for it.
+                    let (guard, timeout) = self
+                        .registry
+                        .changed
+                        .wait_timeout(slots, Duration::from_secs(10))
+                        .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
+                    slots = guard;
+                    if timeout.timed_out()
+                        && matches!(slots.get(sandbox_id), Some(DomainSlot::Creating))
+                    {
+                        return Err(LaunchError::new(
+                            "sandbox process domain creation did not complete in time",
+                        ));
+                    }
+                }
+                Join::Joined => {
+                    let Some(DomainSlot::Active {
+                        in_flight,
+                        domain,
+                        runtime_temp,
+                        ..
+                    }) = slots.get_mut(sandbox_id)
+                    else {
+                        continue;
+                    };
+                    *in_flight += 1;
+                    let domain = Arc::clone(domain);
+                    let runtime_temp_path = runtime_temp.path().to_path_buf();
+                    let lease = DomainLease {
+                        registry: Arc::clone(&self.registry),
+                        sandbox_id: sandbox_id.clone(),
+                    };
+                    return Ok((domain, lease, runtime_temp_path));
+                }
+                Join::Deleting => {
+                    return Err(LaunchError::new(
+                        "sandbox process domain is being deleted; new launches are rejected",
+                    ));
+                }
+                Join::CleanPending => {
+                    // Retry the pending temp cleanup, then resolve a fresh
+                    // generation. The swap keeps exactly one cleaner and
+                    // publishes the `Creating` marker for the creator below.
+                    let mut prior = DomainSlot::Creating;
+                    {
+                        let Some(slot) = slots.get_mut(sandbox_id) else {
+                            continue;
+                        };
+                        std::mem::swap(slot, &mut prior);
+                    }
+                    let DomainSlot::CleanupPending { runtime_temp } = prior else {
+                        continue;
+                    };
+                    drop(slots);
+                    // Filesystem work outside the registry lock.
+                    if let Err(error) = runtime_temp.remove() {
+                        let mut slots = self.registry.slots.lock().map_err(|_| {
+                            LaunchError::new("sandbox process registry is unavailable")
+                        })?;
+                        slots.insert(
+                            sandbox_id.clone(),
+                            DomainSlot::CleanupPending { runtime_temp },
+                        );
+                        self.registry.changed.notify_all();
+                        return Err(error);
+                    }
+                    slots =
+                        self.registry.slots.lock().map_err(|_| {
+                            LaunchError::new("sandbox process registry is unavailable")
+                        })?;
+                    if matches!(slots.get_mut(sandbox_id), Some(DomainSlot::Creating)) {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
-        slot.in_flight += 1;
-        let domain = Arc::clone(slot.domain.as_ref().expect("domain just ensured"));
-        let runtime_temp_path = slot
-            .runtime_temp
-            .as_ref()
-            .ok_or_else(|| LaunchError::new("sandbox runtime temp state is unavailable"))?
-            .path()
-            .to_path_buf();
-        let lease = DomainLease {
-            registry: Arc::clone(&self.registry),
-            sandbox_id: sandbox_id.clone(),
-        };
-        Ok((domain, lease, runtime_temp_path))
+        // `Creating` is published; every cgroup/filesystem operation below
+        // happens without the registry lock.
+        let create = self.create_generation();
+        let mut slots = self
+            .registry
+            .slots
+            .lock()
+            .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
+        match create {
+            Ok((generation, domain, runtime_temp)) => {
+                if matches!(slots.get_mut(sandbox_id), Some(DomainSlot::Creating))
+                    || !slots.contains_key(sandbox_id)
+                {
+                    slots.insert(
+                        sandbox_id.clone(),
+                        DomainSlot::Active {
+                            generation,
+                            in_flight: 1,
+                            domain: Arc::clone(&domain),
+                            runtime_temp,
+                        },
+                    );
+                } else {
+                    // A competing transition won the slot; discard ours.
+                    drop(slots);
+                    let _ = domain.kill_all();
+                    let _ = domain.wait_until_empty(DOMAIN_TEARDOWN_TIMEOUT);
+                    let _ = domain.remove_empty();
+                    return Err(LaunchError::new(
+                        "sandbox process domain state changed during creation",
+                    ));
+                }
+                self.registry.changed.notify_all();
+                let runtime_temp_path = slots
+                    .get(sandbox_id)
+                    .and_then(|slot| match slot {
+                        DomainSlot::Active { runtime_temp, .. } => {
+                            Some(runtime_temp.path().to_path_buf())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| LaunchError::new("sandbox runtime temp state is unavailable"))?;
+                let lease = DomainLease {
+                    registry: Arc::clone(&self.registry),
+                    sandbox_id: sandbox_id.clone(),
+                };
+                Ok((domain, lease, runtime_temp_path))
+            }
+            Err(error) => {
+                // Resolution failed: release the marker so waiting launches
+                // and deletions are not stuck on a dead creator.
+                if matches!(slots.get_mut(sandbox_id), Some(DomainSlot::Creating)) {
+                    slots.remove(sandbox_id);
+                }
+                self.registry.changed.notify_all();
+                Err(error)
+            }
+        }
+    }
+
+    /// Create one runtime-domain generation. Runs without the registry lock;
+    /// only valid while the caller holds the `Creating` marker.
+    fn create_generation(&self) -> Result<(u64, Arc<ProcessDomain>, RuntimeTemp), LaunchError> {
+        let scope = self.domain_scope()?;
+        let generation = self
+            .registry
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let runtime_temp = self.policy.create_runtime_temp(generation)?;
+        let resources = self.policy.engine_resources();
+        let domain = Arc::new(
+            scope
+                .create_domain(&resources)
+                .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
+        );
+        Ok((generation, domain, runtime_temp))
     }
 }
 
@@ -351,7 +527,7 @@ impl ProcessLauncher for LinuxLauncher {
             return Err(LaunchError::new("sandbox workspace is unavailable"));
         }
         let (process_domain, domain_lease, runtime_temp_path) =
-            self.process_domain(&request.sandbox_id, &workspace)?;
+            self.process_domain(&request.sandbox_id)?;
         let config: EngineConfig = self.policy.engine_config(&workspace, &runtime_temp_path);
 
         let mut command = self.command_spec(&request, &workspace)?;
@@ -477,55 +653,176 @@ impl ProcessLauncher for LinuxLauncher {
     fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
         // Deleting transition: reject new launches first, then wait out the
         // in-flight barrier before touching the cgroup (plan M5).
-        let (domain, runtime_temp) = {
+        let (mut domain, runtime_temp) = {
             let mut slots = self
                 .registry
                 .slots
                 .lock()
                 .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
-            match slots.get_mut(sandbox_id) {
-                None => return Ok(()),
-                Some(slot) => {
-                    slot.phase = DomainPhase::Deleting;
-                    // Kill every member now: still-running launches keep an
-                    // in-flight waiter that only finishes once its process
-                    // dies, so the barrier below could never drain otherwise.
-                    // Graceful termination already happened above this seam
-                    // (the manager's TERM pass); this is the hard boundary.
-                    if let Some(domain) = slot.domain.as_ref() {
-                        let _ = domain.kill_all();
-                    }
-                }
-            }
             let deadline = Instant::now() + DOMAIN_TEARDOWN_TIMEOUT;
             loop {
-                let in_flight = slots.get(sandbox_id).map_or(0, |slot| slot.in_flight);
-                if in_flight == 0 {
-                    break;
+                enum Phase {
+                    Absent,
+                    WaitCreating,
+                    WaitBarrier,
+                    TakeOver,
+                    MarkDeleting,
+                    FinishPendingCleanup,
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let Ok((guard, timeout)) = self.registry.changed.wait_timeout(slots, remaining)
-                else {
-                    return Err(LaunchError::new("sandbox process registry is unavailable"));
-                };
-                slots = guard;
-                if timeout.timed_out() {
-                    if let Some(slot) = slots.get_mut(sandbox_id) {
-                        slot.phase = if self.registry.accepting.load(Ordering::Acquire) {
-                            DomainPhase::Active
-                        } else {
-                            DomainPhase::Deleting
-                        };
+                let phase = match slots.get_mut(sandbox_id) {
+                    None => Phase::Absent,
+                    Some(DomainSlot::Creating) => Phase::WaitCreating,
+                    Some(DomainSlot::Deleting { in_flight, .. }) if *in_flight == 0 => {
+                        Phase::TakeOver
                     }
-                    return Err(LaunchError::new(
-                        "sandbox launch barrier did not drain before deletion",
-                    ));
+                    Some(DomainSlot::Deleting { .. }) => Phase::WaitBarrier,
+                    Some(DomainSlot::Active { .. }) => Phase::MarkDeleting,
+                    Some(DomainSlot::CleanupPending { .. }) => Phase::FinishPendingCleanup,
+                };
+                match phase {
+                    Phase::Absent => return Ok(()),
+                    Phase::WaitCreating => {
+                        // A launch is resolving the domain; it will publish
+                        // or retract the marker, so wait for the transition.
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let Ok((guard, timeout)) =
+                            self.registry.changed.wait_timeout(slots, remaining)
+                        else {
+                            return Err(LaunchError::new(
+                                "sandbox process registry is unavailable",
+                            ));
+                        };
+                        slots = guard;
+                        if timeout.timed_out()
+                            && matches!(slots.get(sandbox_id), Some(DomainSlot::Creating))
+                        {
+                            return Err(LaunchError::new(
+                                "sandbox process domain creation did not complete before deletion",
+                            ));
+                        }
+                    }
+                    Phase::WaitBarrier => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let Ok((guard, timeout)) =
+                            self.registry.changed.wait_timeout(slots, remaining)
+                        else {
+                            return Err(LaunchError::new(
+                                "sandbox process registry is unavailable",
+                            ));
+                        };
+                        slots = guard;
+                        if timeout.timed_out()
+                            && matches!(
+                                slots.get(sandbox_id),
+                                Some(DomainSlot::Deleting { in_flight, .. }) if *in_flight > 0
+                            )
+                        {
+                            return Err(LaunchError::new(
+                                "sandbox launch barrier did not drain before deletion",
+                            ));
+                        }
+                    }
+                    Phase::TakeOver => {
+                        let Some(DomainSlot::Deleting {
+                            domain,
+                            runtime_temp,
+                            ..
+                        }) = slots.get_mut(sandbox_id)
+                        else {
+                            continue;
+                        };
+                        break (domain.take(), runtime_temp.take());
+                    }
+                    Phase::MarkDeleting => {
+                        // Kill every member now: still-running launches keep
+                        // an in-flight waiter that only finishes once its
+                        // process dies, so the barrier below could never
+                        // drain otherwise. Graceful termination already
+                        // happened above this seam (the manager's TERM
+                        // pass); this is the hard boundary, and its failure
+                        // is authoritative: surface it instead of waiting
+                        // out a barrier that can never drain (audit S4).
+                        let mut prior = DomainSlot::Creating;
+                        {
+                            let Some(slot) = slots.get_mut(sandbox_id) else {
+                                continue;
+                            };
+                            std::mem::swap(slot, &mut prior);
+                        }
+                        let DomainSlot::Active {
+                            generation,
+                            in_flight,
+                            domain,
+                            runtime_temp,
+                        } = prior
+                        else {
+                            // A racing transition won; re-examine.
+                            slots.insert(sandbox_id.clone(), prior);
+                            continue;
+                        };
+                        if let Err(error) = domain.kill_all() {
+                            // Restore the Active slot unchanged; ownership
+                            // is intact for a retry.
+                            slots.insert(
+                                sandbox_id.clone(),
+                                DomainSlot::Active {
+                                    generation,
+                                    in_flight,
+                                    domain,
+                                    runtime_temp,
+                                },
+                            );
+                            self.registry.changed.notify_all();
+                            return Err(LaunchError::new(describe_engine_error(&error)));
+                        }
+                        slots.insert(
+                            sandbox_id.clone(),
+                            DomainSlot::Deleting {
+                                generation,
+                                in_flight,
+                                domain: Some(domain),
+                                runtime_temp: Some(runtime_temp),
+                            },
+                        );
+                        self.registry.changed.notify_all();
+                    }
+                    Phase::FinishPendingCleanup => {
+                        // Only the runtime temp tree remains. Publish a
+                        // `Creating` barrier while deleting it outside the
+                        // registry lock: concurrent launches/deletions must
+                        // wait, and a failed filesystem cleanup must restore
+                        // ownership instead of dropping the retry state.
+                        let mut prior = DomainSlot::Creating;
+                        {
+                            let Some(slot) = slots.get_mut(sandbox_id) else {
+                                continue;
+                            };
+                            std::mem::swap(slot, &mut prior);
+                        }
+                        let DomainSlot::CleanupPending { runtime_temp } = prior else {
+                            slots.insert(sandbox_id.clone(), prior);
+                            continue;
+                        };
+                        drop(slots);
+                        let outcome = runtime_temp.remove();
+                        let mut slots = self.registry.slots.lock().map_err(|_| {
+                            LaunchError::new("sandbox process registry is unavailable")
+                        })?;
+                        if matches!(slots.get(sandbox_id), Some(DomainSlot::Creating)) {
+                            if outcome.is_ok() {
+                                slots.remove(sandbox_id);
+                            } else {
+                                slots.insert(
+                                    sandbox_id.clone(),
+                                    DomainSlot::CleanupPending { runtime_temp },
+                                );
+                            }
+                        }
+                        self.registry.changed.notify_all();
+                        return outcome;
+                    }
                 }
             }
-            let Some(slot) = slots.get_mut(sandbox_id) else {
-                return Err(LaunchError::new("sandbox process registry is unavailable"));
-            };
-            (slot.domain.take(), slot.runtime_temp.take())
         };
         // Cgroup-authoritative teardown outside the registry lock: kill every
         // member (including detached `setsid()`/double-fork descendants no
@@ -550,62 +847,52 @@ impl ProcessLauncher for LinuxLauncher {
                 .remove_empty()
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))
         };
-        match teardown() {
+        let outcome = match teardown() {
             Ok(()) => {
-                if let Some(runtime_temp_ref) = runtime_temp.as_ref()
-                    && let Err(error) = runtime_temp_ref.remove()
-                {
-                    // The cgroup is already gone, but preserve the runtime
-                    // owner in Deleting so the next delete attempt can retry
-                    // filesystem cleanup before durable tree removal.
-                    if let Ok(mut slots) = self.registry.slots.lock() {
-                        if let Some(slot) = slots.get_mut(sandbox_id) {
-                            slot.phase = DomainPhase::Deleting;
-                            slot.domain = None;
-                            slot.runtime_temp = runtime_temp;
-                        }
-                        self.registry.changed.notify_all();
-                    }
-                    return Err(error);
+                // The cgroup is definitively gone. Do not restore this handle
+                // if only the following runtime-temp cleanup fails: retrying
+                // `kill_all()` on an already-removed cgroup would make the
+                // remaining filesystem cleanup permanently non-retryable.
+                domain = None;
+                match runtime_temp.as_ref().map(RuntimeTemp::remove) {
+                    Some(Err(error)) => Err(error),
+                    _ => Ok(()),
                 }
-                let Ok(mut slots) = self.registry.slots.lock() else {
-                    return Ok(());
-                };
-                if let Some(slot) = slots.get_mut(sandbox_id) {
-                    slot.phase = DomainPhase::Idle;
+            }
+            Err(error) => Err(error),
+        };
+        if let Ok(mut slots) = self.registry.slots.lock() {
+            match outcome {
+                Ok(()) => {
                     slots.remove(sandbox_id);
                 }
-                self.registry.changed.notify_all();
-                Ok(())
-            }
-            Err(error) => {
-                // Deletion failed: restore the slot so the cgroup stays
-                // owned and the caller can retry.
-                if let Ok(mut slots) = self.registry.slots.lock() {
-                    if let Some(slot) = slots.get_mut(sandbox_id) {
-                        slot.domain = domain;
-                        slot.runtime_temp = runtime_temp;
-                        slot.phase = if self.registry.accepting.load(Ordering::Acquire) {
-                            DomainPhase::Active
-                        } else {
-                            DomainPhase::Deleting
-                        };
-                    }
-                    self.registry.changed.notify_all();
+                Err(_) => {
+                    // Deletion failed: restore the pieces that still exist so
+                    // the cgroup stays owned and the caller can retry.
+                    let generation = match slots.get(sandbox_id) {
+                        Some(DomainSlot::Deleting { generation, .. }) => *generation,
+                        _ => 0,
+                    };
+                    slots.insert(
+                        sandbox_id.clone(),
+                        DomainSlot::Deleting {
+                            generation,
+                            in_flight: 0,
+                            domain,
+                            runtime_temp,
+                        },
+                    );
                 }
-                Err(error)
             }
+            self.registry.changed.notify_all();
         }
+        outcome
     }
 
     fn reconcile_startup_resources(&self) -> Result<(), LaunchError> {
-        let parent = self
-            .policy
-            .cgroup_parent()
-            .map(shbox_sandbox::CgroupParent::new);
-        let stale_domains = self
-            .engine
-            .reconcile_stale_process_domains(parent)
+        let scope = self.domain_scope()?;
+        let stale_domains = scope
+            .reconcile_stale()
             .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
         let stale_temps = self.policy.reconcile_runtime_temp()?;
         tracing::info!(
@@ -618,6 +905,7 @@ impl ProcessLauncher for LinuxLauncher {
 
     fn shutdown_sandbox_resources(&self) -> Result<(), LaunchError> {
         self.registry.accepting.store(false, Ordering::Release);
+        let mut first_kill_error = None;
         let sandbox_ids = {
             let mut slots = self
                 .registry
@@ -625,16 +913,44 @@ impl ProcessLauncher for LinuxLauncher {
                 .lock()
                 .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
             let sandbox_ids = slots.keys().cloned().collect::<Vec<_>>();
-            for slot in slots.values_mut() {
-                slot.phase = DomainPhase::Deleting;
-                if let Some(domain) = slot.domain.as_ref() {
-                    let _ = domain.kill_all();
+            for sandbox_id in &sandbox_ids {
+                let mut prior = DomainSlot::Creating;
+                let Some(slot) = slots.get_mut(sandbox_id) else {
+                    continue;
+                };
+                std::mem::swap(slot, &mut prior);
+                let DomainSlot::Active {
+                    generation,
+                    in_flight,
+                    domain,
+                    runtime_temp,
+                } = prior
+                else {
+                    slots.insert(sandbox_id.clone(), prior);
+                    continue;
+                };
+                // The authoritative hard kill: its failure is recorded
+                // (audit S4) but shutdown continues reclaiming the rest.
+                if let Err(error) = domain.kill_all()
+                    && first_kill_error.is_none()
+                {
+                    first_kill_error = Some(LaunchError::new(describe_engine_error(&error)));
                 }
+                slots.insert(
+                    sandbox_id.clone(),
+                    DomainSlot::Deleting {
+                        generation,
+                        in_flight,
+                        domain: Some(domain),
+                        runtime_temp: Some(runtime_temp),
+                    },
+                );
             }
             sandbox_ids
         };
+        self.registry.changed.notify_all();
 
-        let mut first_error = None;
+        let mut first_error = first_kill_error;
         for sandbox_id in sandbox_ids {
             if let Err(error) = self.release_sandbox_resources(&sandbox_id)
                 && first_error.is_none()
@@ -646,13 +962,36 @@ impl ProcessLauncher for LinuxLauncher {
     }
 
     fn force_shutdown_sandbox_resources(&self) {
+        // Explicitly best-effort: failures are suppressed by contract.
         self.registry.accepting.store(false, Ordering::Release);
         if let Ok(mut slots) = self.registry.slots.lock() {
-            for slot in slots.values_mut() {
-                slot.phase = DomainPhase::Deleting;
-                if let Some(domain) = slot.domain.as_ref() {
-                    let _ = domain.kill_all();
-                }
+            let sandbox_ids = slots.keys().cloned().collect::<Vec<_>>();
+            for sandbox_id in sandbox_ids {
+                let mut prior = DomainSlot::Creating;
+                let Some(slot) = slots.get_mut(&sandbox_id) else {
+                    continue;
+                };
+                std::mem::swap(slot, &mut prior);
+                let DomainSlot::Active {
+                    generation,
+                    in_flight,
+                    domain,
+                    runtime_temp,
+                } = prior
+                else {
+                    slots.insert(sandbox_id, prior);
+                    continue;
+                };
+                let _ = domain.kill_all();
+                slots.insert(
+                    sandbox_id,
+                    DomainSlot::Deleting {
+                        generation,
+                        in_flight,
+                        domain: Some(domain),
+                        runtime_temp: Some(runtime_temp),
+                    },
+                );
             }
             self.registry.changed.notify_all();
         }

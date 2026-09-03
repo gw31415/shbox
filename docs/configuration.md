@@ -145,6 +145,8 @@ OS が ordinary command runtime に必要とする system/runtime path は imple
 
 `cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、process domain を作成できる階層を使う。書き込み可能な階層が無ければ Linux sandbox launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=yes` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。
 
+**排他所有権**: `cgroup_parent` と runtime temp root は、それぞれ同時に 1 つの shbox daemon instance だけが所有する。daemon は起動時の reconciliation で当該 parent 直下のすべての `shbox-domain-*` cgroup（および runtime root 直下のすべての `sandbox-*` tree）を自らの所有物として回収する。この名前空間は per-daemon-instance ではないため、2 つの daemon が同一の parent/runtime root を共有する構成は支持されず、一方の起動が他方の稼働中 domain を kill する。複数 daemon を動かす場合は親子の異なる delegated directory をそれぞれに与えること。
+
 macOS の `memory_max` は `RLIMIT_AS`、`pids_max` は `RLIMIT_NPROC` として child の exec 前に設定され、descendant に継承される。これらは Linux cgroup tree quota ではない。
 
 ### 4.5 `[sandbox.env]`

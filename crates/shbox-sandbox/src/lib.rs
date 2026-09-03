@@ -54,7 +54,7 @@
 //!   policy fields are rejected explicitly on macOS — they are never
 //!   silently ignored.
 
-#![forbid(unsafe_op_in_unsafe_fn)]
+// `unsafe_op_in_unsafe_fn` is forbidden workspace-wide via [workspace.lints].
 #![warn(missing_docs)]
 
 mod command;
@@ -80,7 +80,7 @@ pub use policy::{
 };
 
 #[cfg(target_os = "linux")]
-pub use linux::{ProcessDomain, syscall_number};
+pub use linux::{ProcessDomain, ProcessDomainScope, syscall_number};
 
 /// Which backend a [`Sandbox`] resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +100,13 @@ pub struct SandboxCapabilities {
     pub platform: Platform,
     /// Landlock ABI version (Linux only). `None` when Landlock is absent.
     pub landlock_abi: Option<u32>,
-    /// Discovered writable cgroup v2 parent for sandbox cgroups
-    /// (Linux only). `None` when no usable hierarchy exists.
+    /// Candidate cgroup v2 parent path for sandbox cgroups (Linux only):
+    /// the explicitly configured parent when one was given to
+    /// [`Sandbox::detect_with`], otherwise the daemon's current cgroup.
+    /// This is a detection hint, not a validated parent — writability,
+    /// delegation, and controller availability are proven when a parent is
+    /// resolved for use ([`ProcessDomainScope::resolve`] or a spawn with
+    /// resource limits).
     pub cgroup_v2_root: Option<std::path::PathBuf>,
     /// Whether the macOS Seatbelt launcher is present (macOS only).
     pub seatbelt_available: bool,
@@ -293,7 +298,11 @@ impl Sandbox {
     }
 
     /// Like [`detect`](Self::detect), with an explicit cgroup v2 parent
-    /// (Linux only) overriding auto-discovery.
+    /// (Linux only) that takes precedence over auto-discovery in the
+    /// reported [`SandboxCapabilities::cgroup_v2_root`]. The parent is not
+    /// retained for cgroup operations: pass it to
+    /// [`ProcessDomainScope::resolve`] or the spawn config when creating
+    /// domains.
     #[cfg(target_os = "linux")]
     pub fn detect_with(cgroup_parent: Option<CgroupParent>) -> Sandbox {
         let capabilities = linux::detect_capabilities(cgroup_parent.as_ref());
@@ -366,7 +375,11 @@ impl Sandbox {
     /// This removes only cgroups created by the durable process-domain API;
     /// one-shot resource cgroups and unrelated sibling cgroups are ignored.
     /// A daemon should call this before accepting new sandbox launches after
-    /// a restart.
+    /// a restart. Daemons that create domains with resource limits should
+    /// prefer [`ProcessDomainScope`], which guarantees reconciliation scans
+    /// the exact parent creation used; this per-call form resolves the
+    /// parent independently and is only safe when every domain was created
+    /// below the same explicit parent.
     #[cfg(target_os = "linux")]
     pub fn reconcile_stale_process_domains(
         &self,

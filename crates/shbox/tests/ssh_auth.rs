@@ -920,10 +920,16 @@ fn run_ssh_command(
 /// targets retain the fail-closed path used by generic protocol tests.
 fn native_sandbox_supported() -> bool {
     if cfg!(target_os = "linux") {
-        linux_process_domain_supported()
-    } else {
-        cfg!(target_os = "macos")
+        #[cfg(target_os = "linux")]
+        {
+            return linux_process_domain_supported();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unreachable!("guarded by cfg!(target_os = \"linux\")")
+        }
     }
+    cfg!(target_os = "macos")
 }
 
 /// Every sandbox launch joins a mandatory per-sandbox cgroup (plan M4), so

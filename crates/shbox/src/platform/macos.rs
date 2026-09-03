@@ -8,7 +8,6 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -454,8 +453,9 @@ fn async_writer(file: std::fs::File) -> ProcessWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
+
+    use super::*;
     use std::path::Path;
     use tokio::io::AsyncReadExt;
 

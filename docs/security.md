@@ -206,7 +206,9 @@ Linux の engine-owned direct child には parent-death signal を設定し、�
 Linux の SandboxId ごとの cgroup process domain が process inventory と delete/
 shutdown の containment boundary である。sandbox code が deliberate に `setsid()` や
 double-fork で別 session/process groupへ detachしても、同じ domain に所属する限り
-`cgroup.kill` の対象から外れない。
+`cgroup.kill` の対象から外れない。delegated cgroup parent と runtime root は
+同時に 1 つの shbox daemon instance のみが所有する（排他所有権。詳細は
+configuration.md §resource limits）。
 
 process group は sandbox inventory ではなく、PTY foreground job lookup、SSH signal
 forwarding、shell job control、publication前の abandoned launch の graceful cleanup

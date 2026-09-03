@@ -39,3 +39,6 @@ tempfile = "3"
 # WebSocket client for the `ws` transport integration tests. The `connect`
 # feature stays test-only; the daemon itself only serves upgrades.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+
+[lints]
+workspace = true

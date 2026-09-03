@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/shbox", "crates/shbox-sandbox"]
+
+# Review/safety invariants inherited by every crate; members opt in with
+# `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+# Evaluated and deliberately not enabled workspace-wide:
+# clippy::undocumented_unsafe_blocks currently fires ~90 times across
+# pre-existing unsafe code (linux/child.rs, ssh/, tests); enforce it per
+# module once those sites are annotated.

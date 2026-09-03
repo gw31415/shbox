@@ -216,14 +216,25 @@ impl SandboxManager {
     }
 
     /// Complete startup cleanup and make sandbox operations available.
+    ///
+    /// Resource reconciliation is the prerequisite for durable deletion
+    /// recovery: stale process domains (and their runtime temp trees) from a
+    /// previous instance must be terminated and removed **before** any
+    /// `Deleting` workspace is deleted. The process-ownership contract
+    /// (docs/lifecycle.md §1) requires processes to be gone before their
+    /// workspaces; removing the workspace first would strand live sandbox
+    /// descendants in orphaned domains. If resource reconciliation fails,
+    /// the manager stays unavailable and no `Deleting` tree is touched.
     pub(crate) fn reconcile_startup(&self) {
-        self.reconcile_deleting();
-        match self.launcher.reconcile_startup_resources() {
-            Ok(()) => self.ready.store(true, std::sync::atomic::Ordering::Release),
-            Err(error) => {
-                tracing::error!(error = %error, "sandbox resource reconciliation failed; keeping manager unavailable")
-            }
+        if let Err(error) = self.launcher.reconcile_startup_resources() {
+            tracing::error!(
+                error = %error,
+                "sandbox resource reconciliation failed; keeping manager unavailable and deferring Deleting workspace cleanup"
+            );
+            return;
         }
+        self.reconcile_deleting();
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Atomically claim an ID for the principal, creating its workspace only
@@ -1259,6 +1270,119 @@ mod tests {
         manager.reconcile_startup();
         assert_eq!(launcher.startup_reconciliation_count(), 1);
         assert!(manager.claim(&owner, &id).expect("claim").created());
+    }
+
+    /// Audit B1: startup resource reconciliation (stale process domains)
+    /// must run and succeed before any durable `Deleting` workspace is
+    /// removed — the launcher observes the workspace still present while it
+    /// reconciles, and a failed reconciliation leaves the tree untouched.
+    #[test]
+    fn startup_reconciles_processes_before_removing_deleting_workspaces() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+
+        let setup = FakeLauncher::default();
+        let manager = SandboxManager::open_unreconciled_with_launcher(
+            &paths,
+            Caps::default(),
+            Arc::new(setup.clone()),
+        )
+        .expect("manager");
+        manager.reconcile_startup();
+        let handle = manager.claim(&owner, &id).expect("claim");
+        manager
+            .storage
+            .write_metadata(
+                &Metadata::active(id.clone(), owner.fingerprint.clone())
+                    .with_state(State::Deleting),
+            )
+            .expect("mark deleting");
+        drop(manager);
+
+        // The launcher's reconciliation must observe the Deleting workspace
+        // still on disk at the moment stale process domains are reclaimed.
+        let workspace_at_reconcile = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let observed = {
+            let workspace_at_reconcile = Arc::clone(&workspace_at_reconcile);
+            let workspace = handle.workspace().to_path_buf();
+            Arc::new(move || {
+                *workspace_at_reconcile.lock().expect("observer") = Some(workspace.exists());
+            })
+        };
+        let launcher = FakeLauncher::default();
+        launcher.set_startup_observer(observed);
+        let restarted = SandboxManager::open_unreconciled_with_launcher(
+            &paths,
+            Caps::default(),
+            Arc::new(launcher),
+        )
+        .expect("restart");
+        restarted.reconcile_startup();
+
+        assert_eq!(
+            workspace_at_reconcile.lock().expect("observer").clone(),
+            Some(true),
+            "the Deleting workspace must still exist during process-domain reconciliation"
+        );
+        assert!(
+            !handle.workspace().exists(),
+            "successful reconciliation must then remove the Deleting workspace"
+        );
+    }
+
+    /// Audit B1: a failed resource reconciliation keeps the manager
+    /// unavailable and preserves the `Deleting` workspace for a later retry.
+    #[test]
+    fn failed_startup_reconciliation_defers_deleting_workspace_removal() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+
+        let setup = FakeLauncher::default();
+        let manager = SandboxManager::open_unreconciled_with_launcher(
+            &paths,
+            Caps::default(),
+            Arc::new(setup.clone()),
+        )
+        .expect("manager");
+        manager.reconcile_startup();
+        let handle = manager.claim(&owner, &id).expect("claim");
+        manager
+            .storage
+            .write_metadata(
+                &Metadata::active(id.clone(), owner.fingerprint.clone())
+                    .with_state(State::Deleting),
+            )
+            .expect("mark deleting");
+        drop(manager);
+
+        let launcher = FakeLauncher::default();
+        launcher.fail_startup_next();
+        let restarted = SandboxManager::open_unreconciled_with_launcher(
+            &paths,
+            Caps::default(),
+            Arc::new(launcher),
+        )
+        .expect("restart");
+        restarted.reconcile_startup();
+
+        assert!(
+            handle.workspace().exists(),
+            "a failed reconciliation must not delete the Deleting workspace"
+        );
+        assert!(matches!(
+            restarted.claim(&owner, &id),
+            Err(Error::Unavailable)
+        ));
+        // A successful retry completes the deferred deletion.
+        restarted.reconcile_startup();
+        assert!(!handle.workspace().exists());
+        assert!(restarted.claim(&owner, &id).expect("reclaim").created());
     }
 
     fn paths_for(root: &TempDir) -> Paths {

@@ -255,6 +255,11 @@ impl SandboxLaunchPolicy {
         self.network
     }
 
+    /// The operator-specified resource limits for this policy snapshot.
+    pub(crate) fn resources(&self) -> &crate::config::SandboxResources {
+        &self.resources
+    }
+
     /// The operator-specified cgroup v2 creation parent, if any.
     #[cfg(target_os = "linux")]
     pub(crate) fn cgroup_parent(&self) -> Option<&Path> {
@@ -367,8 +372,8 @@ impl SandboxLaunchPolicy {
     }
 
     /// Map the operator resource limits onto cgroup-backed engine limits.
-    fn engine_resources(&self) -> ResourceLimits {
-        let resources = &self.resources;
+    pub(crate) fn engine_resources(&self) -> ResourceLimits {
+        let resources = self.resources();
         ResourceLimits {
             memory_bytes: option_limit(resources.memory_bytes),
             swap_bytes: option_limit(resources.swap_bytes),
@@ -620,28 +625,10 @@ pub(crate) struct LaunchTemp {
     path: PathBuf,
 }
 
-// The Linux and macOS launchers (Milestones 3-4) consume the temp handles;
-// until then only tests construct them.
-#[cfg_attr(not(test), allow(dead_code))]
 impl LaunchTemp {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Best-effort recursive removal that tolerates an already-removed path
-    /// but reports a still-owned tree that could not be deleted. The root is
-    /// inspected without following symlinks before deletion, so a replaced
-    /// launch-temp path cannot redirect cleanup into another tree.
-    pub(crate) fn remove(self) -> Result<(), LaunchError> {
-        let path = self.path.clone();
-        let result = remove_launch_temp_tree(&path);
-        // Avoid running Drop a second time after the explicit removal attempt.
-        std::mem::forget(self);
-        result.map_err(|error| {
-            LaunchError::new(format!(
-                "sandbox launch temp directory could not be removed: {error}"
-            ))
-        })
     }
 }
 
@@ -992,12 +979,12 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         assert!(first.path().starts_with(root.path()));
 
-        // Removing one temp recursively removes child-created contents and
+        // Dropping one temp recursively removes child-created contents and
         // does not affect the sibling.
         let first_path = first.path().to_path_buf();
         fs::create_dir(first.path().join("nested")).expect("nested launch temp");
         fs::write(first.path().join("nested/file"), b"residue").expect("launch temp residue");
-        first.remove().expect("remove first");
+        drop(first);
         assert!(!first_path.exists());
         assert!(second.path().exists());
     }

@@ -100,6 +100,11 @@ domain は cgroup membership を権威として kill、empty wait、remove す�
 ある cgroup、runtime file、workspace は変更しない。cleanup の一部が失敗した場合は
 manager を ready にせず、次回 startup または明示的な retry に ownership を残す。
 
+この resource reconciliation は durable な `Deleting` workspace の削除よりも
+**前に**完了しなければならない（§1 の process ownership contract: process を必ず
+workspace より先に終了させる）。reconciliation が失敗した場合、manager は ready に
+ならず、`Deleting` 状態の workspace も削除しない。
+
 ### 2.7 通常終了後の runtime 資源
 
 - runtime temp（`TMPDIR`）は launch ごとではなく sandbox runtime domain ごとに

@@ -180,7 +180,7 @@ generic hosted Linux gateはLinux implementationのnative proofだが、特定pr
 - Rust build artifact generated from locked dependencies
 - unprivileged dedicated service account
 - kernelがLandlock ABI 4+（6.7+）を提供すること（filesystem/network policy 用）
-- resource limits を設定する場合: 書き込み可能な cgroup v2 階層（delegation）
+- 書き込み可能な cgroup v2 階層（delegation）。limit の有無にかかわらず、すべての Linux sandbox launch が専用 process domain cgroup を必要とするため必須
 - safe XDG config/data/state directories
 - OpenSSH-facing listener bind capability
 

@@ -1,0 +1,5 @@
+# The Linux platform gate builds with this exact toolchain; it matches the
+# rust-version (MSRV) pinned in both crate manifests and the version asserted
+# by scripts/verify-linux-platform.
+[toolchain]
+channel = "1.95"
