@@ -189,14 +189,10 @@ concurrent sessionsでterminal device、foreground process group、window size�
 
 normal process completionではengine-owned direct childをexactly once reapする。PID namespace無しではreap前に残るowned process groupをcleanupする。PID namespace有りでは内部PID1 supervisorがlogical user PID2をreapし、そのstatusをparentへ返した後にnamespace内の残processを停止して終了する。
 
-abnormal teardown:
-
-- channel close
-- connection disconnect
-- sandbox delete
-- daemon shutdown
-
-ではgraceful signal後にtimeoutでforce killへescalateする。
+abnormal teardownでは、published sandbox launchのchannel close/connection
+disconnectはtransport endpointだけをdetachする。process terminationを行うのは
+publication前の失敗、sandbox delete、daemon shutdownであり、graceful signal後に
+timeoutでforce killへescalateする。
 
 connection handler drop時はchannel registry senderをclearし、bridge taskがdisconnectを確実に観測する。bridgeがconnection stateの`Arc`を保持しているだけでprocessが残り続けないようにする。
 
@@ -297,7 +293,7 @@ releaseには少なくとも:
 - disabled network external TCP/UDP denial / outbound success
 - non-PTY streams/status
 - full PTY session/job-control suite
-- disconnect/delete/shutdown cleanup
+- disconnect transport detach / delete and shutdown cleanup
 - no PTY slave/fd leak
 - concurrent PTY isolation
 - migration guard for retired helper/control paths

@@ -111,7 +111,7 @@ release-blocking項目:
 - resize/window-change
 - PTY stream semantics
 - concurrent PTY isolation
-- disconnect cleanup
+- disconnect transport detach / detached descendant survival
 - daemon fd/slave-fd leak absence
 - shutdown cleanup
 
@@ -180,7 +180,7 @@ runtime proof:
 10. 4 concurrent PTY sessions
 11. daemon fd count recovery
 12. PTY/session non-reuse isolation
-13. SSH disconnect cleanup
+13. SSH disconnect transport detach / detached descendant survival
 14. graceful shbox shutdown cleanup
 15. Linux daemon SIGKILL時のengine-owned direct child parent-death behavior（clone ownerがprocess-lifetime threadであることを含む）
 16. deliberately detached new-session descendantの挙動記録

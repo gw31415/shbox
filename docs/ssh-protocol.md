@@ -198,7 +198,7 @@ EOF後のclient dataはprocessへ渡さない。stdout/stderrとexit statusは�
 
 client EOFでshboxがterminal inputへsynthetic VEOF byte（例: `0x04`）を注入することはない。write duplicateを閉じるだけであり、terminal-specific EOF generationを偽装しない。
 
-channel close/transport disconnectはEOFとは別で、managed process teardownを開始する。
+channel close/transport disconnectはEOFとは別で、sandbox launchではtransport endpointだけをdetachする。process terminationは開始しない（sandbox delete/daemon shutdownおよびpublication前失敗を除く）。
 
 ## 13. Signal request
 
@@ -269,14 +269,13 @@ started channelがcloseされた場合はbridgeへ`Close` eventを送る。mailb
 
 connection自体が終了した場合はconnection handler drop時に全registry senderをdropする。
 
-sandbox bridgeはaborted pathで:
+sandbox bridgeはpublished launchのaborted pathで:
 
 1. output pumps停止
-2. process `terminate()`
-3. cleanup grace wait
-4.必要なら `force_terminate()`
-5. cleanup completion待機
-6. channel close
+2. stdin/stdout/stderrのchannel-owned endpointとPTY masterをdetach
+3. processをcgroup内に残したままchannel close
+
+publication前の失敗、sandbox delete、daemon shutdownは別のterminate/reap/cleanup pathを使う。
 
 を行う。
 

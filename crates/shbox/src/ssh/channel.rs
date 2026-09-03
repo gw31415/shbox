@@ -664,11 +664,18 @@ pub(crate) async fn run_sandbox_process(
     };
 
     if result != ChannelResult::Completed {
-        let control = Arc::clone(&process.control);
+        // Post-publication transport loss: close only the endpoints this
+        // channel owns — pumps, stdin/stdout/stderr parent ends, and the
+        // daemon-side PTY master. The sandbox process is NOT terminated:
+        // it stays owned by the sandbox cgroup (docs/lifecycle.md §2.2).
+        // A PTY launch follows kernel hangup semantics from the master
+        // close; `nohup`/`setsid()` processes survive on purpose.
         for pump in pumps {
             pump.abort();
+            let _ = pump.await;
         }
-        wait_for_process_cleanup(control).await;
+        process.stdin = None;
+        process.control.detach_transport();
         let _ = sink.close(id).await;
         return result;
     }
@@ -1116,8 +1123,6 @@ mod tests {
     /// `docs/lifecycle.md` §2.2: once a launch is published, losing the
     /// client transport (channel close, TCP disconnect, registry teardown)
     /// must detach the bridge without terminating the sandbox process.
-    /// Expected to fail until the bridge stops treating transport loss as an
-    /// abnormal process teardown.
     #[tokio::test]
     async fn transport_loss_after_publication_does_not_terminate_the_process() {
         let launcher = FakeLauncher::default();
@@ -1140,6 +1145,10 @@ mod tests {
             .expect("bridge returns after transport loss")
             .expect("bridge join");
         assert_eq!(result, ChannelResult::Aborted);
+        assert!(
+            fake.detached(),
+            "transport loss must close the published process transport"
+        );
         assert!(
             !fake.terminated(),
             "transport loss must not terminate a published sandbox process"
@@ -1235,7 +1244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sink_failure_terminates_only_the_bridge_process() {
+    async fn sink_failure_detaches_without_terminating_the_bridge_process() {
         let launcher = FakeLauncher::default();
         let launched = launcher.launch(request(None)).expect("fake launch");
         let fake = launcher.last_process().expect("fake process");
@@ -1249,7 +1258,8 @@ mod tests {
         });
         fake.send_stdout(b"blocked").await.expect("stdout");
         assert_eq!(bridge.await.expect("bridge join"), ChannelResult::Aborted);
-        assert!(fake.terminated());
+        assert!(fake.detached());
+        assert!(!fake.terminated());
         assert_eq!(sink.events().last(), Some(&SinkEvent::Close));
     }
 

@@ -102,6 +102,13 @@ pub(crate) trait RunningProcess: fmt::Debug + Send + Sync {
     fn resize(&self, _rows: u32, _cols: u32) -> bool {
         true
     }
+
+    /// Close the transport-owned endpoints of this launch after the SSH
+    /// transport disappeared: the daemon-side PTY master (letting the
+    /// kernel's terminal hangup semantics apply) or the parent pipe ends.
+    /// Detaching never signals the process — surviving detached processes
+    /// stay owned by the sandbox cgroup (docs/lifecycle.md §2.2).
+    fn detach_transport(&self) {}
 }
 
 /// Normalized process exit used by the channel bridge.  The manager does not
@@ -347,6 +354,7 @@ impl ProcessLauncher for FakeLauncher {
 #[cfg(test)]
 pub(crate) struct FakeProcess {
     terminated: std::sync::atomic::AtomicBool,
+    detached: std::sync::atomic::AtomicBool,
     cleanup_complete: std::sync::atomic::AtomicBool,
     signals: std::sync::Mutex<Vec<i32>>,
     resizes: std::sync::Mutex<Vec<(u32, u32)>>,
@@ -432,6 +440,7 @@ impl FakeProcess {
     ) -> FakeProcess {
         FakeProcess {
             terminated: std::sync::atomic::AtomicBool::new(false),
+            detached: std::sync::atomic::AtomicBool::new(false),
             cleanup_complete: std::sync::atomic::AtomicBool::new(false),
             signals: std::sync::Mutex::new(Vec::new()),
             resizes: std::sync::Mutex::new(Vec::new()),
@@ -447,6 +456,10 @@ impl FakeProcess {
 
     pub(crate) fn terminated(&self) -> bool {
         self.terminated.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn detached(&self) -> bool {
+        self.detached.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn mark_clean_for_test(&self) {
@@ -559,6 +572,11 @@ impl RunningProcess for FakeProcess {
             .expect("fake resizes")
             .push((rows, cols));
         true
+    }
+
+    fn detach_transport(&self) {
+        self.detached
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 

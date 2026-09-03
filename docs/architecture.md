@@ -198,7 +198,7 @@ interactive shell の job control、Ctrl-C、Ctrl-Z、`jobs`/`fg`/`bg` は OS �
 
 normal completion では engine-owned direct child を必ず一度 reap する。PID namespace 無しでは reap 前に残る owned process group を force-cleanup する。PID namespace 有りでは内部 PID1 が user PID2 の status を返し、残descendantを停止/reapしてから終了する。最後に private temp を削除する。
 
-channel close/client disconnect/delete/daemon shutdown では managed process groupへ graceful termination を送り、grace period 後に kill へ escalate する。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task が disconnect を観測できるようにする。
+published sandbox launchではchannel close/client disconnectはtransport endpointだけをdetachし、processをterminateしない。publication前の失敗、sandbox delete、daemon shutdownではmanaged processをgraceful terminationからforce-killへ進める。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task がdisconnectを観測できるようにする。
 
 Linux の engine-owned direct sandbox child には parent-death signal を設定し、その clone は process-lifetime spawn-owner thread が担当する。ただし daemon の abrupt death 時に orphan process や durable resource domain を cleanup する保証とは扱わない。
 

@@ -138,7 +138,7 @@ engine 単体で all-network denial を検証する場合は、必要な user na
 - PID namespace無しではdirect childをreapする前にinitial owned process groupの残processを停止すること
 - PID namespace有りではinternal PID1 supervisorの下でuser commandがPID2として動き、signal/status forwardingとnamespace descendant teardownが成立すること
 - signal requestがowned foreground/process groupへ届くこと
-- disconnect/delete/daemon shutdownでmanaged groupを停止すること
+- disconnectではtransportだけをdetachし、delete/daemon shutdownでmanaged groupを停止すること
 - Linux cloneはprocess-lifetime spawn-owner threadが担当し、engine-owned direct childはdaemon death時のparent-death signalを持つこと
 
 Landlock confinement inheritanceとprocess cleanupは別の保証である。意図的に新sessionへdetachしたdescendantを、process-group cleanupが完全なprocess tree containmentとして回収するとは主張しない。
@@ -212,7 +212,8 @@ pipeをPTYの代用にしてはならない。
 
 ### 7.5 Disconnect / cleanup / FD lifecycle
 
-- client disconnect後にmanaged shellが終了/reapされること
+- client disconnect後にPTY transportがdetachされ、`setsid()` descendantが生存できること
+- sandbox delete後にdetach済みdescendantもcgroup経由で終了/reapされること
 - repeated PTY open/close後にdaemon fd countがbaseline付近へ戻ること
 - daemonがPTY slave fdを保持しないこと
 - session Aへのsignalがsession Bへ漏れないこと
@@ -275,7 +276,7 @@ GitHub native gateがgreenでも、Fly production tupleのacceptanceを代用し
 - 20 sequential PTY sessions
 - 4 concurrent PTY sessions
 - fd baseline回復
-- disconnect cleanup
+- disconnect transport detach / detached descendant survival
 - graceful daemon shutdown
 - Linux daemon SIGKILL時のdirect-child parent-death behavior
 - deliberately detached descendantの明示的な制約確認

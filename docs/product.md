@@ -153,13 +153,13 @@ real OpenSSH acceptanceでは`isatty(0/1/2)`、`getsid`/`tcgetsid`、`getpgrp`/`
 
 PTY modeではstdout/stderrはterminal streamにmergeする。non-PTYでは分離する。
 
-client EOFはnon-PTY stdinを閉じる。PTY EOFのためにshboxが勝手に`0x04`をinjectすることはない。channel close/disconnectはmanaged process cleanupを開始する。
+client EOFはnon-PTY stdinを閉じる。PTY EOFのためにshboxが勝手に`0x04`をinjectすることはない。published sandbox launchのchannel close/disconnectはtransport endpointだけをdetachし、process terminationを開始しない。
 
 ## 9. Process cleanup
 
 normal exitではengine-owned direct childをreapする。Linux PID namespace無しではowned process groupの残留processをreap前にcleanupし、PID namespace有りでは内部PID1 supervisorがlogical user PID2とnamespace descendantをcleanupする。
 
-channel close、client disconnect、sandbox delete、daemon shutdownではgraceful termination後にforce-killへescalateする。
+publication前の失敗、sandbox delete、daemon shutdownではgraceful termination後にforce-killへescalateする。published sandbox launchのchannel close/client disconnectはtransportだけをdetachする。
 
 Linux の engine-owned direct sandbox child には parent-death behavior が設定され、clone は process-lifetime spawn-owner thread が担当する。PID namespace 有りでは direct child は内部 PID1 supervisor となる。ただし PID namespace を使わない通常の process-group cleanup は cgroup tree containmentではない。descendantがdeliberateに`setsid()`してdetachした場合、元process groupのlifecycle ownershipから外れ得る。filesystem/network confinementの継承とprocess-tree cleanupの強度を同一視しない。
 

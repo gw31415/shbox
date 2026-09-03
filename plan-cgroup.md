@@ -1,791 +1,142 @@
-# shbox: Sandbox-scoped cgroup lifecycle / tssh compatibility plan
+# shbox: sandbox-scoped cgroup lifecycle / tssh compatibility plan
 
-## Goal
+## Goal and observable value
 
-Linux sandbox の process lifetime を SSH channel / process group から分離し、sandbox-scoped cgroup を authoritative な process ownership boundary とする。
+Linux sandbox の process lifetime を SSH channel / process group から分離し、sandbox-scoped cgroup を authoritative な process ownership boundary とする。最終的に、SSH disconnect は transport だけを閉じ、sandbox delete と daemon shutdown は `setsid()`・double-fork・daemonized descendant・tsshd を含む全 process を回収する。runtime temporary resources は sandbox runtime の寿命に従い、workspace は保持する。
 
-最終 invariant:
+## Current state
 
-- SSH channel owns transport.
-- Process group owns terminal job control.
-- cgroup owns all Linux processes belonging to a sandbox runtime.
-- Durable sandbox owns workspace and metadata.
-- SSH disconnect must not implicitly kill sandbox processes.
-- Sandbox deletion and daemon shutdown must be able to kill every sandbox process reliably, including `setsid()`, double-fork, daemonized descendants.
-- tssh/tsshd must work without shbox-specific tssh integration: bootstrap SSH may close while tsshd continues over UDP.
+- M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
+- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam として実装済み。M7 の Linux/macOS PTY master 実装と実 SSH acceptance が次のコミット対象である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
+- `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
+- `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
 
-Current code already has a sandbox-ID keyed shared `ResourceDomain`, but it is created only when cgroup-backed resource limits are configured.   
-Current child/session cleanup still kills process groups both in `shbox` and `shbox-sandbox`, so lifecycle changes must span both layers.  
+## M7 — Define PTY detach semantics
 
----
-
-# Milestone 0 — Freeze lifecycle semantics and tests
-
-## Objective
-
-Before changing implementation, encode the intended behavior as tests and documentation.
-
-## Tasks
-
-- Document lifecycle ownership:
-  - SSH channel: I/O transport only.
-  - PTY/process group: foreground job control and signal routing.
-  - sandbox cgroup: process containment.
-  - workspace/metadata: durable sandbox state.
-- Explicitly document:
-  - channel close does not mean sandbox process termination.
-  - direct child exit does not mean descendant termination.
-  - sandbox delete does terminate every sandbox process.
-  - daemon graceful shutdown terminates every sandbox process.
-  - daemon crash/restart survival is initially not guaranteed.
-- Add failing tests covering:
-  - detached descendant survives direct parent exit.
-  - `setsid()` descendant survives.
-  - channel disconnect does not trigger process termination.
-  - explicit sandbox delete still removes all processes.
-- Keep existing process-group signal/PTY tests intact.
-
-## Acceptance criteria
-
-- New lifecycle contract is documented.
-- Tests fail for the expected current behavior.
-- No production behavior changed yet.
-
----
-
-# Milestone 1 — Generalize `ResourceDomain` into a sandbox process domain
-
-## Objective
-
-Make cgroup creation independent of resource-limit configuration.
-
-Current `ResourceDomain` requires at least one explicit cgroup-backed limit and is described primarily as an aggregate resource-limit domain. 
-
-## Tasks
-
-- Rename or generalize:
-  - `ResourceDomain` → preferably `ProcessDomain` or `CgroupDomain`.
-- Permit creation with all resource limits set to `Inherit`.
-- Keep optional resource limits applied to the same cgroup when configured.
-- Ensure every Linux sandbox process domain is created before the first child.
-- Continue using `clone3(CLONE_INTO_CGROUP)` so there is no fork/move race.
-- Change cgroup creation helpers so an empty set of required controllers is valid.
-- Preserve current explicit `cgroup_parent` handling.
-
-## API target
-
-Conceptually:
-
-```rust
-let domain = sandbox.create_process_domain(resources, cgroup_parent)?;
-
-sandbox.spawn_in_process_domain(command, config, &domain)?;
-```
-
-rather than:
-
-```rust
-if resources.requires_cgroup() {
-    create_resource_domain(...)
-}
-```
-
-## Acceptance criteria
-
-- A sandbox with no CPU/memory/PID limit can still have a dedicated cgroup.
-- Children are born directly inside that cgroup.
-- Existing aggregate resource-limit tests still pass.
-- Different sandbox IDs never share a process domain.
-
----
-
-# Milestone 2 — Separate cgroup observation, kill, and removal
-
-## Objective
-
-Make cgroup membership authoritative instead of Rust handle/reference counts.
-
-Current `ResourceDomain::is_in_use()` is based on `Arc::strong_count`, which cannot detect detached descendants once the direct `SandboxChild` handle disappears. 
-
-Current `Cgroup::remove()` also kills processes implicitly before removal. 
-
-## Tasks
-
-Add explicit cgroup lifecycle operations:
-
-```rust
-fn is_populated(&self) -> Result<bool, ...>;
-fn wait_until_empty(&self, ...);
-fn kill_all(&self) -> Result<(), ...>;
-fn remove_empty(&mut self) -> Result<(), ...>;
-```
+Goal: SSH transport が消えた後に daemon が PTY master を人工的に保持し続けないようにし、kernel の通常の hangup semantics を使う。
 
 Implementation:
 
-- Read `cgroup.events`.
-- Use `populated 0/1` as authoritative membership state.
-- Prefer pollable notification on `cgroup.events` rather than busy polling where practical.
-- `remove_empty()` must fail if the cgroup is populated.
-- `kill_all()` owns `cgroup.kill`.
-- Removal must never implicitly kill processes.
+- `crates/shbox/src/platform/{mod,linux,macos}.rs` の process-control abstraction に明示的な `detach_transport` operation を実装する。
+- PTY launch では channel-owned PTY master を閉じ、resize と SSH-originated signal の受付を止める。process へ terminate signal は送らない。
+- non-PTY launch では channel-owned pipe ends を閉じるだけにし、pipe close を process signal とみなさない。
+- `crates/shbox/tests/ssh_auth.rs` に、公開済み PTY から `setsid()` した descendant が SSH client 終了後に残り、sandbox delete で cgroup 経由で消える実 SSH acceptance を置く。
 
-Remove lifecycle decisions based on:
+Proof:
 
-```rust
-Arc::strong_count(...)
-```
+- channel unit tests が transport loss / sink failure で detach は行い terminate は行わないことを確認する。
+- native SSH PTY acceptance が pass し、PTY master の leak がない。
 
-Reference counts may remain an internal Rust ownership invariant, but not a process-liveness signal.
+## M8 — Move transient runtime resources to sandbox-runtime scope
 
-## Acceptance criteria
+Goal: Linux の `TMPDIR` を per-launch から runtime-domain generation 所有へ移し、direct child 終了後も detached descendant が使えるようにする。
 
-- Double-fork/`setsid()` descendant keeps the domain populated even after direct child handle disappears.
-- Empty-domain removal never kills a process.
-- Explicit kill reliably transitions domain toward `populated=0`.
+Implementation:
 
----
+- `crates/shbox/src/platform/linux.rs` の `LinuxLauncher` / domain slot に、active generation 固有の runtime temp owner または同等の明示的 cleanup state を追加する。
+- `crates/shbox/src/platform/policy.rs` と `crates/shbox/src/paths.rs` の runtime tree を使い、`sandbox-<opaque-id>-<generation>/tmp` を mode `0700` で作る。user の sandbox ID をそのまま control-group/path 名にしない。
+- Linux launch は同一 generation の全 launch に同じ runtime temp を渡し、direct-child waiter の終了時には削除しない。
+- cgroup が `populated=0` かつ `in_flight=0` になり generation が idle になった時だけ temp を削除し、次の launch では新しい generation を作る。workspace は削除しない。
+- child-created entries、canonical path、作成失敗、delete/shutdown cleanup の retry/error policy を明示する。
 
-# Milestone 3 — Stop killing descendants on normal direct-child exit
+Proof:
 
-## Objective
+- detached descendant が `TMPDIR` の下に作った file を direct child 終了後も読めることを integration test で確認する。
+- domain が空になった後に runtime temp が消え、workspace が残ることを確認する。
+- `cargo fmt --package shbox`（自動修正）後に `cargo fmt --package shbox -- --check`、`cargo check --workspace --all-targets`、対象テスト、workspace clippy を実行する。
 
-Change normal process completion semantics before touching SSH disconnect handling.
+## M9 — Make sandbox delete cgroup-authoritative
 
-There are currently two independent process-group cleanup paths that must be removed.
+Goal: explicit deletion を hard process-lifecycle boundary にし、runtime lease の一覧に依存せず cgroup 全体を回収する。
 
-### `shbox-sandbox`
+Implementation:
 
-`LinuxChild::wait()` / `try_wait()` currently kill the owned process group once the direct child exits. 
+1. durable metadata を `Deleting` にして新規 launch を拒否する。
+2. publication 前 launch を cancel/wait し、`in_flight == 0` の barrier を待つ。
+3. `ProcessDomain::kill_all()`、`wait_until_empty()`、`remove_empty()` をこの順で実行する。
+4. runtime temp を除去してから workspace / durable metadata を消す。失敗時は安全側の state と cleanup retry が可能な error を返す。
 
-### `shbox`
+Proof:
 
-`wait_process()` reaps the direct child, then unconditionally kills the process group. 
+- foreground、background、`setsid()`、double-fork daemon、複数 concurrent launch、active tsshd を delete で回収する integration test を追加する。
+- delete と launch の race で process escape がないことを確認する。
 
-## Tasks
+## M10 — Move process-count enforcement to cgroup
 
-- Change normal `SandboxChild::wait()`:
-  - wait/reap the direct child only.
-  - do not kill its process group.
-- Same for `try_wait()`.
-- Remove post-wait `kill_process_group()` from `LinuxLauncher::wait_process()`.
-- Preserve defensive cleanup for abandoned/unpublished children:
-  - failed launch publication.
-  - setup failure.
-  - dropped child handle before normal ownership transfer.
-- Audit `SandboxChild::Drop` separately:
-  - normal completed child must not affect surviving descendants.
-  - abandoned active child may still receive defensive termination.
+Goal: manager の launch 数制限と kernel process 数制限を区別し、fork/descendant を含む aggregate PID budget を cgroup `pids.max` に任せる。
 
-## Acceptance criteria
+Implementation:
 
-This must work:
+- `crates/shbox/src/config.rs`、`crates/shbox/src/sandbox/manager.rs`、`docs/configuration.md` の `max_sandbox_processes` を launch admission/concurrency の名前と説明に改める（互換性が必要なら serde alias を維持）。
+- Linux の `ResourceLimits::pids` / `pids.max` が同じ sandbox domain の全 child・fork・detached descendant を数えることを確認し、manager count を kernel process limit の代替にしない。
+- macOS の `RLIMIT_NPROC` との意味の違いを docs に残す。
 
-```sh
-sh -c 'setsid sleep 30 >/dev/null 2>&1 &'
-```
+Proof:
 
-After the shell exits:
+- 一つの launch 内の fork が `pids.max` を消費し、manager の lease 数を増やさずに bypass できない test を追加する。
+- detached descendant と同時 launch が同一 PID budget を共有する test を追加する。
 
-- direct child has been reaped.
-- detached `sleep` remains alive.
-- sandbox cgroup remains populated.
-- no zombie direct child exists.
+## M11 — Daemon shutdown and stale-domain reconciliation
 
----
+Goal: SSH channel inventory に依存せず、graceful shutdown と再起動時 stale cgroup cleanup を実行する。
 
-# Milestone 4 — Make sandbox cgroup mandatory in `LinuxLauncher`
+Implementation:
 
-## Objective
+- `crates/shbox/src/server.rs` / `main.rs` / `sandbox/manager.rs` の shutdown flow を、accept 停止 → launch admission freeze → publication 前 launch barrier → 各 process domain の `kill_all` → empty wait → domain/temp remove → exit の順にする。
+- configured delegated parent 配下に shbox 所有を識別できる opaque runtime cgroup 名を使う。未 sanitised sandbox ID や sibling cgroup を信頼しない。
+- startup reconciliation で shbox-owned stale cgroup を enumerate、kill、empty wait、remove し、対応する stale runtime temp も remove する。無関係な cgroup は変更しない。
+- crash/restart survival は保証しないという既存方針を保ち、stale cleanup の ownership boundary をテストする。
 
-Every Linux sandbox launch for the same durable sandbox ID joins the same process domain.
+Proof:
 
-Current `LinuxLauncher` already maintains:
+- graceful shutdown 後に sandbox process、runtime cgroup、runtime temp が残らない test を確認する。
+- simulated crash/restart の stale-owned cleanup と unrelated sibling preservation を integration/unit test で確認する。
 
-```rust
-HashMap<SandboxId, Arc<ResourceDomain>>
-```
+## M12 — tssh/tsshd compatibility acceptance
 
-but only creates entries when resource limits require cgroups. 
+Goal: tssh-specific lifecycle code を追加せず、bootstrap SSH close 後も tsshd が cgroup-owned のまま UDP session を提供することを実証する。
 
-## Tasks
+Implementation and proof:
 
-- Replace optional resource-domain lookup with mandatory process-domain lookup.
-- Lazy-create the process domain on first process launch.
-- Key domain ownership by `SandboxId`.
-- All subsequent launches for that sandbox use the same domain.
-- Do not delete the cgroup merely because one direct launch exits.
-- Keep sandbox process-domain state distinct from individual `RuntimeLease`s.
+- repository / environment に存在する tssh の実行方法を確認し、可能なら QUIC、KCP（対応時）、connection loss/reconnect、active session 中の delete、daemon shutdown を acceptance test する。
+- tsshd が自然終了した場合の domain drain を確認する。
+- `SSH_CONNECTION` / `SSH_CLIENT` は一般的な SSH compatibility の必要性が証明された場合のみ追加する。
+- tssh が利用できない場合は、利用不能の正確な理由・実行した代替 acceptance・残る外部依存を plan に記録し、他の milestone を先に完了する。
 
-Desired structure:
+## M13 — Cleanup legacy process-group ownership assumptions
 
-```text
-SandboxId
-└── ProcessDomain
-    ├── launch A
-    │   └── descendants
-    ├── launch B
-    │   └── descendants
-    └── detached background processes
-```
+Goal: cgroup lifecycle が authoritative になった後、obsolete な process-group ownership 説明と cleanup helper を整理する。
 
-## Acceptance criteria
+Implementation:
 
-- Two concurrent SSH sessions to one sandbox share one cgroup.
-- Two different sandbox IDs use separate cgroups.
-- Aggregate `memory.max`, `cpu.max`, `pids.max` still cover all processes belonging to the sandbox.
+- `kill_process_group`、`SIGTERM`、`SIGKILL`、`wait_for_process_cleanup`、`PROCESS_GROUP_SETTLE`、Arc count lifecycle 判定を検索し、delete・shutdown・failed/unpublished launch・terminal/job-control に限定する。不要な helper と legacy test を削除する。
+- channel disconnect が process termination を意味する古い docs/tests/comments を更新する。process group は foreground lookup、signal forwarding、job control、未公開 launch の防御 cleanup にだけ残す。
+- `docs/architecture.md`、`docs/product.md`、`docs/security.md`、`docs/testing.md`、`docs/release.md`、`docs/ssh-protocol.md` の lifecycle contract を最終実装へ揃える。
 
----
+Proof:
 
-# Milestone 5 — Introduce sandbox runtime-domain state machine
+- `rg` の各残存箇所を分類し、意図しない disconnect teardown がないことを確認する。
+- fmt、check、clippy、workspace tests、必要な native sandbox acceptance を実行し、warning/環境依存を記録する。
 
-## Objective
-
-Prevent races between empty-domain cleanup, launch, and deletion.
-
-The critical race is:
-
-```text
-domain becomes empty
-cleanup starts
-    ↕
-new launch starts
-```
-
-## Tasks
-
-Introduce manager-side process-domain state, e.g.:
-
-```rust
-enum DomainState {
-    Idle,
-    Creating,
-    Active,
-    Deleting,
-}
-```
-
-Track at minimum:
-
-- sandbox ID.
-- domain generation.
-- in-flight launch count.
-- active process-domain handle.
-- deletion state.
-
-Lifecycle:
-
-```text
-Idle
-  ↓ first launch
-Creating
-  ↓ domain ready
-Active
-  ↓ populated=0 && launch_inflight=0
-Idle
-```
-
-Delete:
-
-```text
-Active/Idle
-  ↓ durable metadata → Deleting
-Deleting
-  ↓ reject new launches
-  ↓ wait in-flight launch barrier
-  ↓ kill/remove process domain
-  ↓ delete workspace/metadata
-```
-
-Empty cleanup may only remove a domain when:
-
-```text
-cgroup populated == 0
-AND launch_inflight == 0
-AND domain generation unchanged
-AND sandbox state == Active
-```
-
-## Acceptance criteria
-
-Stress tests must show no process escape under:
-
-- launch vs empty cleanup.
-- launch vs delete.
-- repeated empty → launch → empty cycles.
-- concurrent multiple SSH sessions.
-
----
-
-# Milestone 6 — Decouple SSH channel teardown from sandbox process teardown
-
-## Objective
-
-After process containment is reliable, stop killing processes because transport disappeared.
-
-Current sandbox bridge treats channel close/connection loss as abnormal teardown and invokes process termination cleanup.   
-`wait_for_process_cleanup()` currently performs TERM → wait → KILL. 
-
-## Tasks
-
-Split failure cases into two categories.
-
-### Pre-publication failure
-
-Examples:
-
-- launch failed.
-- PTY setup failed.
-- resize synchronization failed.
-- SSH `CHANNEL_SUCCESS` could not be published.
-
-Behavior:
-
-```text
-terminate launch
-wait/reap
-cleanup
-```
-
-No client ever successfully acquired this launch.
-
-### Post-publication transport loss
-
-Examples:
-
-- SSH channel close.
-- SSH TCP disconnect.
-- connection registry dropped.
-- output sink fails.
-- client disappears after successful shell/exec acknowledgement.
-
-Behavior:
-
-```text
-close transport endpoints
-stop pumps
-detach PTY/channel ownership
-do NOT TERM/KILL sandbox processes
-```
-
-Remove use of `wait_for_process_cleanup()` from transport-detach paths.
-
-Keep explicit process termination for:
-
-- sandbox delete.
-- daemon shutdown.
-- pre-publication failure.
-
-## Acceptance criteria
-
-After successful launch:
-
-```text
-client disconnect
-→ SSH task exits
-→ target process survives
-→ cgroup remains populated
-```
-
----
-
-# Milestone 7 — Define PTY detach semantics
-
-## Objective
-
-Avoid keeping a pseudo-terminal artificially alive after its SSH transport disappears.
-
-Current Linux process control holds the PTY master through `lifecycle_fd`. 
-
-## Tasks
-
-Add an explicit transport-detach operation to the sandbox process control abstraction.
-
-Conceptually:
-
-```rust
-fn detach_transport(&self);
-```
-
-For a PTY-backed launch this should:
-
-- stop SSH input/output pumps.
-- close daemon-side PTY master ownership belonging to that channel.
-- stop accepting resize requests.
-- stop accepting SSH-originated signal requests.
-- allow normal kernel PTY hangup semantics to occur.
-
-For non-PTY execution:
-
-- close parent stdin/stdout/stderr pipe ends owned by the channel.
-- do not signal the process merely because pipes closed.
-
-Do not emulate persistence by keeping PTY master FDs around indefinitely.
-
-## Acceptance criteria
-
-- normal interactive shell usually terminates according to standard terminal hangup semantics.
-- `nohup`, daemonized, detached, `setsid()` processes may survive.
-- tsshd launched without requiring persistent PTY survives bootstrap SSH close.
-- no PTY FD leak after channel disconnect.
-
----
-
-# Milestone 8 — Move transient runtime resources to sandbox-runtime scope
-
-## Objective
-
-Ensure descendants do not lose runtime resources when the direct launch exits.
-
-Current TMPDIR is per-launch and is deleted when the direct-child waiter finishes.  
-
-That is incompatible with:
-
-```text
-shell exits
-└── daemon survives and still references TMPDIR
-```
-
-## Tasks
-
-Replace per-launch TMPDIR ownership with sandbox-runtime ownership on Linux.
-
-Suggested layout:
-
-```text
-sandbox durable tree
-└── workspace
-
-shbox runtime tree
-└── sandbox-<id>-<generation>
-    └── tmp
-```
-
-Properties:
-
-- unique to one active runtime-domain generation.
-- mode `0700`.
-- available to every launch in that runtime generation.
-- deleted only after:
-  - domain `populated=0`.
-  - no launch is in flight.
-- regenerated on next first launch.
-
-Do not tie runtime temp cleanup to direct-child exit.
-
-## Acceptance criteria
-
-- detached descendant retains a valid TMPDIR.
-- once the final process exits, runtime TMPDIR is removed.
-- workspace remains intact.
-
----
-
-# Milestone 9 — Make sandbox delete cgroup-authoritative
-
-## Objective
-
-Explicit deletion becomes the hard process-lifecycle boundary.
-
-Current deletion cancels manager runtime entries and then releases the resource domain. 
-
-Runtime entries are insufficient once descendants may outlive their direct launch.
-
-## Tasks
-
-Deletion flow:
-
-```text
-1. durable metadata → Deleting
-2. reject new launches
-3. cancel/wait any launch still in pre-publication state
-4. wait launch_inflight == 0
-5. process_domain.kill_all()
-6. wait until cgroup.events populated=0
-7. process_domain.remove_empty()
-8. remove runtime temp
-9. remove workspace / durable metadata
-```
-
-Runtime leases remain useful for launch-race management, but must not be treated as the complete process inventory.
-
-## Acceptance criteria
-
-Deletion reliably kills:
-
-- foreground shell.
-- background process.
-- `setsid()` process.
-- double-fork daemon.
-- tsshd.
-- processes from multiple simultaneous SSH launches.
-
-No process remains after workspace deletion.
-
----
-
-# Milestone 10 — Move process-count enforcement to cgroup
-
-## Objective
-
-Correct the meaning of process limits after detached descendants become legitimate.
-
-Current `max_sandbox_processes` counts manager runtime entries, not actual kernel processes. 
-
-## Tasks
-
-- Rename manager-side count limit if retained:
-  - e.g. `max_concurrent_launches_per_sandbox`.
-- Use cgroup `pids.max` for actual process-count enforcement.
-- Ensure child processes/forks consume the same sandbox aggregate PID budget.
-- Update config documentation and tests to avoid ambiguous "process" terminology.
-
-## Acceptance criteria
-
-- Forking inside one SSH launch cannot bypass sandbox process-count limits.
-- detached descendants remain counted.
-- simultaneous launches share the same PID budget.
-
----
-
-# Milestone 11 — Daemon shutdown and stale-domain reconciliation
-
-## Objective
-
-Ensure processes that have detached from SSH are still owned by shbox operational lifecycle.
-
-## Graceful shutdown
-
-Implement:
-
-```text
-stop accepting new sandbox launches
-↓
-freeze launch admission
-↓
-wait pre-publication launches
-↓
-kill_all() each sandbox process domain
-↓
-wait populated=0
-↓
-remove runtime domains
-↓
-exit daemon
-```
-
-Do not derive shutdown process inventory from active SSH channels.
-
-## Startup reconciliation
-
-Initially define:
-
-> Processes survive SSH disconnect, but survival across shbox daemon crash/restart is not guaranteed.
-
-Then add stale-cgroup cleanup.
-
-Prefer cgroup names that allow shbox ownership to be identified safely, e.g.:
-
-```text
-<configured-shbox-parent>/
-└── sandbox-<opaque-runtime-id>
-```
-
-Avoid trusting an unsanitized user sandbox ID directly as a filesystem/control-group name.
-
-On startup:
-
-- enumerate only shbox-owned cgroups under the configured delegated parent.
-- kill stale members.
-- wait empty.
-- remove stale cgroups.
-- remove corresponding stale runtime temp directories.
-
-Do not touch unrelated sibling cgroups.
-
-## Acceptance criteria
-
-- graceful shutdown leaves no sandbox processes.
-- simulated daemon crash + restart cleans stale shbox-owned domains.
-- unrelated cgroups are untouched.
-
----
-
-# Milestone 12 — tssh/tsshd compatibility acceptance
-
-## Objective
-
-Verify the generic lifecycle design against the original motivating workload.
-
-No tssh-specific branch or protocol integration should be added to shbox unless a genuine SSH compatibility gap is discovered.
-
-tsshd opens its own UDP listener and uses SSH connection information when available to choose a server-side address. 
-
-## Tasks
-
-Test:
-
-```text
-tssh
-↓
-SSH connects to shbox
-↓
-exec tsshd bootstrap
-↓
-tsshd binds UDP
-↓
-tsshd reports port/token
-↓
-bootstrap SSH channel closes
-↓
-shbox detaches transport
-↓
-tsshd remains in sandbox cgroup
-↓
-client establishes UDP session
-```
-
-Verify at minimum:
-
-- QUIC mode.
-- KCP mode if supported by current tssh.
-- connection loss and reconnection.
-- server process cleanup when tssh/tsshd actually terminates.
-- explicit sandbox delete while an active tssh session exists.
-- daemon shutdown during active tssh session.
-
-Also check whether shbox should populate standard OpenSSH variables such as:
-
-```text
-SSH_CONNECTION
-SSH_CLIENT
-```
-
-as a general SSH compatibility feature. Do not introduce them solely as hidden tssh-specific behavior.
-
-## Acceptance criteria
-
-- `tssh --udp` can connect to a shbox sandbox.
-- bootstrap SSH disconnect does not kill tsshd.
-- tsshd disappears naturally when finished and the runtime cgroup becomes empty.
-- sandbox delete reliably kills an active tsshd.
-- no tssh-specific lifecycle code exists in shbox.
-
----
-
-# Milestone 13 — Cleanup legacy process-group ownership assumptions
-
-## Objective
-
-Remove obsolete code and documentation after cgroup lifecycle becomes authoritative.
-
-## Tasks
-
-Audit and remove/rewrite:
-
-- direct-child-exit process-group cleanup.
-- channel-disconnect process-group cleanup.
-- comments equating process group with sandbox process ownership.
-- `PROCESS_GROUP_SETTLE` and polling helpers no longer needed.
-- `ResourceDomain::is_in_use()`-style Arc-count lifecycle logic.
-- tests asserting disconnect → terminate behavior.
-- documentation saying sandbox descendants are cleaned through launch process group.
-
-Retain process groups only for:
-
-- PTY foreground job lookup.
-- SSH signal forwarding.
-- job-control semantics.
-- defensive cleanup of an unpublished/failed launch where appropriate.
-
-## Acceptance criteria
-
-A code search for:
-
-```text
-kill_process_group
-SIGKILL
-SIGTERM
-wait_for_process_cleanup
-resource domain is still in use
-```
-
-must show each remaining use is explicitly associated with:
-
-- delete,
-- shutdown,
-- failed/unpublished launch,
-- or terminal/job-control behavior,
-
-not normal SSH transport teardown.
-
----
-
-# Final acceptance matrix
+## Final acceptance matrix
 
 | Scenario | Expected |
-|---|---|
+| --- | --- |
 | foreground command exits | direct child reaped; domain eventually empty |
-| shell starts background process and exits | background process survives |
-| descendant calls `setsid()` | remains in sandbox cgroup |
-| double-fork daemon | remains owned by sandbox cgroup |
-| SSH channel closes | transport detaches; no forced process kill |
-| SSH TCP connection disappears | same |
-| final sandbox process exits | `populated=0`; runtime resources removed |
-| reconnect to idle sandbox | new runtime domain may be lazily created |
-| reconnect while background process lives | same existing sandbox domain |
-| two SSH sessions | same sandbox cgroup |
-| resource limits configured | shared aggregate cgroup limits |
-| no resource limits configured | dedicated cgroup still exists |
-| sandbox delete | `cgroup.kill`; all descendants gone |
-| daemon graceful shutdown | all sandbox domains killed |
-| daemon crash/restart | stale shbox domains reconciled |
-| workspace after runtime becomes empty | preserved |
-| tssh bootstrap SSH closes | tsshd survives |
-| tssh UDP session active | process remains cgroup-owned |
-| tssh ends | domain eventually becomes empty |
+| shell starts background / `setsid()` / double-fork daemon | descendant survives direct child exit and remains cgroup-owned |
+| SSH channel or TCP connection closes | transport detaches; no forced process kill |
+| final process exits | `populated=0`; runtime temp is removed; workspace remains |
+| reconnect to idle/living sandbox | new generation or existing domain is selected correctly |
+| two SSH sessions | same sandbox cgroup and aggregate limits |
+| sandbox delete | cgroup kill removes every descendant before durable deletion |
+| daemon graceful shutdown | all sandbox domains and runtime resources are removed |
+| daemon crash/restart | stale shbox-owned domains are reconciled; unrelated cgroups untouched |
+| tssh bootstrap closes | tsshd survives and remains reachable until it exits or is deleted |
 
----
+## Verification and recovery
 
-# Recommended implementation order
-
-Do not start by changing SSH disconnect behavior.
-
-Use this dependency order:
-
-```text
-M0  contract/tests
- ↓
-M1  always-available process-domain API
- ↓
-M2  cgroup populated/kill/remove semantics
- ↓
-M3  stop normal direct-child descendant kill
- ↓
-M4  always-cgroup LinuxLauncher
- ↓
-M5  runtime-domain state machine
- ↓
-M6  SSH transport detach
- ↓
-M7  PTY detach semantics
- ↓
-M8  runtime-scoped TMPDIR
- ↓
-M9  delete via cgroup.kill
- ↓
-M10 process-count semantics
- ↓
-M11 shutdown/startup reconciliation
- ↓
-M12 tssh E2E
- ↓
-M13 legacy cleanup
-```
-
-The critical safety gate is:
-
-> M1–M5 must be complete before M6 removes SSH-disconnect termination.
-
-Until the cgroup is an authoritative ownership boundary and deletion races are closed, allowing processes to survive SSH disconnect would create unmanaged processes.
-
-Each milestone should be implemented, mechanically tested, committed, and only then used as the base for the next milestone.
+- Work from `/home/ubuntu/shbox`; do not stage `.serena/.gitignore` or unrelated user changes.
+- Before each milestone commit, run targeted acceptance plus `cargo fmt --package shbox` (automatic formatting), `cargo fmt --package shbox -- --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets`, and the relevant `systemd-run --user --scope` native integration command when cgroup delegation is required.
+- Each milestone is committed separately with an archival Conventional Commit. Do not amend, push, or create a PR.
+- If a cleanup operation fails, retain the durable `Deleting` state and leave enough ownership metadata for retry; never delete a workspace while its process domain is still populated.

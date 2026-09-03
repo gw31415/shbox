@@ -201,7 +201,7 @@ port 22 bindだけのために必要ならservice managerで`CAP_NET_BIND_SERVIC
 - Ctrl-Z stop + `jobs` + `bg` + `fg`
 - raw-mode change/restore
 - initial size and later resize/SIGWINCH
-- disconnect cleanup
+- disconnect transport detach / detached descendant survival
 - no daemon-held PTY slave
 - repeated session fd baseline recovery
 - concurrent PTY signal/resize/terminal isolation

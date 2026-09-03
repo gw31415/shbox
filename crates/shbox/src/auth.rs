@@ -89,7 +89,12 @@ fn decode_sha256_base64(digest: &str) -> Result<[u8; 32], FingerprintError> {
             base64_value(byte).ok_or(FingerprintError::InvalidCharacter(index, byte))?;
     }
     let mut out = [0u8; 32];
-    for (v, group) in values[..40].chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+    for (v, group) in values[..40]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<3>().0.iter_mut())
+    {
         group[0] = (v[0] << 2) | (v[1] >> 4);
         group[1] = (v[1] << 4) | (v[2] >> 2);
         group[2] = (v[2] << 6) | v[3];
