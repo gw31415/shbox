@@ -33,7 +33,9 @@ use crate::error::{ExitStatus, SandboxError};
 use crate::policy::{CgroupParent, NetworkNamespacePolicy, ResourceLimits, SandboxConfig};
 use crate::{BackendChild, Platform, SandboxCapabilities, SandboxChild};
 
-use cgroup::{Cgroup, create_sandbox_cgroup};
+use cgroup::{
+    Cgroup, create_process_domain_cgroup, create_sandbox_cgroup, reconcile_process_domain_cgroups,
+};
 use clone3::{
     CLONE_INTO_CGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
     CLONE_NEWUTS, CLONE_PIDFD, CLONE3_ARGS_SIZE_V1, CLONE3_ARGS_SIZE_V2, Clone3, Clone3Args,
@@ -199,13 +201,20 @@ impl LinuxBackend {
         // for process containment, it simply leaves every controller file
         // at the creation parent's policy.
         Ok(ProcessDomain {
-            cgroup: Arc::new(create_sandbox_cgroup(
+            cgroup: Arc::new(create_process_domain_cgroup(
                 &resources,
                 explicit_parent,
                 &random_suffix()?,
             )?),
             resources,
         })
+    }
+
+    pub(crate) fn reconcile_stale_process_domains(
+        &self,
+        explicit_parent: Option<&CgroupParent>,
+    ) -> Result<usize, SandboxError> {
+        reconcile_process_domain_cgroups(explicit_parent)
     }
 
     pub(crate) fn spawn_in_process_domain(

@@ -73,6 +73,7 @@ struct DomainRegistry {
     slots: Mutex<HashMap<SandboxId, DomainSlot>>,
     changed: Condvar,
     next_generation: AtomicU64,
+    accepting: AtomicBool,
 }
 
 impl Default for DomainRegistry {
@@ -81,6 +82,7 @@ impl Default for DomainRegistry {
             slots: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
             next_generation: AtomicU64::new(1),
+            accepting: AtomicBool::new(true),
         }
     }
 }
@@ -284,6 +286,11 @@ impl LinuxLauncher {
             .slots
             .lock()
             .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
+        if !self.registry.accepting.load(Ordering::Acquire) {
+            return Err(LaunchError::new(
+                "sandbox process adapter is shutting down; new launches are rejected",
+            ));
+        }
         let slot = slots.entry(sandbox_id.clone()).or_default();
         if slot.phase == DomainPhase::Deleting {
             return Err(LaunchError::new(
@@ -503,7 +510,11 @@ impl ProcessLauncher for LinuxLauncher {
                 slots = guard;
                 if timeout.timed_out() {
                     if let Some(slot) = slots.get_mut(sandbox_id) {
-                        slot.phase = DomainPhase::Active;
+                        slot.phase = if self.registry.accepting.load(Ordering::Acquire) {
+                            DomainPhase::Active
+                        } else {
+                            DomainPhase::Deleting
+                        };
                     }
                     return Err(LaunchError::new(
                         "sandbox launch barrier did not drain before deletion",
@@ -573,12 +584,76 @@ impl ProcessLauncher for LinuxLauncher {
                     if let Some(slot) = slots.get_mut(sandbox_id) {
                         slot.domain = domain;
                         slot.runtime_temp = runtime_temp;
-                        slot.phase = DomainPhase::Active;
+                        slot.phase = if self.registry.accepting.load(Ordering::Acquire) {
+                            DomainPhase::Active
+                        } else {
+                            DomainPhase::Deleting
+                        };
                     }
                     self.registry.changed.notify_all();
                 }
                 Err(error)
             }
+        }
+    }
+
+    fn reconcile_startup_resources(&self) -> Result<(), LaunchError> {
+        let parent = self
+            .policy
+            .cgroup_parent()
+            .map(shbox_sandbox::CgroupParent::new);
+        let stale_domains = self
+            .engine
+            .reconcile_stale_process_domains(parent)
+            .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
+        let stale_temps = self.policy.reconcile_runtime_temp()?;
+        tracing::info!(
+            stale_domains,
+            stale_temps,
+            "reconciled stale sandbox resources"
+        );
+        Ok(())
+    }
+
+    fn shutdown_sandbox_resources(&self) -> Result<(), LaunchError> {
+        self.registry.accepting.store(false, Ordering::Release);
+        let sandbox_ids = {
+            let mut slots = self
+                .registry
+                .slots
+                .lock()
+                .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
+            let sandbox_ids = slots.keys().cloned().collect::<Vec<_>>();
+            for slot in slots.values_mut() {
+                slot.phase = DomainPhase::Deleting;
+                if let Some(domain) = slot.domain.as_ref() {
+                    let _ = domain.kill_all();
+                }
+            }
+            sandbox_ids
+        };
+
+        let mut first_error = None;
+        for sandbox_id in sandbox_ids {
+            if let Err(error) = self.release_sandbox_resources(&sandbox_id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn force_shutdown_sandbox_resources(&self) {
+        self.registry.accepting.store(false, Ordering::Release);
+        if let Ok(mut slots) = self.registry.slots.lock() {
+            for slot in slots.values_mut() {
+                slot.phase = DomainPhase::Deleting;
+                if let Some(domain) = slot.domain.as_ref() {
+                    let _ = domain.kill_all();
+                }
+            }
+            self.registry.changed.notify_all();
         }
     }
 }
@@ -1033,7 +1108,7 @@ mod tests {
 
         let first_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert!(
-            first_cgroup.contains("sandbox-"),
+            first_cgroup.contains("shbox-domain-"),
             "launch must join a dedicated cgroup even without limits: {first_cgroup}"
         );
         let second_cgroup = read_cgroup(&launcher, "linux-test", workspace.path()).await;

@@ -6,27 +6,10 @@ Linux sandbox の process lifetime を SSH channel / process group から分離�
 
 ## Current state
 
-- M0–M5 は `bc29aa8` から `3b1043e` までの履歴に保存済み。
-- M6 は `ssh/channel.rs` の published transport-detach bridge と `RunningProcess::detach_transport` seam、M7 は Linux/macOS の PTY master close と実 SSH acceptance、M8 は runtime temp generation ownership、M9 は cgroup-authoritative delete と double-fork acceptance、M10 は launch admission と kernel `pids.max` の分離までこのコミットで保存する。次は M11 の shutdown/reconciliation である。delete・shutdown・publication 前失敗は terminate path を維持する。
+- M0–M5 は `bc29aa8` から `3b1043e`、M6 は `5766419`、M7 は `cee682d`、M8 は `2237bc8`、M9 は `ea0beba`、M10 は `ed7e187`、M11 はこのコミットの履歴に保存する。次は M12 の tssh acceptance、最後に M13 の legacy cleanup である。delete・shutdown・publication 前失敗は terminate path を維持する。
 - Linux launcher は `SandboxId` ごとの state machine と mandatory `ProcessDomain` を持ち、cgroup の `populated` / `kill_all` / `remove_empty` を lifecycle 判断に使う。
 - `plan-cgroup.md` がこのタスクの active execution plan。完了した計画本文はコミット履歴に保存し、各 milestone の archival commit と同時にここから除去する。
 - `.serena/.gitignore` は既存の未追跡補助ファイルであり、計画実装のコミットには含めない。
-
-## M11 — Daemon shutdown and stale-domain reconciliation
-
-Goal: SSH channel inventory に依存せず、graceful shutdown と再起動時 stale cgroup cleanup を実行する。
-
-Implementation:
-
-- `crates/shbox/src/server.rs` / `main.rs` / `sandbox/manager.rs` の shutdown flow を、accept 停止 → launch admission freeze → publication 前 launch barrier → 各 process domain の `kill_all` → empty wait → domain/temp remove → exit の順にする。
-- configured delegated parent 配下に shbox 所有を識別できる opaque runtime cgroup 名を使う。未 sanitised sandbox ID や sibling cgroup を信頼しない。
-- startup reconciliation で shbox-owned stale cgroup を enumerate、kill、empty wait、remove し、対応する stale runtime temp も remove する。無関係な cgroup は変更しない。
-- crash/restart survival は保証しないという既存方針を保ち、stale cleanup の ownership boundary をテストする。
-
-Proof:
-
-- graceful shutdown 後に sandbox process、runtime cgroup、runtime temp が残らない test を確認する。
-- simulated crash/restart の stale-owned cleanup と unrelated sibling preservation を integration/unit test で確認する。
 
 ## M12 — tssh/tsshd compatibility acceptance
 

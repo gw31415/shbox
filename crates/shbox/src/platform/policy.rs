@@ -530,6 +530,48 @@ impl SandboxLaunchPolicy {
             "sandbox runtime temp could not be allocated",
         ))
     }
+
+    /// Remove generation trees left by a previous daemon instance. The runtime
+    /// root is already shbox-owned; the name prefix narrows cleanup to trees
+    /// created by this policy and leaves unrelated operator files untouched.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reconcile_runtime_temp(&self) -> Result<usize, LaunchError> {
+        crate::paths::validate_dir(&self.temp_root).map_err(|error| {
+            LaunchError::new(format!("sandbox runtime root is unsafe: {error}"))
+        })?;
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.temp_root).map_err(|error| {
+            LaunchError::new(format!("sandbox runtime root could not be listed: {error}"))
+        })? {
+            let entry = entry.map_err(|error| {
+                LaunchError::new(format!(
+                    "sandbox runtime root entry could not be read: {error}"
+                ))
+            })?;
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .is_some_and(|name| name.starts_with("sandbox-"))
+                || !entry
+                    .file_type()
+                    .map_err(|error| {
+                        LaunchError::new(format!(
+                            "sandbox runtime entry type could not be read: {error}"
+                        ))
+                    })?
+                    .is_dir()
+            {
+                continue;
+            }
+            remove_launch_temp_tree(&entry.path()).map_err(|error| {
+                LaunchError::new(format!(
+                    "stale sandbox runtime temp could not be removed: {error}"
+                ))
+            })?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
 }
 
 fn canonicalize_existing_paths(paths: &mut Vec<PathBuf>) {
@@ -936,6 +978,30 @@ mod tests {
         first.remove().expect("remove first");
         assert!(!first_path.exists());
         assert!(second.path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_reconciliation_removes_owned_generations_only() {
+        let root = tempfile::tempdir().expect("runtime root");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private runtime root");
+        let config = crate::config::defaults();
+        let policy = SandboxLaunchPolicy::from_config(&config, "/bin/sh", root.path());
+        let stale = policy.create_runtime_temp(7).expect("stale runtime temp");
+        let stale_root = stale.root.clone();
+        fs::write(stale.path().join("leftover"), b"stale").expect("runtime residue");
+        std::mem::forget(stale);
+        let sibling = root.path().join("operator-data");
+        fs::create_dir(&sibling).expect("unrelated runtime sibling");
+
+        assert_eq!(
+            policy.reconcile_runtime_temp().expect("reconcile runtime"),
+            1
+        );
+        assert!(!stale_root.exists());
+        assert!(sibling.exists(), "unrelated runtime data must be preserved");
     }
 
     #[test]

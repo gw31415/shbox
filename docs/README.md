@@ -42,7 +42,7 @@ SSH/session layer
             macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
 ```
 
-Linux では workspace 内の shbox-sandbox crate が confinement engine と sandbox process domain cgroup を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（Linux launch には writable な cgroup delegation が必要）。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
+Linux では workspace 内の shbox-sandbox crate が confinement engine と sandbox process domain cgroup を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（Linux launch には writable な cgroup delegation が必要）。restart 時は delegated parent の shbox 所有 process domain と runtime temp を自動 reconciliation する。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
 
 ## Change discipline
 

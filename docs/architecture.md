@@ -200,7 +200,7 @@ normal completion では engine-owned direct child を必ず一度 reap する�
 
 published sandbox launchではchannel close/client disconnectはtransport endpointだけをdetachし、processをterminateしない。publication前の失敗、sandbox delete、daemon shutdownではmanaged processをgraceful terminationからforce-killへ進める。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task がdisconnectを観測できるようにする。
 
-Linux の engine-owned direct sandbox child には parent-death signal を設定し、その clone は process-lifetime spawn-owner thread が担当する。ただし daemon の abrupt death 時に orphan process や durable resource domain を cleanup する保証とは扱わない。
+Linux の engine-owned direct sandbox child には parent-death signal を設定し、その clone は process-lifetime spawn-owner thread が担当する。daemon の abrupt death 時に process の生存は保証しないが、restart 時は delegated parent の `shbox-domain-*` と runtime root の `sandbox-*` generation を ownership prefix で reconcile する。prefix 外の sibling cgroup/file は変更しない。
 
 ### 9.1 重要な containment limit
 

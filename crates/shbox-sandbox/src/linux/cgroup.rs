@@ -7,7 +7,7 @@
 //! straight into it (`CLONE_INTO_CGROUP`), so resource limits hold from the
 //! child's first instruction — there is no apply-after-fork window.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -17,6 +17,11 @@ use std::path::{Path, PathBuf};
 
 use crate::error::SandboxError;
 use crate::policy::{CgroupParent, Limit, ResourceLimits};
+
+/// Reserved prefix for process domains owned by the durable-domain API.
+/// One-shot resource cgroups intentionally use the separate `sandbox-`
+/// prefix and are never touched by startup reconciliation.
+pub(crate) const PROCESS_DOMAIN_PREFIX: &str = "shbox-domain-";
 
 /// Controllers a `ResourceLimits` needs enabled on the creation parent.
 fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
@@ -209,9 +214,32 @@ pub fn create_sandbox_cgroup(
     explicit_parent: Option<&CgroupParent>,
     random_suffix: &str,
 ) -> Result<Cgroup, SandboxError> {
+    create_sandbox_cgroup_with_prefix(limits, explicit_parent, "sandbox-", random_suffix)
+}
+
+/// Create a durable process-domain cgroup with the reserved ownership prefix.
+pub(crate) fn create_process_domain_cgroup(
+    limits: &ResourceLimits,
+    explicit_parent: Option<&CgroupParent>,
+    random_suffix: &str,
+) -> Result<Cgroup, SandboxError> {
+    create_sandbox_cgroup_with_prefix(
+        limits,
+        explicit_parent,
+        PROCESS_DOMAIN_PREFIX,
+        random_suffix,
+    )
+}
+
+fn create_sandbox_cgroup_with_prefix(
+    limits: &ResourceLimits,
+    explicit_parent: Option<&CgroupParent>,
+    name_prefix: &str,
+    random_suffix: &str,
+) -> Result<Cgroup, SandboxError> {
     let needed = needed_controllers(limits);
     let parent = resolve_creation_parent(explicit_parent, &needed)?;
-    let name = format!("sandbox-{random_suffix}");
+    let name = format!("{name_prefix}{random_suffix}");
 
     for attempt in 0..8 {
         let candidate = if attempt == 0 {
@@ -265,6 +293,52 @@ pub fn create_sandbox_cgroup(
         "cgroup-v2",
         "sandbox cgroup names collided; retry the spawn",
     ))
+}
+
+/// Remove stale durable process domains below the resolved delegated parent.
+/// Only the reserved [`PROCESS_DOMAIN_PREFIX`] is considered owned; sibling
+/// cgroups and one-shot `sandbox-*` cgroups are never inspected or changed.
+pub(crate) fn reconcile_process_domain_cgroups(
+    explicit_parent: Option<&CgroupParent>,
+) -> Result<usize, SandboxError> {
+    let parent = resolve_creation_parent(explicit_parent, &[])?;
+    let parent_path =
+        fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd())).map_err(SandboxError::Io)?;
+    let names = fs::read_dir(parent_path)
+        .map_err(SandboxError::Io)?
+        .map(|entry| {
+            let entry = entry.map_err(SandboxError::Io)?;
+            let name = entry.file_name();
+            let is_owned = name
+                .to_str()
+                .is_some_and(|name| name.starts_with(PROCESS_DOMAIN_PREFIX));
+            if !is_owned {
+                return Ok(None);
+            }
+            if !entry.file_type().map_err(SandboxError::Io)?.is_dir() {
+                return Ok(None);
+            }
+            Ok(Some(name))
+        })
+        .collect::<Result<Vec<_>, SandboxError>>()?;
+
+    let mut removed = 0;
+    for name in names.into_iter().flatten() {
+        let cgroup = open_existing_cgroup(&parent, &name)?;
+        cgroup.kill_all().map_err(SandboxError::Io)?;
+        if !cgroup
+            .wait_until_empty(std::time::Duration::from_secs(5))
+            .map_err(SandboxError::Io)?
+        {
+            return Err(SandboxError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("stale process domain {name:?} did not empty"),
+            )));
+        }
+        cgroup.remove_empty().map_err(SandboxError::Io)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn apply_limits(cgroup: &Cgroup, limits: &ResourceLimits) -> Result<(), SandboxError> {
@@ -589,6 +663,22 @@ fn open_directory(parent: &OwnedFd, name: &str) -> Result<OwnedFd, SandboxError>
     }
     // SAFETY: fd is a fresh descriptor from a successful openat.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_existing_cgroup(parent: &OwnedFd, name: &std::ffi::OsStr) -> Result<Cgroup, SandboxError> {
+    let name = name.to_str().ok_or_else(|| {
+        SandboxError::invalid("cgroup_name", "owned cgroup name is not valid UTF-8")
+    })?;
+    let dir = open_directory(parent, name)?;
+    let parent_copy = parent
+        .try_clone()
+        .map_err(|error| SandboxError::Io(io::Error::other(error)))?;
+    Ok(Cgroup {
+        dir,
+        parent: parent_copy,
+        name: name.into(),
+        removed: std::sync::atomic::AtomicBool::new(false),
+    })
 }
 
 fn write_control(dir: &OwnedFd, name: &str, value: &str) -> io::Result<()> {

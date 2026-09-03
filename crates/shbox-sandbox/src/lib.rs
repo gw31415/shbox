@@ -361,6 +361,28 @@ impl Sandbox {
         }
     }
 
+    /// Reconcile stale process domains left below a delegated cgroup parent.
+    ///
+    /// This removes only cgroups created by the durable process-domain API;
+    /// one-shot resource cgroups and unrelated sibling cgroups are ignored.
+    /// A daemon should call this before accepting new sandbox launches after
+    /// a restart.
+    #[cfg(target_os = "linux")]
+    pub fn reconcile_stale_process_domains(
+        &self,
+        cgroup_parent: Option<CgroupParent>,
+    ) -> Result<usize, SandboxError> {
+        match &self.backend {
+            Backend::Linux(backend) => {
+                backend.reconcile_stale_process_domains(cgroup_parent.as_ref())
+            }
+            Backend::Unsupported => Err(SandboxError::unsupported(
+                "backend",
+                "no sandbox backend exists for this platform",
+            )),
+        }
+    }
+
     /// Spawn a Linux child directly into an existing durable process domain.
     ///
     /// The config's resource limits must exactly match the domain's limits.

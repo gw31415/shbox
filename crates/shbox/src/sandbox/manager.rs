@@ -138,6 +138,7 @@ pub(crate) struct SandboxManager {
     runtime_changed: std::sync::Condvar,
     lifecycle_locks: Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
     ready: std::sync::atomic::AtomicBool,
+    launch_admission_frozen: std::sync::atomic::AtomicBool,
 }
 
 impl SandboxManager {
@@ -208,6 +209,7 @@ impl SandboxManager {
             runtime_changed: std::sync::Condvar::new(),
             lifecycle_locks: Mutex::new(HashMap::new()),
             ready: std::sync::atomic::AtomicBool::new(false),
+            launch_admission_frozen: std::sync::atomic::AtomicBool::new(false),
         };
         manager.load_registry()?;
         Ok(manager)
@@ -216,7 +218,12 @@ impl SandboxManager {
     /// Complete startup cleanup and make sandbox operations available.
     pub(crate) fn reconcile_startup(&self) {
         self.reconcile_deleting();
-        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        match self.launcher.reconcile_startup_resources() {
+            Ok(()) => self.ready.store(true, std::sync::atomic::Ordering::Release),
+            Err(error) => {
+                tracing::error!(error = %error, "sandbox resource reconciliation failed; keeping manager unavailable")
+            }
+        }
     }
 
     /// Atomically claim an ID for the principal, creating its workspace only
@@ -414,6 +421,12 @@ impl SandboxManager {
         operation: platform::LaunchOperation,
         pty: Option<platform::PtySpec>,
     ) -> Result<ManagedProcess, Error> {
+        if self
+            .launch_admission_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable);
+        }
         let handle = self.claim(principal, id)?;
         self.launch_handle(&handle, operation, pty)
     }
@@ -448,6 +461,15 @@ impl SandboxManager {
 
     fn begin_launch(&self, handle: &SandboxHandle) -> Result<RuntimeLease, Error> {
         let mut ledger = self.ledger.lock().expect("sandbox ledger");
+        // The shutdown store happens before taking this same ledger lock. A
+        // launch that already owns the lock is included in the shutdown
+        // snapshot; every later launch is rejected here.
+        if self
+            .launch_admission_frozen
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable);
+        }
         let Some(metadata) = ledger.records.get(handle.id()) else {
             return Err(Error::Unavailable);
         };
@@ -584,6 +606,8 @@ impl SandboxManager {
     /// remain in the ledger until their owner returns, so a late adapter
     /// result cannot outlive this cancellation barrier.
     pub(crate) fn shutdown_runtime(&self) {
+        self.launch_admission_frozen
+            .store(true, std::sync::atomic::Ordering::Release);
         let (tokens, processes) = {
             let mut ledger = self.ledger.lock().expect("sandbox ledger");
             let mut tokens = BTreeSet::new();
@@ -602,27 +626,30 @@ impl SandboxManager {
         for process in &processes {
             process.terminate();
         }
-        if self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT) {
-            return;
+        if !self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT) {
+            let processes = {
+                let ledger = self.ledger.lock().expect("sandbox ledger");
+                tokens
+                    .iter()
+                    .filter_map(|token| ledger.runtime.get(token)?.process.clone())
+                    .collect::<Vec<_>>()
+            };
+            for process in &processes {
+                process.force_terminate();
+            }
+            let _ = self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT);
         }
-
-        let processes = {
-            let ledger = self.ledger.lock().expect("sandbox ledger");
-            tokens
-                .iter()
-                .filter_map(|token| ledger.runtime.get(token)?.process.clone())
-                .collect::<Vec<_>>()
-        };
-        for process in &processes {
-            process.force_terminate();
+        if let Err(error) = self.launcher.shutdown_sandbox_resources() {
+            tracing::error!(error = %error, "sandbox process-domain shutdown cleanup failed");
         }
-        let _ = self.wait_for_runtime_tokens(&tokens, Instant::now() + RUNTIME_CLEANUP_TIMEOUT);
     }
 
     /// Force-stop every process currently registered by the manager. This is
     /// the second-signal path: it publishes cancellation and sends the
     /// adapter's hard-stop signal without waiting for graceful cleanup.
     pub(crate) fn force_shutdown_runtime(&self) {
+        self.launch_admission_frozen
+            .store(true, std::sync::atomic::Ordering::Release);
         let processes = {
             let mut ledger = self.ledger.lock().expect("sandbox ledger");
             let mut processes = Vec::new();
@@ -639,6 +666,7 @@ impl SandboxManager {
         for process in processes {
             process.force_terminate();
         }
+        self.launcher.force_shutdown_sandbox_resources();
     }
 
     /// Wait for all selected runtime entries in parallel. A launch marker
@@ -1186,7 +1214,7 @@ mod tests {
         let manager = SandboxManager::open_unreconciled_with_launcher(
             &paths,
             Caps::default(),
-            Arc::new(launcher),
+            Arc::new(launcher.clone()),
         )
         .expect("manager");
         let owner = principal('A', Role::Normal);
@@ -1197,6 +1225,7 @@ mod tests {
             Err(Error::Unavailable)
         ));
         manager.reconcile_startup();
+        assert_eq!(launcher.startup_reconciliation_count(), 1);
         assert!(manager.claim(&owner, &id).expect("claim").created());
     }
 
@@ -1701,8 +1730,26 @@ mod tests {
         assert!(first_process.terminated());
         assert!(second_process.terminated());
         assert_eq!(manager.runtime_count(), 0);
+        assert_eq!(launcher.shutdown_count(), 1);
         drop(first);
         drop(second);
+    }
+
+    #[test]
+    fn force_shutdown_freezes_launches_and_invokes_adapter_hard_stop() {
+        let launcher = FakeLauncher::default();
+        let (_root, manager) = manager_with_fake(Caps::default(), &launcher);
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        manager.claim(&owner, &id).expect("claim");
+
+        manager.force_shutdown_runtime();
+
+        assert_eq!(launcher.forced_shutdown_count(), 1);
+        assert!(matches!(
+            manager.launch(&owner, &id, platform::LaunchOperation::Shell, None),
+            Err(Error::Unavailable)
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -1746,6 +1793,86 @@ mod tests {
         assert!(control.wait_for_cleanup(Duration::from_secs(1)));
         assert_eq!(manager.runtime_count(), 0);
         drop(managed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_runtime_reaps_detached_domain_after_channel_lease_is_gone() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let policy = SandboxLaunchPolicy::from_parts(
+            PathBuf::from("/bin/sh"),
+            NetworkMode::Disabled,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            paths.runtime_dir().to_path_buf(),
+            crate::config::SandboxResources::default(),
+            std::env::var_os("SHBOX_SANDBOX_TEST_CGROUP_PARENT").map(PathBuf::from),
+        );
+        let launcher = Arc::new(LinuxLauncher::new(policy).expect("linux launcher"));
+        if !launcher.process_domain_ready(paths.runtime_dir()) {
+            return;
+        }
+        let manager =
+            SandboxManager::open_with_launcher(&paths, Caps::default(), launcher).expect("manager");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("dev").expect("id");
+        let handle = manager.claim(&owner, &id).expect("claim");
+        let managed = manager
+            .launch_handle(
+                &handle,
+                platform::LaunchOperation::Exec(
+                    br#"setsid sh -c 'exec sleep 30' & printf '%s' "$!" > detached.pid; printf '%s' "$TMPDIR" > tmp.path; exit 0"#.to_vec(),
+                ),
+                None,
+            )
+            .expect("detached launch");
+        let lease = managed.lease.clone();
+        let platform::LaunchedProcess { control, wait, .. } = managed.process;
+        assert_eq!(
+            wait.blocking_recv().expect("wait channel").expect("wait"),
+            platform::ProcessExit::Code(0)
+        );
+
+        let workspace = paths.sandboxes_root().join("dev/workspace");
+        let pid: libc::pid_t = fs::read_to_string(workspace.join("detached.pid"))
+            .expect("detached pid")
+            .trim()
+            .parse()
+            .expect("numeric detached pid");
+        let temp_path = PathBuf::from(
+            fs::read_to_string(workspace.join("tmp.path")).expect("runtime temp path"),
+        );
+        let process_alive = || {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.split_whitespace().nth(2).map(|state| state != "Z"))
+                .unwrap_or(false)
+        };
+        manager.clear_runtime(&lease);
+        assert_eq!(manager.runtime_count(), 0);
+        assert!(control.wait_for_cleanup(Duration::from_secs(1)));
+        assert!(process_alive());
+        assert!(
+            temp_path.exists(),
+            "domain temp survives channel lease cleanup"
+        );
+
+        manager.shutdown_runtime();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_alive());
+        assert!(!temp_path.exists(), "shutdown must remove runtime temp");
+        assert_eq!(
+            fs::read_dir(paths.runtime_dir())
+                .expect("runtime listing")
+                .count(),
+            0
+        );
     }
 
     #[cfg(target_os = "macos")]

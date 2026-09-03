@@ -196,7 +196,7 @@ timeoutでforce killへescalateする。
 
 connection handler drop時はchannel registry senderをclearし、bridge taskがdisconnectを確実に観測する。bridgeがconnection stateの`Arc`を保持しているだけでprocessが残り続けないようにする。
 
-Linux の engine-owned direct child には parent-death signal を設定し、その clone は process-lifetime の専用 spawn-owner thread が実行する。PID namespace 有りでは direct child は内部 PID1 supervisor で user command は PID2 として実行される。ただし daemon abrupt death時のorphan processやdurable resource domainをcleanupする保証とは扱わない。
+Linux の engine-owned direct child には parent-death signal を設定し、その clone は process-lifetime の専用 spawn-owner thread が実行する。PID namespace 有りでは direct child は内部 PID1 supervisor で user command は PID2 として実行される。daemon abrupt death 時に process の生存は保証しないが、次回 startup は delegated parent の shbox 所有 `shbox-domain-*` と runtime root の `sandbox-*` generation を回収する。ownership prefix 外の sibling cgroup/file は変更しない。
 
 ### 9.1 Detached descendant limitation
 
@@ -217,7 +217,7 @@ shbox v0.1は、設定された resource limit を sandbox ごとに platform �
 
 Linux の public shbox adapter では、limit の有無にかかわらず `SandboxId` ごとに一つの durable な process domain（専用 cgroup v2）を作成し、同じ `SandboxId` の concurrent launch が共有する。child はその domain に直接生成され、child exit では domain を削除しない。sandbox deletion が runtime cancellation と child cleanup を完了した後に domain を release/remove する。limit を省略した分野は `Inherit` であり、その controller の sandbox-local 制限を書き換えない。直接 `shbox-sandbox::Sandbox::spawn` を利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。
 
-limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。daemon crash 時の orphan process や durable resource domain の自動 cleanup は、この lifecycle contract に含めない。
+limit は parent/ancestor cgroup の制限に追加され、child が inherited cgroup restriction を解除または引き上げることはできない。daemon crash 時に process を残す保証はないが、restart 時の stale-owned domain/temp reconciliation はこの lifecycle contract に含まれる。
 
 提供しないもの:
 

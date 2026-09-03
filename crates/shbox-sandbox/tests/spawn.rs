@@ -1134,7 +1134,7 @@ mod linux_only {
 
         let first = read_cgroup("first").expect("first cgroup reading");
         assert!(
-            first.contains("sandbox-"),
+            first.contains("shbox-domain-"),
             "child must be born inside the dedicated cgroup: {first}"
         );
         let second = read_cgroup("second").expect("second cgroup reading");
@@ -1166,6 +1166,50 @@ mod linux_only {
         other_domain
             .remove_empty()
             .expect("remove independent process domain");
+    }
+
+    /// M11: startup reconciliation owns only process domains created by the
+    /// durable-domain API. A sibling cgroup with another name is outside the
+    /// ownership boundary and must survive the sweep.
+    #[test]
+    fn startup_reconciliation_removes_stale_domains_but_preserves_siblings() {
+        let Some(parent_path) = delegated_cgroup_parent() else {
+            eprintln!("skipping: no delegated cgroup parent");
+            return;
+        };
+        let parent = shbox_sandbox::CgroupParent::new(parent_path.clone());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = restricted_to(workspace.path());
+        let sandbox = Sandbox::detect_with(Some(parent.clone()));
+        let domain = match sandbox.create_process_domain(config.resources, Some(parent.clone())) {
+            Ok(domain) => domain,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("stale domain setup failed: {error}"),
+        };
+
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg("exec sleep 30");
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Null;
+        command.stderr = Stdio::Null;
+        let child = sandbox
+            .spawn_in_process_domain(command, config, &domain)
+            .expect("stale-domain child");
+        std::mem::forget(child);
+        std::mem::forget(domain);
+
+        let sibling = parent_path.join("unrelated-sibling");
+        std::fs::create_dir(&sibling).expect("create unrelated sibling cgroup");
+
+        let removed = sandbox
+            .reconcile_stale_process_domains(Some(parent))
+            .expect("startup reconciliation");
+        assert_eq!(removed, 1, "one stale shbox domain must be removed");
+        assert!(sibling.exists(), "unrelated cgroup must be preserved");
+        std::fs::remove_dir(sibling).expect("remove test sibling cgroup");
     }
 
     #[test]

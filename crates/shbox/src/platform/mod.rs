@@ -157,6 +157,23 @@ pub(crate) trait ProcessLauncher: fmt::Debug + Send + Sync {
     fn release_sandbox_resources(&self, _sandbox_id: &SandboxId) -> Result<(), LaunchError> {
         Ok(())
     }
+
+    /// Reconcile process domains and runtime files left by a previous daemon
+    /// instance before launch admission becomes ready.
+    fn reconcile_startup_resources(&self) -> Result<(), LaunchError> {
+        Ok(())
+    }
+
+    /// Gracefully terminate and remove every durable process-domain resource
+    /// during daemon shutdown, including domains no longer represented by a
+    /// live SSH channel.
+    fn shutdown_sandbox_resources(&self) -> Result<(), LaunchError> {
+        Ok(())
+    }
+
+    /// Best-effort hard stop for the second shutdown signal. It may leave
+    /// empty cgroups or runtime trees for the next startup reconciliation.
+    fn force_shutdown_sandbox_resources(&self) {}
 }
 
 /// Build the single production launcher for this target from the immutable
@@ -254,6 +271,9 @@ struct FakeState {
     last_request: Option<LaunchRequest>,
     last_process: Option<Arc<FakeProcess>>,
     released_sandboxes: Vec<SandboxId>,
+    startup_reconciliations: usize,
+    shutdowns: usize,
+    forced_shutdowns: usize,
 }
 
 #[cfg(test)]
@@ -296,6 +316,21 @@ impl FakeLauncher {
             .expect("fake launcher")
             .released_sandboxes
             .clone()
+    }
+
+    pub(crate) fn startup_reconciliation_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fake launcher")
+            .startup_reconciliations
+    }
+
+    pub(crate) fn shutdown_count(&self) -> usize {
+        self.state.lock().expect("fake launcher").shutdowns
+    }
+
+    pub(crate) fn forced_shutdown_count(&self) -> usize {
+        self.state.lock().expect("fake launcher").forced_shutdowns
     }
 }
 
@@ -348,6 +383,23 @@ impl ProcessLauncher for FakeLauncher {
             return Err(LaunchError::new("injected fake resource release failure"));
         }
         Ok(())
+    }
+
+    fn reconcile_startup_resources(&self) -> Result<(), LaunchError> {
+        self.state
+            .lock()
+            .expect("fake launcher")
+            .startup_reconciliations += 1;
+        Ok(())
+    }
+
+    fn shutdown_sandbox_resources(&self) -> Result<(), LaunchError> {
+        self.state.lock().expect("fake launcher").shutdowns += 1;
+        Ok(())
+    }
+
+    fn force_shutdown_sandbox_resources(&self) {
+        self.state.lock().expect("fake launcher").forced_shutdowns += 1;
     }
 }
 

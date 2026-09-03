@@ -23,8 +23,10 @@ Linux sandbox において process の生存を誰が管理するかを layer �
 - sandbox delete は sandbox に属するすべての process を終了させる。
   `setsid()` による session 離脱、double-fork、daemonize 済みの descendant を含む。
 - daemon の graceful shutdown はすべての sandbox process を終了させる。
-- daemon の crash/restart を跨いだ process の生存は、初期状態では保証しない
-  （stale cgroup の startup reconciliation は後に追加する）。
+- daemon の crash/restart を跨いだ process の生存は保証しない。次回 startup は
+  delegated parent 配下の shbox 所有 `shbox-domain-*` cgroup を enumerate し、
+  kill → populated=0 待ち → remove する。対応する `sandbox-*` runtime temp と
+  無関係な sibling cgroup はそれぞれ ownership boundary に従って扱う。
 
 ## 2. 各イベントの定義する挙動
 
@@ -81,11 +83,23 @@ cgroup に残り得るため、削除の権威は cgroup membership にある。
 
 ### 2.5 Daemon graceful shutdown
 
-- 新規 launch の受付を停止する。
-- 各 sandbox process domain に対して kill → populated=0 待ち → cgroup 削除を
-  行う。shutdown の process inventory を active SSH channel から導出しない。
+- listener の受付を停止し、manager の launch admission を freeze する。
+- publication 前の launch barrier と、manager に残る runtime lease の graceful
+  cleanup を完了する。
+- 各 sandbox process domain に対して kill → populated=0 待ち → cgroup 削除 →
+  runtime temp 削除を行う。shutdown の process inventory を active SSH channel
+  から導出しない。
 
-### 2.6 通常終了後の runtime 資源
+### 2.6 Daemon restart reconciliation
+
+startup では、新しい launcher が launch admission を開く前に、configured または
+auto-discovered delegated parent の直下から `shbox-domain-*` だけを調べる。各 stale
+domain は cgroup membership を権威として kill、empty wait、remove する。runtime root
+では `sandbox-*` generation tree だけを recursive に削除する。名前 prefix の外側に
+ある cgroup、runtime file、workspace は変更しない。cleanup の一部が失敗した場合は
+manager を ready にせず、次回 startup または明示的な retry に ownership を残す。
+
+### 2.7 通常終了後の runtime 資源
 
 - runtime temp（`TMPDIR`）は launch ごとではなく sandbox runtime domain ごとに
   作られる。domain 内の全 process が終了し in-flight launch がなくなった時点で
