@@ -32,6 +32,8 @@ use crate::config::NetworkMode;
 use crate::sandbox::SandboxId;
 
 const PROCESS_GROUP_SETTLE: Duration = Duration::from_secs(1);
+/// Deadline for a killed process domain to report `populated 0`.
+const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Linux launcher backed by the detected engine capabilities and the
 /// process-lifetime shbox policy snapshot.
@@ -302,26 +304,32 @@ impl ProcessLauncher for LinuxLauncher {
         let Some(domain) = domains.remove(sandbox_id) else {
             return Ok(());
         };
-        if Arc::strong_count(&domain) != 1 || domain.is_in_use() {
-            domains.insert(sandbox_id.clone(), domain);
-            return Err(LaunchError::new(
-                "sandbox resource domain is still in use after process cleanup",
-            ));
-        }
-        let mut domain = match Arc::try_unwrap(domain) {
-            Ok(domain) => domain,
-            Err(domain) => {
-                domains.insert(sandbox_id.clone(), domain);
+        // Cgroup-authoritative teardown: kill every member (including
+        // detached `setsid()`/double-fork descendants no process group can
+        // reach), wait for the kernel to agree the domain is empty, then
+        // remove the directory. Each failure re-inserts the domain so the
+        // caller can retry without losing cgroup ownership.
+        let release = || -> Result<(), LaunchError> {
+            domain
+                .kill_all()
+                .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
+            if !domain
+                .wait_until_empty(DOMAIN_TEARDOWN_TIMEOUT)
+                .map_err(|error| LaunchError::new(describe_engine_error(&error)))?
+            {
                 return Err(LaunchError::new(
-                    "sandbox resource domain is still referenced after process cleanup",
+                    "sandbox process domain still contains processes after kill",
                 ));
             }
+            domain
+                .remove_empty()
+                .map_err(|error| LaunchError::new(describe_engine_error(&error)))
         };
-        match domain.remove() {
+        match release() {
             Ok(()) => Ok(()),
             Err(error) => {
-                domains.insert(sandbox_id.clone(), Arc::new(domain));
-                Err(LaunchError::new(describe_engine_error(&error)))
+                domains.insert(sandbox_id.clone(), domain);
+                Err(error)
             }
         }
     }
@@ -567,7 +575,10 @@ mod tests {
             BTreeMap::new(),
             root.into(),
             resources,
-            None,
+            // A delegated cgroup v2 parent for hosts whose session
+            // ancestors are root-owned; without it, cgroup-backed tests
+            // self-skip inside the launcher.
+            std::env::var_os("SHBOX_SANDBOX_TEST_CGROUP_PARENT").map(std::path::PathBuf::from),
         )
     }
 

@@ -133,19 +133,35 @@ impl std::fmt::Debug for ProcessDomain {
 }
 
 impl ProcessDomain {
-    /// Whether a spawned child still holds this domain's cgroup open.
-    pub fn is_in_use(&self) -> bool {
-        Arc::strong_count(&self.cgroup) > 1
+    /// Whether the domain's cgroup (or a descendant) still contains
+    /// processes. This is the authoritative membership signal; Rust handle
+    /// counts are not — a detached descendant keeps the domain populated
+    /// long after every child handle is gone.
+    pub fn is_populated(&self) -> Result<bool, SandboxError> {
+        self.cgroup.is_populated().map_err(SandboxError::Io)
     }
 
-    /// Remove this domain's cgroup after all children have released it.
+    /// Block until the cgroup reports `populated 0` or `timeout` elapses.
+    pub fn wait_until_empty(&self, timeout: Duration) -> Result<bool, SandboxError> {
+        self.cgroup
+            .wait_until_empty(timeout)
+            .map_err(SandboxError::Io)
+    }
+
+    /// Kill every process in the domain (`cgroup.kill`).
     ///
-    /// A failed removal leaves the domain intact so the caller can retry
-    /// cleanup without losing ownership of the cgroup.
-    pub fn remove(&mut self) -> Result<(), SandboxError> {
-        let cgroup = Arc::get_mut(&mut self.cgroup)
-            .ok_or_else(|| SandboxError::Internal("resource domain is still in use".to_string()))?;
-        cgroup.remove().map_err(SandboxError::Io)
+    /// The only member-terminating operation, reserved for explicit
+    /// lifecycle decisions: sandbox deletion, daemon shutdown, and
+    /// defensive cleanup of an abandoned launch.
+    pub fn kill_all(&self) -> Result<(), SandboxError> {
+        self.cgroup.kill_all().map_err(SandboxError::Io)
+    }
+
+    /// Remove the domain's cgroup directory, refusing while processes
+    /// remain. A failed removal leaves the domain intact so the caller can
+    /// kill, wait, and retry without losing ownership of the cgroup.
+    pub fn remove_empty(&self) -> Result<(), SandboxError> {
+        self.cgroup.remove_empty().map_err(SandboxError::Io)
     }
 }
 
@@ -1030,9 +1046,13 @@ impl BackendChild for LinuxChild {
             }
         }
         if let Some(cgroup) = self.cgroup.take() {
-            // Per-launch cgroups are removed when this is the final Arc.
-            // Shared resource-domain cgroups remain alive until the durable
-            // sandbox releases its owning domain.
+            // A per-launch cgroup (this handle is the last owner) that is
+            // being abandoned still terminates its members: nobody else can.
+            // Shared process-domain cgroups outlive individual children and
+            // are removed only by the domain's explicit owner.
+            if was_running && Arc::strong_count(&cgroup) == 1 {
+                let _ = cgroup.kill_all();
+            }
             drop(cgroup);
         }
         self.supervisor_control.take();

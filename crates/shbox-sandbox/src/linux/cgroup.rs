@@ -34,13 +34,18 @@ fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
 }
 
 /// An open sandbox cgroup plus what is needed to remove it again.
+///
+/// Membership observation (`cgroup.events` `populated`), explicit
+/// termination (`cgroup.kill`), and removal are separate operations:
+/// removal never kills, and killing never removes. The kernel's membership
+/// state — not Rust handle counts — is the authority for every decision.
 pub struct Cgroup {
     /// Directory fd of the cgroup itself; also the `CLONE_INTO_CGROUP` fd.
     dir: OwnedFd,
     /// Directory fd of the creation parent.
     parent: OwnedFd,
     name: std::ffi::OsString,
-    removed: bool,
+    removed: std::sync::atomic::AtomicBool,
 }
 
 impl Cgroup {
@@ -50,42 +55,95 @@ impl Cgroup {
     }
 
     /// Kill every process in the cgroup (`cgroup.kill`, kernel 5.14+).
-    /// Kernels without the file return an error, which the caller treats as
-    /// a hint rather than a failure; the process-group kill still applies.
-    pub fn kill_processes(&self) -> io::Result<()> {
+    ///
+    /// This is the only operation that terminates cgroup members, and it is
+    /// always explicit: neither removal nor handle teardown implies it.
+    /// Kernels without the file return an error for the caller to combine
+    /// with process-group signalling.
+    pub fn kill_all(&self) -> io::Result<()> {
         write_control(&self.dir, "cgroup.kill", "1")
     }
 
-    /// Whether `cgroup.procs` is empty.
-    pub fn is_empty(&self) -> bool {
-        read_control(&self.dir, "cgroup.procs")
-            .map(|content| content.trim().is_empty())
-            .unwrap_or(true)
+    /// Whether the cgroup (or a descendant) still contains processes,
+    /// per `cgroup.events` `populated` — the authoritative membership
+    /// signal. An unreadable events file reads as populated: failing open
+    /// would risk stranding live processes in a removed domain.
+    pub fn is_populated(&self) -> io::Result<bool> {
+        let events = read_control(&self.dir, "cgroup.events")?;
+        Ok(events
+            .lines()
+            .any(|line| line.trim_start().starts_with("populated ")
+                && line.trim_start().ends_with('1')))
     }
 
-    /// Remove the cgroup. Kills members first; refuses to remove a
-    /// non-empty cgroup unless `force` (which polls briefly for members to
-    /// die after `cgroup.kill`).
-    pub fn remove(&mut self) -> io::Result<()> {
-        if self.removed {
+    /// Block until `populated` reads `0` or `timeout` elapses.
+    ///
+    /// `cgroup.events` supports `poll(2)` notification on kernels with
+    /// kernfs event triggers; the bounded poll slice keeps the wait cheap
+    /// everywhere else instead of a tight read loop.
+    pub fn wait_until_empty(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        // One read arms the kernfs poll trigger before the first wait.
+        if !self.is_populated()? {
+            return Ok(true);
+        }
+        let events_fd = open_control_read(&self.dir, "cgroup.events")?;
+        loop {
+            if !self.is_populated()? {
+                return Ok(true);
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                return Ok(false);
+            };
+            let slice = remaining.min(std::time::Duration::from_millis(50));
+            let mut poller = libc::pollfd {
+                fd: events_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poller` is one valid pollfd over an owned descriptor.
+            let ready = unsafe {
+                libc::poll(
+                    &mut poller,
+                    1,
+                    slice.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            // Drain the trigger so the next poll blocks until a new change.
+            let _ = read_control(&self.dir, "cgroup.events")?;
+        }
+    }
+
+    /// Remove the cgroup directory, refusing when it is still populated.
+    ///
+    /// Removal never kills: a populated domain is the caller's explicit
+    /// problem (`kill_all` first, then wait, then remove). Idempotent.
+    pub fn remove_empty(&self) -> io::Result<()> {
+        if self
+            .removed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(());
         }
-        self.remove_inner()?;
-        self.removed = true;
-        Ok(())
-    }
-
-    fn remove_inner(&self) -> io::Result<()> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while !self.is_empty() {
-            let _ = self.kill_processes();
-            if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "sandbox cgroup still has live processes",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if self.is_populated().unwrap_or(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "sandbox cgroup still contains processes",
+            ));
+        }
+        let already_removed =
+            self.removed
+                .swap(true, std::sync::atomic::Ordering::AcqRel);
+        if already_removed {
+            return Ok(());
         }
         unlink_directory(self.parent.as_raw_fd(), &self.name)
     }
@@ -93,9 +151,13 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        if !self.removed {
-            let _ = self.remove_inner();
-            self.removed = true;
+        if !self
+            .removed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Best-effort cleanup of an unreleased cgroup. It never kills:
+            // processes still inside are somebody's live sandbox members.
+            let _ = self.remove_empty();
         }
     }
 }
@@ -189,7 +251,7 @@ pub fn create_sandbox_cgroup(
                     dir,
                     parent: parent_copy,
                     name: candidate.into(),
-                    removed: false,
+                    removed: std::sync::atomic::AtomicBool::new(false),
                 };
                 apply_limits(&cgroup, limits)?;
                 cleanup.disarm();
@@ -558,6 +620,25 @@ fn write_control(dir: &OwnedFd, name: &str, value: &str) -> io::Result<()> {
     file.write_all(value.as_bytes())
 }
 
+/// Open a control file read-only for poll-based waiting.
+fn open_control_read(dir: &OwnedFd, name: &str) -> io::Result<OwnedFd> {
+    let path = format!("{name}\0");
+    // SAFETY: openat against an owned directory fd with a NUL-terminated
+    // relative name; a successful result is a uniquely owned descriptor.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            path.as_bytes().as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh descriptor from a successful openat.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn read_control(dir: &OwnedFd, name: &str) -> io::Result<String> {
     let path = format!("{name}\0");
     // SAFETY: openat against an owned directory fd with a NUL-terminated
@@ -689,7 +770,7 @@ mod tests {
             dir,
             parent,
             name: "test".into(),
-            removed: false,
+            removed: std::sync::atomic::AtomicBool::new(false),
         };
 
         apply_limits(&cgroup, &ResourceLimits::default()).expect("inherit limits");

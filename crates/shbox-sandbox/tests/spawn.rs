@@ -56,8 +56,18 @@ fn restricted_to(workspace: &std::path::Path) -> SandboxConfig {
             execute: system_execute_paths(),
         },
         network: NetworkPolicy::Disabled,
+        cgroup_parent: delegated_cgroup_parent(),
         ..SandboxConfig::unrestricted()
     }
+}
+
+/// A cgroup v2 creation parent delegated to this test user, if the
+/// environment provides one. Auto-discovery walks the daemon's own cgroup
+/// ancestors, which on a developer session are root-owned; a delegated
+/// subtree (systemd `user@.service`, `systemd-run --scope -p Delegate=…`)
+/// is where sandbox cgroups can actually live.
+fn delegated_cgroup_parent() -> Option<std::path::PathBuf> {
+    std::env::var_os("SHBOX_SANDBOX_TEST_CGROUP_PARENT").map(std::path::PathBuf::from)
 }
 
 fn existing_paths(candidates: &[&str]) -> Vec<PathRule> {
@@ -1072,7 +1082,12 @@ mod linux_only {
             "fixture must be the all-Inherit case"
         );
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_process_domain(config.resources, None) {
+        let domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1080,7 +1095,12 @@ mod linux_only {
             }
             Err(error) => panic!("all-Inherit process domain must be creatable: {error}"),
         };
-        let mut other_domain = match sandbox.create_process_domain(config.resources, None) {
+        let other_domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(error) => panic!("second process domain could not be created: {error}"),
         };
@@ -1139,9 +1159,9 @@ mod linux_only {
             "different sandbox IDs must never share a process domain"
         );
 
-        domain.remove().expect("remove first process domain");
+        domain.remove_empty().expect("remove first process domain");
         other_domain
-            .remove()
+            .remove_empty()
             .expect("remove independent process domain");
     }
 
@@ -1154,7 +1174,12 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_process_domain(config.resources, None) {
+        let domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1165,26 +1190,40 @@ mod linux_only {
 
         let mut first_command = CommandSpec::new("/bin/sleep");
         first_command = first_command.arg("30");
-        let mut first = sandbox
-            .spawn_in_process_domain(first_command, config.clone(), &domain)
-            .expect("first domain spawn");
+        let mut first = match sandbox.spawn_in_process_domain(first_command, config.clone(), &domain)
+        {
+            Ok(child) => child,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("unexpected first domain spawn error: {error}"),
+        };
 
+        // A populated domain refuses removal: the live child is the kernel's
+        // authoritative membership, not the Rust handle count.
         let error = domain
-            .remove()
-            .expect_err("a live child must keep the resource domain in use");
+            .remove_empty()
+            .expect_err("a populated domain must refuse removal");
         assert!(
-            matches!(error, SandboxError::Internal(_)),
+            matches!(error, SandboxError::Io(_)),
             "unexpected removal error: {error}"
         );
 
         first.signal(libc::SIGKILL).expect("kill first child");
         let _ = first.wait().expect("wait first child");
+        assert!(
+            domain
+                .wait_until_empty(Duration::from_secs(2))
+                .expect("wait for the killed child to leave the cgroup"),
+            "domain must drain after its only child is killed"
+        );
 
         let mut second = sandbox
             .spawn_in_process_domain(CommandSpec::new("/bin/true"), config, &domain)
             .expect("resource domain must remain reusable after child cleanup");
         assert_eq!(second.wait().expect("wait second child").code(), Some(0));
-        domain.remove().expect("remove idle resource domain");
+        domain.remove_empty().expect("remove idle resource domain");
     }
 
 
@@ -1243,7 +1282,12 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_process_domain(config.resources, None) {
+        let domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1293,19 +1337,33 @@ mod linux_only {
             process_is_alive(pid),
             "setsid descendant {pid} must survive the direct child handle being dropped"
         );
-        // The domain release must not silently kill a populated domain's
-        // members: with the child handle gone, only an explicit kill can
-        // remove them today, and this test pins that removal attempts fail
-        // rather than terminate processes behind the caller's back.
+        // With the child handle gone, only the detached descendant keeps the
+        // domain populated — and removal must refuse rather than kill it.
         assert!(
-            domain.remove().is_err() || !process_is_alive(pid),
-            "domain removal must not leave processes half-killed: it either fails \
-             on a populated domain or the members are gone"
+            domain.is_populated().expect("domain population"),
+            "the setsid descendant must keep the domain populated after every \
+             direct child handle is gone"
         );
-        if process_is_alive(pid) {
-            kill_process(pid);
-        }
-        let _ = domain.remove();
+        assert!(
+            domain.remove_empty().is_err(),
+            "a populated domain must refuse removal instead of killing members"
+        );
+        assert!(
+            process_is_alive(pid),
+            "a refused removal must leave the descendant untouched"
+        );
+
+        // Explicit teardown: kill_all reaches even the detached descendant,
+        // the domain drains, and only then can the cgroup be removed.
+        domain.kill_all().expect("kill all domain members");
+        assert!(
+            domain
+                .wait_until_empty(Duration::from_secs(2))
+                .expect("wait for domain to drain"),
+            "domain must drain after kill_all"
+        );
+        assert!(!process_is_alive(pid));
+        domain.remove_empty().expect("remove drained domain");
     }
 
     #[test]
@@ -1321,7 +1379,12 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_process_domain(config.resources, None) {
+        let domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1329,7 +1392,12 @@ mod linux_only {
             }
             Err(error) => panic!("unexpected resource-domain error: {error}"),
         };
-        let mut other_domain = match sandbox.create_process_domain(config.resources, None) {
+        let other_domain = match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
             Ok(domain) => domain,
             Err(error) => panic!("second resource domain could not be created: {error}"),
         };
@@ -1371,9 +1439,79 @@ mod linux_only {
             .expect("the same resource domain must be reusable after its child exits");
         assert_eq!(reused.wait().expect("wait reused child").code(), Some(0));
 
-        domain.remove().expect("remove first resource domain");
+        domain.remove_empty().expect("remove first resource domain");
         other_domain
-            .remove()
+            .remove_empty()
             .expect("remove independent resource domain");
+    }
+
+    /// `plan-cgroup.md` M2: `cgroup.events` `populated` is the membership
+    /// authority; `kill_all` is the only terminating operation and an empty
+    /// domain's removal must not disturb processes in other domains.
+    #[test]
+    fn process_domain_populated_kill_and_remove_are_separate_operations() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = restricted_to(workspace.path());
+        config.resources = ResourceLimits {
+            pids: Limit::Value(8),
+            ..ResourceLimits::default()
+        };
+        let sandbox = Sandbox::detect();
+        let make_domain = || {
+            match sandbox.create_process_domain(
+            config.resources,
+            delegated_cgroup_parent()
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new),
+        ) {
+                Ok(domain) => Some(domain),
+                Err(SandboxError::Unsupported { feature, reason }) => {
+                    eprintln!("skipping: {feature} unsupported here: {reason}");
+                    None
+                }
+                Err(error) => panic!("unexpected process-domain error: {error}"),
+            }
+        };
+        let Some(domain) = make_domain() else {
+            return;
+        };
+        let Some(other) = make_domain() else {
+            return;
+        };
+
+        let mut witness_command = CommandSpec::new("/bin/sleep");
+        witness_command = witness_command.arg("30");
+        let mut witness = match sandbox.spawn_in_process_domain(
+            witness_command,
+            config.clone(),
+            &other,
+        ) {
+            Ok(child) => child,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("unexpected witness spawn error: {error}"),
+        };
+
+        // An empty domain removes cleanly and does not touch other domains.
+        assert!(!domain.is_populated().expect("empty domain population"));
+        domain.remove_empty().expect("remove empty domain");
+        assert!(
+            other.is_populated().expect("witness domain population"),
+            "removing an empty domain must not disturb a populated sibling"
+        );
+
+        // The witness domain drains only through its own kill_all, and that
+        // kill reaches exactly this domain's members.
+        other.kill_all().expect("kill witness domain");
+        assert!(
+            other
+                .wait_until_empty(Duration::from_secs(2))
+                .expect("witness drain"),
+            "witness domain must drain after its own kill_all"
+        );
+        other.remove_empty().expect("remove drained witness domain");
+        let _ = witness.wait();
     }
 }
