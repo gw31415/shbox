@@ -545,11 +545,12 @@ enum FileIdentity {
     /// purpose: it still counts as a change against a cached inode, and the
     /// authoritative reason surfaces from the following full validation.
     Absent,
-    /// A statable directory entry: device, inode, status-change time, size.
+    /// A statable directory entry: device, inode, status-change time, mode, size.
     Inode {
         dev: u64,
         ino: u64,
         ctime_ns: i64,
+        mode: u32,
         size: u64,
     },
 }
@@ -768,6 +769,7 @@ fn observe_identity(path: &Path) -> FileIdentity {
             dev: metadata.dev(),
             ino: metadata.ino(),
             ctime_ns: metadata.ctime_nsec(),
+            mode: metadata.mode(),
             size: metadata.len(),
         },
         Err(_) => FileIdentity::Absent,
