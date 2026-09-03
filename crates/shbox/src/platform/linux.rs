@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
-    CommandSpec, ResourceDomain, Sandbox, SandboxConfig as EngineConfig, SandboxError,
+    CommandSpec, ProcessDomain, Sandbox, SandboxConfig as EngineConfig, SandboxError,
     SessionSetup, Stdio,
 };
 
@@ -38,7 +38,7 @@ const PROCESS_GROUP_SETTLE: Duration = Duration::from_secs(1);
 pub(crate) struct LinuxLauncher {
     policy: SandboxLaunchPolicy,
     engine: Sandbox,
-    resource_domains: Mutex<HashMap<SandboxId, Arc<ResourceDomain>>>,
+    resource_domains: Mutex<HashMap<SandboxId, Arc<ProcessDomain>>>,
 }
 
 impl fmt::Debug for LinuxLauncher {
@@ -132,7 +132,7 @@ impl LinuxLauncher {
         &self,
         sandbox_id: &SandboxId,
         config: &EngineConfig,
-    ) -> Result<Option<Arc<ResourceDomain>>, LaunchError> {
+    ) -> Result<Option<Arc<ProcessDomain>>, LaunchError> {
         if !config.resources.requires_cgroup() {
             return Ok(None);
         }
@@ -151,7 +151,7 @@ impl LinuxLauncher {
             .map(shbox_sandbox::CgroupParent::new);
         let domain = Arc::new(
             self.engine
-                .create_resource_domain(config.resources, parent)
+                .create_process_domain(config.resources, parent)
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
         );
         domains.insert(sandbox_id.clone(), Arc::clone(&domain));
@@ -231,7 +231,7 @@ impl ProcessLauncher for LinuxLauncher {
         let mut child = match resource_domain.as_deref() {
             Some(domain) => self
                 .engine
-                .spawn_in_resource_domain(command, config, domain),
+                .spawn_in_process_domain(command, config, domain),
             None => self.engine.spawn(command, config),
         }
         .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
@@ -620,7 +620,7 @@ mod tests {
             .map(shbox_sandbox::CgroupParent::new);
         match launcher
             .engine
-            .create_resource_domain(probe_config.resources, cgroup_parent)
+            .create_process_domain(probe_config.resources, cgroup_parent)
         {
             Ok(domain) => drop(domain),
             Err(SandboxError::Unsupported {
@@ -1041,7 +1041,9 @@ mod tests {
         let launched = launcher
             .launch(request(
                 workspace.path(),
-                "setsid sleep 30 >/dev/null 2>&1 & printf '%s' $! > detached-pid; exit 0",
+                "setsid sh -c 'printf ok > detached-ready; exec sleep 30' & B=$!; \
+                 until [ -f detached-ready ]; do sleep 0.01; done; \
+                 printf '%s' $B > detached-pid; exit 0",
                 false,
             ))
             .expect("launch");

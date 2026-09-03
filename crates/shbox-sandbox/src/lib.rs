@@ -80,7 +80,7 @@ pub use policy::{
 };
 
 #[cfg(target_os = "linux")]
-pub use linux::{ResourceDomain, syscall_number};
+pub use linux::{ProcessDomain, syscall_number};
 
 /// Which backend a [`Sandbox`] resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +132,7 @@ pub(crate) trait BackendChild: Send {
     /// Idempotent teardown: kill descendants, reap the direct child if
     /// possible, and release process-owned resource handles. A one-shot
     /// cgroup is removed when its final handle is released; a shared
-    /// [`ResourceDomain`] outlives individual children until its owner
+    /// [`ProcessDomain`] outlives individual children until its owner
     /// explicitly removes it.
     fn teardown(&mut self);
 }
@@ -334,22 +334,25 @@ impl Sandbox {
         &self.capabilities
     }
 
-    /// Create one Linux cgroup-backed resource domain for a durable sandbox.
+    /// Create one Linux cgroup-backed process domain for a durable sandbox.
     ///
-    /// Every child spawned through [`spawn_in_resource_domain`](Self::spawn_in_resource_domain)
-    /// shares the same aggregate limits. The caller owns the domain lifetime
-    /// separately from any individual child and should remove it only after
-    /// all sandbox processes have been cleaned up.
+    /// Every child spawned through [`spawn_in_process_domain`](Self::spawn_in_process_domain)
+    /// is born inside the domain's cgroup (`clone3(CLONE_INTO_CGROUP)`) and
+    /// shares the same aggregate limits. Limits may be entirely `Inherit`:
+    /// the domain still exists as the sandbox's process-containment boundary,
+    /// it just leaves every controller file at the parent's policy. The
+    /// caller owns the domain lifetime separately from any individual child
+    /// and should remove it only after all sandbox processes are gone.
     #[cfg(target_os = "linux")]
-    pub fn create_resource_domain(
+    pub fn create_process_domain(
         &self,
         resources: ResourceLimits,
         cgroup_parent: Option<CgroupParent>,
-    ) -> Result<ResourceDomain, SandboxError> {
+    ) -> Result<ProcessDomain, SandboxError> {
         validate::validate_resources(&resources)?;
         match &self.backend {
             Backend::Linux(backend) => {
-                backend.create_resource_domain(resources, cgroup_parent.as_ref())
+                backend.create_process_domain(resources, cgroup_parent.as_ref())
             }
             Backend::Unsupported => Err(SandboxError::unsupported(
                 "backend",
@@ -358,21 +361,21 @@ impl Sandbox {
         }
     }
 
-    /// Spawn a Linux child directly into an existing durable resource domain.
+    /// Spawn a Linux child directly into an existing durable process domain.
     ///
     /// The config's resource limits must exactly match the domain's limits.
     /// Child teardown releases only the child's reference; it does not remove
     /// the shared cgroup.
     #[cfg(target_os = "linux")]
-    pub fn spawn_in_resource_domain(
+    pub fn spawn_in_process_domain(
         &self,
         command: CommandSpec,
         config: SandboxConfig,
-        domain: &ResourceDomain,
+        domain: &ProcessDomain,
     ) -> Result<SandboxChild, SandboxError> {
         validate::validate(&config, &command)?;
         match &self.backend {
-            Backend::Linux(backend) => backend.spawn_in_resource_domain(command, config, domain),
+            Backend::Linux(backend) => backend.spawn_in_process_domain(command, config, domain),
             Backend::Unsupported => Err(SandboxError::unsupported(
                 "backend",
                 "no sandbox backend exists for this platform",

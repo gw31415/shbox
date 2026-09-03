@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
     CommandSpec, FilesystemPolicy, Limit, NetworkPolicy, PathRule, Sandbox, SandboxConfig,
-    SandboxError, SeccompAction, Stdio, Syscall, SyscallPolicy, SyscallRule,
+    SandboxError, SeccompAction, SessionSetup, Stdio, Syscall, SyscallPolicy, SyscallRule,
 };
 
 /// Run `/bin/sh -c <script>` under `config`, wait, and collect
@@ -74,7 +74,9 @@ fn system_execute_paths() -> Vec<PathRule> {
 }
 
 fn system_data_paths() -> Vec<PathRule> {
-    let candidates = ["/private/etc", "/etc", "/dev"];
+    // /proc is included so lifecycle tests can observe their own cgroup
+    // membership (`/proc/self/cgroup`) under the restricted fixture.
+    let candidates = ["/private/etc", "/etc", "/dev", "/proc"];
     existing_paths(&candidates)
 }
 
@@ -1057,8 +1059,94 @@ mod linux_only {
         );
     }
 
+    /// `plan-cgroup.md` M1: a process domain is the sandbox's containment
+    /// boundary first and its resource-limit carrier second. All-`Inherit`
+    /// limits must still yield a dedicated cgroup that children are born
+    /// into, and separate domains must never share it.
     #[test]
-    fn resource_domain_remove_is_retryable_and_child_exit_preserves_domain() {
+    fn process_domain_with_all_inherit_limits_contains_children() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = restricted_to(workspace.path());
+        assert!(
+            !config.resources.requires_cgroup(),
+            "fixture must be the all-Inherit case"
+        );
+        let sandbox = Sandbox::detect();
+        let mut domain = match sandbox.create_process_domain(config.resources, None) {
+            Ok(domain) => domain,
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                return;
+            }
+            Err(error) => panic!("all-Inherit process domain must be creatable: {error}"),
+        };
+        let mut other_domain = match sandbox.create_process_domain(config.resources, None) {
+            Ok(domain) => domain,
+            Err(error) => panic!("second process domain could not be created: {error}"),
+        };
+
+        let read_cgroup = |label: &str| {
+            let mut command = CommandSpec::new("/bin/sh");
+            command = command.arg("-c").arg("cat /proc/self/cgroup");
+            command.stdin = Stdio::Null;
+            command.stdout = Stdio::Pipe;
+            command.stderr = Stdio::Null;
+            let mut child =
+                match sandbox.spawn_in_process_domain(command, config.clone(), &domain) {
+                    Ok(child) => child,
+                    Err(SandboxError::Unsupported { feature, reason }) => {
+                        eprintln!("skipping: {feature} unsupported here: {reason}");
+                        return None;
+                    }
+                    Err(error) => panic!("unexpected {label} spawn error: {error}"),
+                };
+            let mut stdout = String::new();
+            if let Some(mut pipe) = child.take_stdout() {
+                pipe.read_to_string(&mut stdout).expect("read stdout");
+            }
+            let status = child.wait().expect("wait");
+            assert_eq!(status.code(), Some(0), "{label} stdout: {stdout}");
+            Some(stdout.trim().to_string())
+        };
+
+        let first = read_cgroup("first").expect("first cgroup reading");
+        assert!(
+            first.contains("sandbox-"),
+            "child must be born inside the dedicated cgroup: {first}"
+        );
+        let second = read_cgroup("second").expect("second cgroup reading");
+        assert_eq!(
+            first, second,
+            "every launch in one sandbox must share the same process domain"
+        );
+
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg("cat /proc/self/cgroup");
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Pipe;
+        command.stderr = Stdio::Null;
+        let mut independent = sandbox
+            .spawn_in_process_domain(command, config.clone(), &other_domain)
+            .expect("independent domain spawn");
+        let mut independent_stdout = String::new();
+        if let Some(mut pipe) = independent.take_stdout() {
+            pipe.read_to_string(&mut independent_stdout).expect("read");
+        }
+        assert_eq!(independent.wait().expect("wait").code(), Some(0));
+        let independent_cgroup = independent_stdout.trim();
+        assert_ne!(
+            first, independent_cgroup,
+            "different sandbox IDs must never share a process domain"
+        );
+
+        domain.remove().expect("remove first process domain");
+        other_domain
+            .remove()
+            .expect("remove independent process domain");
+    }
+
+    #[test]
+    fn process_domain_remove_is_retryable_and_child_exit_preserves_domain() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut config = restricted_to(workspace.path());
         config.resources = ResourceLimits {
@@ -1066,7 +1154,7 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_resource_domain(config.resources, None) {
+        let mut domain = match sandbox.create_process_domain(config.resources, None) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1078,7 +1166,7 @@ mod linux_only {
         let mut first_command = CommandSpec::new("/bin/sleep");
         first_command = first_command.arg("30");
         let mut first = sandbox
-            .spawn_in_resource_domain(first_command, config.clone(), &domain)
+            .spawn_in_process_domain(first_command, config.clone(), &domain)
             .expect("first domain spawn");
 
         let error = domain
@@ -1093,7 +1181,7 @@ mod linux_only {
         let _ = first.wait().expect("wait first child");
 
         let mut second = sandbox
-            .spawn_in_resource_domain(CommandSpec::new("/bin/true"), config, &domain)
+            .spawn_in_process_domain(CommandSpec::new("/bin/true"), config, &domain)
             .expect("resource domain must remain reusable after child cleanup");
         assert_eq!(second.wait().expect("wait second child").code(), Some(0));
         domain.remove().expect("remove idle resource domain");
@@ -1112,10 +1200,15 @@ mod linux_only {
         let mut command = CommandSpec::new("/bin/sh");
         command = command
             .arg("-c")
-            .arg("sleep 30 >/dev/null 2>&1 & printf '%s' $! > descendant.pid; exit 0");
+            .arg("sleep 30 & printf '%s' $! > descendant.pid; exit 0");
+        command.cwd = Some(workspace.path().to_path_buf());
         command.stdin = Stdio::Null;
         command.stdout = Stdio::Null;
         command.stderr = Stdio::Null;
+        // The launcher path always creates a session per launch; the engine
+        // contract must hold for that shape, where the owned process group
+        // exists and could be (wrongly) cleaned up on wait.
+        command.session = SessionSetup::NewSession;
         let mut child = sandbox.spawn(command, config).expect("spawn");
         let status = child.wait().expect("wait");
         assert_eq!(status.code(), Some(0));
@@ -1124,6 +1217,10 @@ mod linux_only {
             .trim()
             .parse()
             .expect("numeric descendant pid");
+        // A process-group kill lands within microseconds of `wait()`
+        // returning; letting that window pass makes "still alive" a settled
+        // fact rather than a race with signal delivery.
+        std::thread::sleep(Duration::from_millis(250));
         assert!(
             process_is_alive(pid),
             "background descendant {pid} must survive the direct child's normal exit"
@@ -1146,7 +1243,7 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_resource_domain(config.resources, None) {
+        let mut domain = match sandbox.create_process_domain(config.resources, None) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1155,13 +1252,19 @@ mod linux_only {
             Err(error) => panic!("unexpected resource-domain error: {error}"),
         };
         let mut command = CommandSpec::new("/bin/sh");
-        command = command.arg("-c").arg(
-            "setsid sleep 30 >/dev/null 2>&1 & printf '%s' $! > setsid.pid; exit 0",
-        );
+        command = command
+            .arg("-c")
+            .arg("setsid sh -c 'printf ok > setsid-ready; exec sleep 30' & B=$!; until [ -f setsid-ready ]; do sleep 0.01; done; printf '%s' $B > setsid.pid; exit 0");
+        command.cwd = Some(workspace.path().to_path_buf());
+        command.env = vec![(
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from("/bin:/usr/bin"),
+        )];
         command.stdin = Stdio::Null;
         command.stdout = Stdio::Null;
         command.stderr = Stdio::Null;
-        let mut child = match sandbox.spawn_in_resource_domain(command, config.clone(), &domain) {
+        command.session = SessionSetup::NewSession;
+        let mut child = match sandbox.spawn_in_process_domain(command, config.clone(), &domain) {
             Ok(child) => child,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1175,6 +1278,10 @@ mod linux_only {
             .trim()
             .parse()
             .expect("numeric setsid pid");
+        // The readiness marker is written from inside the new session, so
+        // the descendant's `setsid()` is complete before the shell exits and
+        // the survival assertion cannot race session establishment.
+        std::thread::sleep(Duration::from_millis(250));
         assert!(
             process_is_alive(pid),
             "setsid descendant {pid} must survive the direct child's normal exit"
@@ -1202,7 +1309,7 @@ mod linux_only {
     }
 
     #[test]
-    fn resource_domain_pids_limit_is_shared_across_spawns() {
+    fn process_domain_pids_limit_is_shared_across_spawns() {
         if !landlock_ready() {
             eprintln!("skipping: kernel has no Landlock");
             return;
@@ -1214,7 +1321,7 @@ mod linux_only {
             ..ResourceLimits::default()
         };
         let sandbox = Sandbox::detect();
-        let mut domain = match sandbox.create_resource_domain(config.resources, None) {
+        let mut domain = match sandbox.create_process_domain(config.resources, None) {
             Ok(domain) => domain,
             Err(SandboxError::Unsupported { feature, reason }) => {
                 eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1222,7 +1329,7 @@ mod linux_only {
             }
             Err(error) => panic!("unexpected resource-domain error: {error}"),
         };
-        let mut other_domain = match sandbox.create_resource_domain(config.resources, None) {
+        let mut other_domain = match sandbox.create_process_domain(config.resources, None) {
             Ok(domain) => domain,
             Err(error) => panic!("second resource domain could not be created: {error}"),
         };
@@ -1230,7 +1337,7 @@ mod linux_only {
         let mut first_command = CommandSpec::new("/bin/sleep");
         first_command = first_command.arg("30");
         let mut first =
-            match sandbox.spawn_in_resource_domain(first_command, config.clone(), &domain) {
+            match sandbox.spawn_in_process_domain(first_command, config.clone(), &domain) {
                 Ok(child) => child,
                 Err(SandboxError::Unsupported { feature, reason }) => {
                     eprintln!("skipping: {feature} unsupported here: {reason}");
@@ -1239,7 +1346,7 @@ mod linux_only {
                 Err(error) => panic!("unexpected first spawn error: {error}"),
             };
 
-        let same_domain = sandbox.spawn_in_resource_domain(
+        let same_domain = sandbox.spawn_in_process_domain(
             CommandSpec::new("/bin/true"),
             config.clone(),
             &domain,
@@ -1250,7 +1357,7 @@ mod linux_only {
         );
 
         let mut independent = sandbox
-            .spawn_in_resource_domain(CommandSpec::new("/bin/true"), config.clone(), &other_domain)
+            .spawn_in_process_domain(CommandSpec::new("/bin/true"), config.clone(), &other_domain)
             .expect("a different resource domain must have an independent pids budget");
         assert_eq!(
             independent.wait().expect("wait independent child").code(),
@@ -1260,7 +1367,7 @@ mod linux_only {
         first.signal(libc::SIGKILL).expect("kill first child");
         let _ = first.wait().expect("wait first child");
         let mut reused = sandbox
-            .spawn_in_resource_domain(CommandSpec::new("/bin/true"), config, &domain)
+            .spawn_in_process_domain(CommandSpec::new("/bin/true"), config, &domain)
             .expect("the same resource domain must be reusable after its child exits");
         assert_eq!(reused.wait().expect("wait reused child").code(), Some(0));
 

@@ -111,18 +111,20 @@ pub struct LinuxBackend {
     landlock_abi: Option<u32>,
 }
 
-/// A durable Linux resource domain shared by every process in one sandbox.
+/// A durable Linux process domain shared by every process in one sandbox.
 ///
-/// The domain owns one configured cgroup v2 directory. Spawned children hold
-/// references to that cgroup so a process teardown never removes limits that
-/// still belong to the durable sandbox. Removing the domain is a separate
-/// lifecycle operation performed after all sandbox processes are gone.
-pub struct ResourceDomain {
+/// The domain owns one configured cgroup v2 directory: the authoritative
+/// process-ownership boundary for the sandbox. Spawned children hold
+/// references to that cgroup so a process teardown never removes containment
+/// that still belongs to the durable sandbox. Resource limits are optional
+/// dressing on the same cgroup; removing the domain is a separate lifecycle
+/// operation performed after all sandbox processes are gone.
+pub struct ProcessDomain {
     cgroup: Arc<Cgroup>,
     resources: ResourceLimits,
 }
 
-impl std::fmt::Debug for ResourceDomain {
+impl std::fmt::Debug for ProcessDomain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourceDomain")
             .field("resources", &self.resources)
@@ -130,7 +132,7 @@ impl std::fmt::Debug for ResourceDomain {
     }
 }
 
-impl ResourceDomain {
+impl ProcessDomain {
     /// Whether a spawned child still holds this domain's cgroup open.
     pub fn is_in_use(&self) -> bool {
         Arc::strong_count(&self.cgroup) > 1
@@ -172,18 +174,15 @@ impl LinuxBackend {
         self.spawn_with_cgroup(command, config, sandbox_cgroup)
     }
 
-    pub(crate) fn create_resource_domain(
+    pub(crate) fn create_process_domain(
         &self,
         resources: ResourceLimits,
         explicit_parent: Option<&CgroupParent>,
-    ) -> Result<ResourceDomain, SandboxError> {
-        if !resources.requires_cgroup() {
-            return Err(SandboxError::invalid(
-                "resources",
-                "resource domain requires at least one explicit cgroup-backed limit",
-            ));
-        }
-        Ok(ResourceDomain {
+    ) -> Result<ProcessDomain, SandboxError> {
+        // All-`Inherit` limits are valid: the domain still owns one cgroup
+        // for process containment, it simply leaves every controller file
+        // at the creation parent's policy.
+        Ok(ProcessDomain {
             cgroup: Arc::new(create_sandbox_cgroup(
                 &resources,
                 explicit_parent,
@@ -193,11 +192,11 @@ impl LinuxBackend {
         })
     }
 
-    pub(crate) fn spawn_in_resource_domain(
+    pub(crate) fn spawn_in_process_domain(
         &self,
         command: CommandSpec,
         config: SandboxConfig,
-        domain: &ResourceDomain,
+        domain: &ProcessDomain,
     ) -> Result<SandboxChild, SandboxError> {
         if config.resources != domain.resources {
             return Err(SandboxError::invalid(
