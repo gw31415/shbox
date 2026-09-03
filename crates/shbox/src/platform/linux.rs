@@ -39,7 +39,7 @@ const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct LinuxLauncher {
     policy: SandboxLaunchPolicy,
     engine: Sandbox,
-    resource_domains: Mutex<HashMap<SandboxId, Arc<ProcessDomain>>>,
+    process_domains: Mutex<HashMap<SandboxId, Arc<ProcessDomain>>>,
 }
 
 impl fmt::Debug for LinuxLauncher {
@@ -48,9 +48,9 @@ impl fmt::Debug for LinuxLauncher {
             .field("policy", &self.policy)
             .field("capabilities", self.engine.capabilities())
             .field(
-                "resource_domains",
+                "process_domains",
                 &self
-                    .resource_domains
+                    .process_domains
                     .lock()
                     .map(|domains| domains.len())
                     .unwrap_or_default(),
@@ -82,17 +82,19 @@ impl LinuxLauncher {
             ));
         }
 
-        if let Some(root) = &capabilities.cgroup_v2_root {
-            tracing::info!(
-                cgroup_v2_root = %root.display(),
-                "sandbox engine detected a cgroup v2 hierarchy"
-            );
-        } else if policy.resources().wants_cgroup() {
+        // The sandbox cgroup is the mandatory process-ownership boundary
+        // (docs/lifecycle.md §1): without a cgroup v2 hierarchy there is no
+        // reliable containment, so launches fail closed.
+        let Some(root) = &capabilities.cgroup_v2_root else {
             return Err(LaunchError::new(
-                "sandbox process adapter unavailable: resource limits are configured \
-                 but no cgroup v2 hierarchy is usable",
+                "sandbox process adapter unavailable: process containment requires \
+                 a cgroup v2 hierarchy",
             ));
-        }
+        };
+        tracing::info!(
+            cgroup_v2_root = %root.display(),
+            "sandbox engine detected a cgroup v2 hierarchy"
+        );
 
         tracing::info!(
             kernel_release = %kernel_release(),
@@ -103,7 +105,7 @@ impl LinuxLauncher {
         Ok(Self {
             policy,
             engine,
-            resource_domains: Mutex::new(HashMap::new()),
+            process_domains: Mutex::new(HashMap::new()),
         })
     }
 
@@ -129,21 +131,44 @@ impl LinuxLauncher {
         Ok(command)
     }
 
-    fn resource_domain(
+    /// The per-sandbox process domain: one cgroup for every launch of one
+    /// durable sandbox ID, created lazily on first launch and shared by all
+    /// subsequent launches. The domain outlives individual launches; only
+    /// `release_sandbox_resources` removes it.
+    /// Whether this host can currently provide the mandatory per-sandbox
+    /// process domain. Test seams use this to self-skip on hosts without a
+    /// delegated cgroup v2 parent, mirroring the engine's contract.
+    #[cfg(test)]
+    pub(crate) fn process_domain_ready(&self, workspace: &Path) -> bool {
+        let config = self.policy.engine_config(workspace, workspace);
+        let parent = config
+            .cgroup_parent
+            .as_deref()
+            .map(shbox_sandbox::CgroupParent::new);
+        match self.engine.create_process_domain(config.resources, parent) {
+            Ok(domain) => {
+                let _ = domain.remove_empty();
+                true
+            }
+            Err(SandboxError::Unsupported { feature, reason }) => {
+                eprintln!("skipping: {feature} unsupported here: {reason}");
+                false
+            }
+            Err(error) => panic!("unexpected process-domain probe error: {error}"),
+        }
+    }
+
+    fn process_domain(
         &self,
         sandbox_id: &SandboxId,
         config: &EngineConfig,
-    ) -> Result<Option<Arc<ProcessDomain>>, LaunchError> {
-        if !config.resources.requires_cgroup() {
-            return Ok(None);
-        }
-
+    ) -> Result<Arc<ProcessDomain>, LaunchError> {
         let mut domains = self
-            .resource_domains
+            .process_domains
             .lock()
-            .map_err(|_| LaunchError::new("sandbox resource registry is unavailable"))?;
+            .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
         if let Some(domain) = domains.get(sandbox_id) {
-            return Ok(Some(Arc::clone(domain)));
+            return Ok(Arc::clone(domain));
         }
 
         let parent = config
@@ -156,7 +181,7 @@ impl LinuxLauncher {
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
         );
         domains.insert(sandbox_id.clone(), Arc::clone(&domain));
-        Ok(Some(domain))
+        Ok(domain)
     }
 }
 
@@ -173,7 +198,7 @@ impl ProcessLauncher for LinuxLauncher {
         let launch_temp_path = fs::canonicalize(launch_temp.path())
             .map_err(|_| LaunchError::new("sandbox launch temp directory became unavailable"))?;
         let config: EngineConfig = self.policy.engine_config(&workspace, &launch_temp_path);
-        let resource_domain = self.resource_domain(&request.sandbox_id, &config)?;
+        let process_domain = self.process_domain(&request.sandbox_id, &config)?;
 
         let mut command = self.command_spec(&request, &workspace)?;
         command.env = self
@@ -229,13 +254,12 @@ impl ProcessLauncher for LinuxLauncher {
 
         // The engine returns only after exec is confirmed with every
         // confinement mechanism in place; failures already cleaned up.
-        let mut child = match resource_domain.as_deref() {
-            Some(domain) => self
-                .engine
-                .spawn_in_process_domain(command, config, domain),
-            None => self.engine.spawn(command, config),
-        }
-        .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
+        // Every launch joins the sandbox's shared process domain: limits or
+        // no limits, containment is not optional.
+        let mut child = self
+            .engine
+            .spawn_in_process_domain(command, config, &process_domain)
+            .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
         // `None` would mean the child was already reaped — a pid of 0 must
         // never reach the group-signaling control (`kill(0, ..)` would
         // signal the daemon's own process group).
@@ -297,7 +321,7 @@ impl ProcessLauncher for LinuxLauncher {
 
     fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
         let mut domains = self
-            .resource_domains
+            .process_domains
             .lock()
             .map_err(|_| LaunchError::new("sandbox resource registry is unavailable"))?;
         let Some(domain) = domains.remove(sandbox_id) else {
@@ -574,6 +598,15 @@ mod tests {
         request_for("linux-test", workspace, command, pty)
     }
 
+    /// Whether this host can currently provide the launcher's mandatory
+    /// per-sandbox process domain. Every launch joins one cgroup (plan M4),
+    /// so on hosts without a delegated cgroup v2 parent the launcher-level
+    /// tests self-skip with the engine's diagnostic — the same contract as
+    /// the engine integration tests.
+    fn process_domain_available(launcher: &LinuxLauncher, workspace: &Path) -> bool {
+        launcher.process_domain_ready(workspace)
+    }
+
     fn request_for(sandbox_id: &str, workspace: &Path, command: &str, pty: bool) -> LaunchRequest {
         LaunchRequest {
             sandbox_id: sandbox_id.parse().expect("sandbox id"),
@@ -607,29 +640,10 @@ mod tests {
 
         // The native platform gate intentionally does not require cgroup
         // delegation. Resource limits still fail closed in production, but
-        // this limit-specific test should self-skip when the host cannot
-        // provide a writable cgroup v2 parent, matching the engine-level
-        // integration tests.
-        let probe_config = launcher
-            .policy
-            .engine_config(first_workspace.path(), root.path());
-        let cgroup_parent = probe_config
-            .cgroup_parent
-            .as_deref()
-            .map(shbox_sandbox::CgroupParent::new);
-        match launcher
-            .engine
-            .create_process_domain(probe_config.resources, cgroup_parent)
-        {
-            Ok(domain) => drop(domain),
-            Err(SandboxError::Unsupported {
-                feature: feature @ ("cgroup-v2" | "clone3-into-cgroup"),
-                reason,
-            }) => {
-                eprintln!("skipping: {feature} unsupported here: {reason}");
-                return;
-            }
-            Err(error) => panic!("unexpected resource-domain probe error: {error}"),
+        // this limit-specific test self-skips when the host cannot provide a
+        // writable cgroup v2 parent, matching the engine-level tests.
+        if !process_domain_available(&launcher, first_workspace.path()) {
+            return;
         }
 
         let first = launcher
@@ -737,6 +751,214 @@ mod tests {
         assert_eq!(status.code(), Some(0), "probe did not confine reads");
     }
 
+    /// Plan M4: every launch of one sandbox joins the same process domain —
+    /// limits or no limits — and the domain survives individual launches
+    /// exiting; different sandbox IDs never share it.
+    #[tokio::test]
+    async fn launches_without_limits_share_one_domain_per_sandbox() {
+        use tokio::io::AsyncReadExt;
+
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        // /proc is readable so the probe command can observe its own cgroup.
+        let policy = SandboxLaunchPolicy::from_parts(
+            "/bin/sh".into(),
+            NetworkMode::Disabled,
+            vec!["/proc".into()],
+            BTreeMap::new(),
+            root.path().into(),
+            crate::config::SandboxResources::default(),
+            std::env::var_os("SHBOX_SANDBOX_TEST_CGROUP_PARENT").map(std::path::PathBuf::from),
+        );
+        let launcher = LinuxLauncher::new(policy).expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+
+        let mut first = launcher
+            .launch(request(workspace.path(), "cat /proc/self/cgroup", false))
+            .expect("first launch");
+        drop(first.stdin.take());
+        let mut first_cgroup = String::new();
+        first
+            .stdout
+            .take()
+            .expect("first stdout")
+            .read_to_string(&mut first_cgroup)
+            .await
+            .expect("read first cgroup");
+        assert_eq!(
+            first.wait.await.expect("first wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        assert!(
+            first_cgroup.contains("sandbox-"),
+            "launch must join a dedicated cgroup even without limits: {first_cgroup}"
+        );
+
+        // The domain outlives the launch that created it.
+        let mut second = launcher
+            .launch(request(workspace.path(), "cat /proc/self/cgroup", false))
+            .expect("second launch");
+        drop(second.stdin.take());
+        let mut second_cgroup = String::new();
+        second
+            .stdout
+            .take()
+            .expect("second stdout")
+            .read_to_string(&mut second_cgroup)
+            .await
+            .expect("read second cgroup");
+        assert_eq!(
+            second.wait.await.expect("second wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        assert_eq!(
+            first_cgroup, second_cgroup,
+            "every launch of one sandbox must share one process domain"
+        );
+
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+        let mut other = launcher
+            .launch(request_for(
+                "other-sandbox",
+                other_workspace.path(),
+                "cat /proc/self/cgroup",
+                false,
+            ))
+            .expect("other sandbox launch");
+        drop(other.stdin.take());
+        let mut other_cgroup = String::new();
+        other
+            .stdout
+            .take()
+            .expect("other stdout")
+            .read_to_string(&mut other_cgroup)
+            .await
+            .expect("read other cgroup");
+        assert_eq!(
+            other.wait.await.expect("other wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        assert_ne!(
+            first_cgroup, other_cgroup,
+            "different sandbox IDs must use separate process domains"
+        );
+
+        launcher
+            .release_sandbox_resources(&"linux-test".parse().expect("sandbox id"))
+            .expect("release first domain");
+        launcher
+            .release_sandbox_resources(&"other-sandbox".parse().expect("sandbox id"))
+            .expect("release other domain");
+    }
+
+    /// `docs/lifecycle.md` §2.1: a normally-exiting shell must not terminate
+    /// the background process it started.
+    #[tokio::test]
+    async fn background_process_survives_shell_exit() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                "sleep 30 >/dev/null 2>&1 & printf '%s' $! > background-pid; exit 0",
+                false,
+            ))
+            .expect("launch");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("background-pid"))
+            .expect("background pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(
+            process_alive(pid),
+            "background process {pid} must survive the shell's normal exit"
+        );
+        // Test cleanup: the contract under test leaves this process running,
+        // so the test itself owns its disposal.
+        kill_test_process(pid);
+    }
+
+    /// `docs/lifecycle.md` §2.4: releasing a sandbox's resources (the
+    /// launcher seam under sandbox delete) must remove every sandbox process,
+    /// including a `setsid()` descendant no process group signal can reach.
+    #[tokio::test]
+    async fn sandbox_release_kills_detached_descendants() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+            .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+        let launched = launcher
+            .launch(request(
+                workspace.path(),
+                "setsid sh -c 'printf ok > detached-ready; exec sleep 30' & B=$!; \
+                 until [ -f detached-ready ]; do sleep 0.01; done; \
+                 printf '%s' $B > detached-pid; exit 0",
+                false,
+            ))
+            .expect("launch");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        let pid: libc::pid_t = fs::read_to_string(workspace.path().join("detached-pid"))
+            .expect("detached pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(process_alive(pid), "detached process must start alive");
+        launcher
+            .release_sandbox_resources(&"linux-test".parse().expect("sandbox id"))
+            .expect("release sandbox resources");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_alive(pid),
+            "sandbox release must kill the detached descendant {pid}"
+        );
+    }
+
+    /// Whether `pid` exists and is not a zombie.
+    fn process_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal zero performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rfind(')')
+                        .and_then(|end| stat.as_bytes().get(end + 2).copied())
+                })
+                .is_none_or(|state| state != b'Z')
+        } else {
+            false
+        }
+    }
+
+    /// Direct test-side disposal of a process the lifecycle contract
+    /// deliberately leaves running.
+    fn kill_test_process(pid: libc::pid_t) {
+        // SAFETY: signal delivery to a process the test spawned.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
     #[tokio::test]
     async fn non_pty_launch_keeps_streams_separate_and_confines_filesystem() {
         let root = tempfile::tempdir().expect("runtime root");
@@ -757,6 +979,9 @@ mod tests {
         );
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let mut launched = launcher
             .launch(request(workspace.path(), &command, false))
             .expect("launch");
@@ -795,6 +1020,9 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let command = "test -t 0 && test -t 1 && test -t 2 && printf 'PTY_OK '; stty size; stty -a | grep -q -- '-echo'";
         let mut launched = launcher
             .launch(request(workspace.path(), command, true))
@@ -823,6 +1051,9 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let launched = launcher
             .launch(request(workspace.path(), "sleep 30", false))
             .expect("launch");
@@ -848,6 +1079,9 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let command = "trap 'printf signaled > signal; exit 0' USR1; printf ready > ready; while :; do sleep 1; done";
         let launched = launcher
             .launch(request(workspace.path(), command, false))
@@ -879,6 +1113,9 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let launched = launcher
             .launch(request(
                 workspace.path(),
@@ -907,6 +1144,9 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         // Landlock's network rules mediate bind/connect, not socket creation.
         // A real listener makes this red if confinement is absent: the
         // connection would otherwise succeed immediately on loopback.
@@ -932,6 +1172,9 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Outbound))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let command = format!(
             "python3 -c 'import socket; s=socket.socket(); s.connect((\"127.0.0.1\", {port}))'"
         );
@@ -965,6 +1208,9 @@ mod tests {
         };
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let mut launched = launcher.launch(request).expect("launch");
         drop(launched.stdin.take());
         let mut output = Vec::new();
@@ -999,6 +1245,9 @@ mod tests {
         };
         let launcher = LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
             .expect("linux launcher");
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
         let mut launched = launcher.launch(request).expect("launch");
         let mut stdin = launched.stdin.take().expect("stdin");
         stdin

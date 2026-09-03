@@ -253,11 +253,6 @@ impl SandboxLaunchPolicy {
         self.network
     }
 
-    /// The operator-configured per-sandbox resource limits.
-    pub(crate) fn resources(&self) -> &crate::config::SandboxResources {
-        &self.resources
-    }
-
     /// The operator-specified cgroup v2 creation parent, if any.
     #[cfg(target_os = "linux")]
     pub(crate) fn cgroup_parent(&self) -> Option<&Path> {

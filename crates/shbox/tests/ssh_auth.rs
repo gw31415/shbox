@@ -912,7 +912,31 @@ fn run_ssh_command(
 /// Linux and macOS have a native production sandbox launcher. Unsupported
 /// targets retain the fail-closed path used by generic protocol tests.
 fn native_sandbox_supported() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    if cfg!(target_os = "linux") {
+        linux_process_domain_supported()
+    } else {
+        cfg!(target_os = "macos")
+    }
+}
+
+/// Every sandbox launch joins a mandatory per-sandbox cgroup (plan M4), so
+/// a Linux host without a usable delegated cgroup v2 parent cannot run the
+/// native-launch acceptance path. Probe with the engine's own discovery.
+#[cfg(target_os = "linux")]
+fn linux_process_domain_supported() -> bool {
+    match shbox_sandbox::Sandbox::detect().create_process_domain(
+        shbox_sandbox::ResourceLimits::default(),
+        None,
+    ) {
+        Ok(domain) => {
+            let _ = domain.remove_empty();
+            true
+        }
+        Err(error) => {
+            eprintln!("skipping native sandbox acceptance: {error}");
+            false
+        }
+    }
 }
 
 /// Blocking real-platform sandbox/PTTY acceptance is explicit. Platform gate

@@ -1719,10 +1719,14 @@ mod tests {
             crate::config::SandboxResources::default(),
             None,
         );
-        let launcher = LinuxLauncher::new(policy).expect("linux launcher");
-        let manager =
-            SandboxManager::open_with_launcher(&paths, Caps::default(), Arc::new(launcher))
-                .expect("manager");
+        let launcher = Arc::new(LinuxLauncher::new(policy).expect("linux launcher"));
+        // Every launch joins a mandatory process domain (plan M4); without
+        // a delegated cgroup parent the real-launch assertion self-skips.
+        if !launcher.process_domain_ready(paths.runtime_dir()) {
+            return;
+        }
+        let manager = SandboxManager::open_with_launcher(&paths, Caps::default(), launcher)
+            .expect("manager");
         let owner = principal('A', Role::Normal);
         let id = SandboxId::parse("dev").expect("id");
         let handle = manager.claim(&owner, &id).expect("claim");

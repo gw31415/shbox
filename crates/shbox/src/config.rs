@@ -212,16 +212,7 @@ pub struct SandboxResources {
     pub cpu_period_micros: Option<u64>,
 }
 
-impl SandboxResources {
-    /// Whether any limit asks for a dedicated per-sandbox cgroup.
-    #[cfg(target_os = "linux")]
-    pub fn wants_cgroup(&self) -> bool {
-        self.memory_bytes.is_some()
-            || self.swap_bytes.is_some()
-            || self.pids.is_some()
-            || self.cpu_quota_micros.is_some()
-    }
-}
+impl SandboxResources {}
 
 fn validate_resources(sandbox: &RawSandbox) -> Result<SandboxResources, Error> {
     let reject = |field: &'static str, why: String| -> Error {
