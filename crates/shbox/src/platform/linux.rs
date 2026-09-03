@@ -34,12 +34,94 @@ use crate::sandbox::SandboxId;
 /// Deadline for a killed process domain to report `populated 0`.
 const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+
+/// One sandbox's runtime-domain state (plan M5).
+///
+/// ```text
+/// Idle (absent)  -- first launch -->  Active  -- populated=0 && in_flight=0 -->  Idle
+/// Active/Idle    -- delete -->        Deleting  -- reject launches, wait in-flight,
+///                                             kill/remove the domain, then gone
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DomainPhase {
+    /// No domain exists; the slot is absent from the registry.
+    #[default]
+    Idle,
+    /// A domain exists and launches may join it.
+    Active,
+    /// Removal is in progress; launches are rejected.
+    Deleting,
+}
+
+/// The registry entry behind [`DomainPhase::Active`].
+#[derive(Debug, Default)]
+struct DomainSlot {
+    phase: DomainPhase,
+    /// Bumped each time a domain is removed; names the runtime generation.
+    generation: u64,
+    /// Launches between "domain acquired" and "waiter finished".
+    in_flight: usize,
+    domain: Option<Arc<ProcessDomain>>,
+}
+
+/// Shared per-sandbox domain registry: the state machine guarding the
+/// launch / empty-cleanup / delete races.
+#[derive(Debug, Default)]
+struct DomainRegistry {
+    slots: Mutex<HashMap<SandboxId, DomainSlot>>,
+    changed: Condvar,
+}
+
+impl DomainRegistry {
+    /// A launch's in-flight accounting handle. Dropping it decrements the
+    /// count and performs the empty-cleanup transition when the domain has
+    /// drained.
+    fn launch_finished(&self, sandbox_id: &SandboxId) {
+        let Ok(mut slots) = self.slots.lock() else {
+            return;
+        };
+        let Some(slot) = slots.get_mut(sandbox_id) else {
+            return;
+        };
+        slot.in_flight = slot.in_flight.saturating_sub(1);
+        // Empty cleanup is only allowed when everything agrees the domain is
+        // unused: no in-flight launch (this lock serializes new launches'
+        // increments), no member processes (so nothing can fork into it),
+        // and the slot is still Active — not mid-deletion.
+        if slot.phase == DomainPhase::Active
+            && slot.in_flight == 0
+            && slot
+                .domain
+                .as_ref()
+                .is_some_and(|domain| !domain.is_populated().unwrap_or(true))
+            && let Some(domain) = slot.domain.take()
+            && domain.remove_empty().is_ok()
+        {
+            slot.generation += 1;
+            slots.remove(sandbox_id);
+        }
+        self.changed.notify_all();
+    }
+}
+
+/// Owned in-flight registration for one launch against its sandbox domain.
+struct DomainLease {
+    registry: Arc<DomainRegistry>,
+    sandbox_id: SandboxId,
+}
+
+impl Drop for DomainLease {
+    fn drop(&mut self) {
+        self.registry.launch_finished(&self.sandbox_id);
+    }
+}
+
 /// Linux launcher backed by the detected engine capabilities and the
 /// process-lifetime shbox policy snapshot.
 pub(crate) struct LinuxLauncher {
     policy: SandboxLaunchPolicy,
     engine: Sandbox,
-    process_domains: Mutex<HashMap<SandboxId, Arc<ProcessDomain>>>,
+    registry: Arc<DomainRegistry>,
 }
 
 impl fmt::Debug for LinuxLauncher {
@@ -50,9 +132,10 @@ impl fmt::Debug for LinuxLauncher {
             .field(
                 "process_domains",
                 &self
-                    .process_domains
+                    .registry
+                    .slots
                     .lock()
-                    .map(|domains| domains.len())
+                    .map(|slots| slots.len())
                     .unwrap_or_default(),
             )
             .finish()
@@ -105,7 +188,7 @@ impl LinuxLauncher {
         Ok(Self {
             policy,
             engine,
-            process_domains: Mutex::new(HashMap::new()),
+            registry: Arc::new(DomainRegistry::default()),
         })
     }
 
@@ -131,10 +214,6 @@ impl LinuxLauncher {
         Ok(command)
     }
 
-    /// The per-sandbox process domain: one cgroup for every launch of one
-    /// durable sandbox ID, created lazily on first launch and shared by all
-    /// subsequent launches. The domain outlives individual launches; only
-    /// `release_sandbox_resources` removes it.
     /// Whether this host can currently provide the mandatory per-sandbox
     /// process domain. Test seams use this to self-skip on hosts without a
     /// delegated cgroup v2 parent, mirroring the engine's contract.
@@ -158,30 +237,46 @@ impl LinuxLauncher {
         }
     }
 
+    /// Join (or lazily create) the sandbox's process domain and register one
+    /// in-flight launch against it. The returned lease decrements the
+    /// in-flight count on drop, so every exit path — success, failure, or a
+    /// panicking waiter — keeps the registry exact.
     fn process_domain(
         &self,
         sandbox_id: &SandboxId,
         config: &EngineConfig,
-    ) -> Result<Arc<ProcessDomain>, LaunchError> {
-        let mut domains = self
-            .process_domains
+    ) -> Result<(Arc<ProcessDomain>, DomainLease), LaunchError> {
+        let mut slots = self
+            .registry
+            .slots
             .lock()
             .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
-        if let Some(domain) = domains.get(sandbox_id) {
-            return Ok(Arc::clone(domain));
+        let slot = slots.entry(sandbox_id.clone()).or_default();
+        if slot.phase == DomainPhase::Deleting {
+            return Err(LaunchError::new(
+                "sandbox process domain is being deleted; new launches are rejected",
+            ));
         }
-
-        let parent = config
-            .cgroup_parent
-            .as_deref()
-            .map(shbox_sandbox::CgroupParent::new);
-        let domain = Arc::new(
-            self.engine
-                .create_process_domain(config.resources, parent)
-                .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
-        );
-        domains.insert(sandbox_id.clone(), Arc::clone(&domain));
-        Ok(domain)
+        if slot.domain.is_none() {
+            let parent = config
+                .cgroup_parent
+                .as_deref()
+                .map(shbox_sandbox::CgroupParent::new);
+            let domain = Arc::new(
+                self.engine
+                    .create_process_domain(config.resources, parent)
+                    .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
+            );
+            slot.domain = Some(domain);
+            slot.phase = DomainPhase::Active;
+        }
+        slot.in_flight += 1;
+        let domain = Arc::clone(slot.domain.as_ref().expect("domain just ensured"));
+        let lease = DomainLease {
+            registry: Arc::clone(&self.registry),
+            sandbox_id: sandbox_id.clone(),
+        };
+        Ok((domain, lease))
     }
 }
 
@@ -198,7 +293,7 @@ impl ProcessLauncher for LinuxLauncher {
         let launch_temp_path = fs::canonicalize(launch_temp.path())
             .map_err(|_| LaunchError::new("sandbox launch temp directory became unavailable"))?;
         let config: EngineConfig = self.policy.engine_config(&workspace, &launch_temp_path);
-        let process_domain = self.process_domain(&request.sandbox_id, &config)?;
+        let (process_domain, domain_lease) = self.process_domain(&request.sandbox_id, &config)?;
 
         let mut command = self.command_spec(&request, &workspace)?;
         command.env = self
@@ -300,7 +395,9 @@ impl ProcessLauncher for LinuxLauncher {
         let wait_control = Arc::clone(&control);
         let spawn_result = std::thread::Builder::new()
             .name("shbox-linux-sandbox-wait".to_string())
-            .spawn(move || wait_process(child, wait_control, launch_temp, wait_tx));
+            .spawn(move || {
+                wait_process(child, wait_control, launch_temp, wait_tx, domain_lease)
+            });
         if spawn_result.is_err() {
             control.force_terminate();
             control.mark_cleanup_complete();
@@ -320,19 +417,71 @@ impl ProcessLauncher for LinuxLauncher {
     }
 
     fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
-        let mut domains = self
-            .process_domains
-            .lock()
-            .map_err(|_| LaunchError::new("sandbox resource registry is unavailable"))?;
-        let Some(domain) = domains.remove(sandbox_id) else {
-            return Ok(());
+        // Deleting transition: reject new launches first, then wait out the
+        // in-flight barrier before touching the cgroup (plan M5).
+        let domain = {
+            let mut slots = self
+                .registry
+                .slots
+                .lock()
+                .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
+            match slots.get_mut(sandbox_id) {
+                None => return Ok(()),
+                Some(slot) if slot.phase == DomainPhase::Deleting => {
+                    return Err(LaunchError::new(
+                        "sandbox process domain deletion is already in progress",
+                    ));
+                }
+                Some(slot) => {
+                    slot.phase = DomainPhase::Deleting;
+                    // Kill every member now: still-running launches keep an
+                    // in-flight waiter that only finishes once its process
+                    // dies, so the barrier below could never drain otherwise.
+                    // Graceful termination already happened above this seam
+                    // (the manager's TERM pass); this is the hard boundary.
+                    if let Some(domain) = slot.domain.as_ref() {
+                        let _ = domain.kill_all();
+                    }
+                }
+            }
+            let deadline = Instant::now() + DOMAIN_TEARDOWN_TIMEOUT;
+            loop {
+                let in_flight = slots
+                    .get(sandbox_id)
+                    .map_or(0, |slot| slot.in_flight);
+                if in_flight == 0 {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let Ok((guard, timeout)) =
+                    self.registry.changed.wait_timeout(slots, remaining)
+                else {
+                    return Err(LaunchError::new(
+                        "sandbox process registry is unavailable",
+                    ));
+                };
+                slots = guard;
+                if timeout.timed_out() {
+                    if let Some(slot) = slots.get_mut(sandbox_id) {
+                        slot.phase = DomainPhase::Active;
+                    }
+                    return Err(LaunchError::new(
+                        "sandbox launch barrier did not drain before deletion",
+                    ));
+                }
+            }
+            slots
+                .get_mut(sandbox_id)
+                .and_then(|slot| slot.domain.take())
         };
-        // Cgroup-authoritative teardown: kill every member (including
-        // detached `setsid()`/double-fork descendants no process group can
-        // reach), wait for the kernel to agree the domain is empty, then
-        // remove the directory. Each failure re-inserts the domain so the
-        // caller can retry without losing cgroup ownership.
-        let release = || -> Result<(), LaunchError> {
+        // Cgroup-authoritative teardown outside the registry lock: kill every
+        // member (including detached `setsid()`/double-fork descendants no
+        // process group can reach), wait for the kernel to agree the domain
+        // is empty, then remove the directory.
+        let teardown = || -> Result<(), LaunchError> {
+            let Some(domain) = domain.as_ref() else {
+                return Ok(());
+            };
             domain
                 .kill_all()
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
@@ -348,10 +497,31 @@ impl ProcessLauncher for LinuxLauncher {
                 .remove_empty()
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))
         };
-        match release() {
-            Ok(()) => Ok(()),
+        match teardown() {
+            Ok(()) => {
+                let Ok(mut slots) = self.registry.slots.lock() else {
+                    return Ok(());
+                };
+                if let Some(slot) = slots.get_mut(sandbox_id) {
+                    // A launch cannot have recreated a domain: Deleting
+                    // rejects them. Bump the generation for the next runtime.
+                    slot.generation += 1;
+                    slot.phase = DomainPhase::Idle;
+                    slots.remove(sandbox_id);
+                }
+                self.registry.changed.notify_all();
+                Ok(())
+            }
             Err(error) => {
-                domains.insert(sandbox_id.clone(), domain);
+                // Deletion failed: restore the slot so the cgroup stays
+                // owned and the caller can retry.
+                if let Ok(mut slots) = self.registry.slots.lock() {
+                    if let Some(slot) = slots.get_mut(sandbox_id) {
+                        slot.domain = domain;
+                        slot.phase = DomainPhase::Active;
+                    }
+                    self.registry.changed.notify_all();
+                }
                 Err(error)
             }
         }
@@ -395,6 +565,10 @@ fn wait_process(
     control: Arc<LinuxProcessControl>,
     launch_temp: LaunchTemp,
     wait_tx: tokio::sync::oneshot::Sender<Result<ProcessExit, LaunchError>>,
+    // Held for the waiter's lifetime: dropping it after the launch completes
+    // decrements the domain's in-flight count and may retire an empty
+    // domain (the M5 empty-cleanup transition).
+    _domain_lease: DomainLease,
 ) {
     let result = match child.wait() {
         Ok(status) => Ok(if let Some(code) = status.code() {
@@ -751,9 +925,11 @@ mod tests {
         assert_eq!(status.code(), Some(0), "probe did not confine reads");
     }
 
-    /// Plan M4: every launch of one sandbox joins the same process domain —
-    /// limits or no limits — and the domain survives individual launches
-    /// exiting; different sandbox IDs never share it.
+    /// Plans M4+M5: every launch of one sandbox joins the same process
+    /// domain — limits or no limits — while the domain holds members; once
+    /// the domain drains (no processes, no in-flight launches) it is retired
+    /// and the next launch starts a fresh generation. Different sandbox IDs
+    /// never share a domain.
     #[tokio::test]
     async fn launches_without_limits_share_one_domain_per_sandbox() {
         use tokio::io::AsyncReadExt;
@@ -775,74 +951,69 @@ mod tests {
             return;
         }
 
-        let mut first = launcher
-            .launch(request(workspace.path(), "cat /proc/self/cgroup", false))
-            .expect("first launch");
-        drop(first.stdin.take());
-        let mut first_cgroup = String::new();
-        first
-            .stdout
-            .take()
-            .expect("first stdout")
-            .read_to_string(&mut first_cgroup)
-            .await
-            .expect("read first cgroup");
+        let read_cgroup = read_own_cgroup;
+
+        // A detached descendant keeps the domain populated across launch
+        // boundaries (docs/lifecycle.md §2.1).
+        let mut keeper = launcher
+            .launch(request(
+                workspace.path(),
+                "setsid sh -c 'printf ok > keeper-ready; exec sleep 30' & B=$!; \
+                 until [ -f keeper-ready ]; do sleep 0.01; done; \
+                 printf '%s' $B > keeper-pid; exit 0",
+                false,
+            ))
+            .expect("keeper launch");
         assert_eq!(
-            first.wait.await.expect("first wait channel").expect("wait"),
+            keeper.wait.await.expect("wait channel").expect("wait"),
             ProcessExit::Code(0)
         );
+
+        let first_cgroup =
+            read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert!(
             first_cgroup.contains("sandbox-"),
             "launch must join a dedicated cgroup even without limits: {first_cgroup}"
         );
-
-        // The domain outlives the launch that created it.
-        let mut second = launcher
-            .launch(request(workspace.path(), "cat /proc/self/cgroup", false))
-            .expect("second launch");
-        drop(second.stdin.take());
-        let mut second_cgroup = String::new();
-        second
-            .stdout
-            .take()
-            .expect("second stdout")
-            .read_to_string(&mut second_cgroup)
-            .await
-            .expect("read second cgroup");
-        assert_eq!(
-            second.wait.await.expect("second wait channel").expect("wait"),
-            ProcessExit::Code(0)
-        );
+        let second_cgroup =
+            read_cgroup(&launcher, "linux-test", workspace.path()).await;
         assert_eq!(
             first_cgroup, second_cgroup,
-            "every launch of one sandbox must share one process domain"
+            "launches of one sandbox must share one domain while it is populated"
         );
 
         let other_workspace = tempfile::tempdir().expect("other workspace");
-        let mut other = launcher
-            .launch(request_for(
-                "other-sandbox",
-                other_workspace.path(),
-                "cat /proc/self/cgroup",
-                false,
-            ))
-            .expect("other sandbox launch");
-        drop(other.stdin.take());
-        let mut other_cgroup = String::new();
-        other
-            .stdout
-            .take()
-            .expect("other stdout")
-            .read_to_string(&mut other_cgroup)
-            .await
-            .expect("read other cgroup");
-        assert_eq!(
-            other.wait.await.expect("other wait channel").expect("wait"),
-            ProcessExit::Code(0)
-        );
+        let other_cgroup =
+            read_cgroup(&launcher, "other-sandbox", other_workspace.path()).await;
         assert_ne!(
             first_cgroup, other_cgroup,
             "different sandbox IDs must use separate process domains"
+        );
+
+        // Drain the keeper: the next launch joins the same (now idle-domain)
+        // cgroup, and its completion retires the domain; the launch after
+        // that must start a fresh generation.
+        let keeper_pid: libc::pid_t = fs::read_to_string(workspace.path().join("keeper-pid"))
+            .expect("keeper pid")
+            .trim()
+            .parse()
+            .expect("numeric keeper pid");
+        kill_test_process(keeper_pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_alive(keeper_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let drained_cgroup =
+            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        assert_eq!(
+            drained_cgroup, first_cgroup,
+            "the drained domain stays until a launch-finished transition"
+        );
+        let fresh_cgroup =
+            read_cgroup(&launcher, "linux-test", workspace.path()).await;
+        assert_ne!(
+            fresh_cgroup, first_cgroup,
+            "after the domain drains, the next launch must start a fresh generation"
         );
 
         launcher
@@ -855,6 +1026,82 @@ mod tests {
 
     /// `docs/lifecycle.md` §2.1: a normally-exiting shell must not terminate
     /// the background process it started.
+    /// Plan M5 stress: concurrent launches, empty-cleanup transitions, and a
+    /// racing delete must never lose a process or wedge the domain state
+    /// machine. Delegated-host only (self-skips otherwise).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn domain_state_machine_survives_launch_cleanup_and_delete_races() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let launcher = Arc::new(
+            LinuxLauncher::new(test_policy(root.path(), NetworkMode::Disabled))
+                .expect("linux launcher"),
+        );
+        if !process_domain_available(&launcher, workspace.path()) {
+            return;
+        }
+        let sandbox: SandboxId = "stress".parse().expect("sandbox id");
+
+        // Repeated empty → launch → empty cycles: each burst drains the
+        // domain, its completion retires the cgroup, and the next burst
+        // lazily creates a fresh generation.
+        for _round in 0..5 {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let launcher = Arc::clone(&launcher);
+                let workspace = workspace.path().to_path_buf();
+                tasks.push(tokio::spawn(async move {
+                    let launched = launcher
+                        .launch(request_for("stress", &workspace, "exit 0", false))
+                        .expect("burst launch");
+                    assert_eq!(
+                        launched.wait.await.expect("wait channel").expect("wait"),
+                        ProcessExit::Code(0)
+                    );
+                }));
+            }
+            for task in tasks {
+                task.await.expect("burst task");
+            }
+        }
+
+        // Launch vs delete: the launch either joins the doomed domain and is
+        // killed by the release teardown, or is rejected while Deleting.
+        let long_launch = tokio::spawn({
+            let launcher = Arc::clone(&launcher);
+            let workspace = workspace.path().to_path_buf();
+            async move {
+                let launched = launcher
+                    .launch(request_for("stress", &workspace, "exec sleep 30", false))
+                    .expect("long launch");
+                launched.wait.await.expect("long wait channel")
+            }
+        });
+        // Give the launch a moment to join the domain, then race the delete.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        launcher
+            .release_sandbox_resources(&sandbox)
+            .expect("stress release");
+        let long_exit = long_launch.await.expect("long launch task");
+        assert!(
+            matches!(long_exit, Ok(ProcessExit::Signal { .. }) | Ok(ProcessExit::Code(_))),
+            "the racing launch must exit, not hang: {long_exit:?}"
+        );
+
+        // The state machine must be reusable: a fresh launch and a clean
+        // release after the race.
+        let fresh = launcher
+            .launch(request_for("stress", workspace.path(), "exit 0", false))
+            .expect("post-race launch");
+        assert_eq!(
+            fresh.wait.await.expect("post-race wait").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        launcher
+            .release_sandbox_resources(&sandbox)
+            .expect("post-race release");
+    }
+
     #[tokio::test]
     async fn background_process_survives_shell_exit() {
         let root = tempfile::tempdir().expect("runtime root");
@@ -931,6 +1178,29 @@ mod tests {
             !process_alive(pid),
             "sandbox release must kill the detached descendant {pid}"
         );
+    }
+
+    /// Launch one probe command that prints its own cgroup and collect it.
+    async fn read_own_cgroup(launcher: &LinuxLauncher, sandbox: &str, workspace: &Path) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut launched = launcher
+            .launch(request_for(sandbox, workspace, "cat /proc/self/cgroup", false))
+            .expect("launch");
+        drop(launched.stdin.take());
+        let mut cgroup = String::new();
+        launched
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut cgroup)
+            .await
+            .expect("read cgroup");
+        assert_eq!(
+            launched.wait.await.expect("wait channel").expect("wait"),
+            ProcessExit::Code(0)
+        );
+        cgroup.trim().to_string()
     }
 
     /// Whether `pid` exists and is not a zombie.
