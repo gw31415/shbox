@@ -179,6 +179,7 @@ impl TestDaemon {
             .arg("--listen")
             .arg(format!("tcp://127.0.0.1:{port}"));
         let mut child = daemon_command
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1765,6 +1766,7 @@ fn tssh_tcp_compatibility_runs_inside_the_sandbox_process_domain() {
         .args(["-p", &daemon.port.to_string(), "-4", "--tcp"])
         .arg("m12-tssh@127.0.0.1")
         .arg("printf __M12_TSSH_BEGIN__; cat /proc/self/cgroup; printf __M12_TSSH_END__")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1818,6 +1820,7 @@ fn tssh_udp_bootstrap_runs_inside_the_sandbox_process_domain() {
         .arg("--debug")
         .arg("m12-tssh@127.0.0.1")
         .arg("printf __M12_TSSH_BEGIN__; cat /proc/self/cgroup; printf __M12_TSSH_END__")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

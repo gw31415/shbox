@@ -1008,10 +1008,12 @@ impl BackendChild for LinuxChild {
             }
         }
         if let Some(cgroup) = self.cgroup.take() {
-            // A per-launch cgroup (this handle is the last owner) that is
-            // being abandoned still terminates its members: nobody else can.
-            // Shared process-domain cgroups outlive individual children and
-            // are removed only by the domain's explicit owner.
+            // Only a private one-shot cgroup may be killed as part of an
+            // abandoned child handle. Its last Arc owner proves that no
+            // durable process-domain owner remains. Shared process-domain
+            // cgroups outlive individual children and are removed only by
+            // their explicit owner; cgroup membership, not Arc counts, is
+            // authoritative for their lifecycle.
             if was_running && Arc::strong_count(&cgroup) == 1 {
                 let _ = cgroup.kill_all();
             }

@@ -804,33 +804,6 @@ mod linux_only {
     }
 
     #[test]
-    fn normal_completion_leaves_owned_process_group_descendants_running() {
-        let mut command = CommandSpec::new("/bin/sh");
-        command = command.arg("-c").arg("sleep 30 & read ignored; exit 0");
-        command.stdin = Stdio::Pipe;
-        command.session = shbox_sandbox::SessionSetup::NewSession;
-        let mut child = Sandbox::detect()
-            .spawn(command, unrestricted())
-            .expect("spawn");
-        let pid = child.id().expect("child present");
-        let descendant = wait_for_descendant(pid, Duration::from_secs(1));
-        drop(child.take_stdin().expect("stdin pipe"));
-        assert_eq!(child.wait().expect("wait").code(), Some(0));
-
-        // Normal completion reaps the direct child and leaves the
-        // process-group descendant running (docs/lifecycle.md §2.1);
-        // killing it is reserved for explicit teardown paths.
-        assert!(
-            !process_is_gone_or_zombie(descendant),
-            "owned process-group descendant {descendant} must survive normal completion"
-        );
-        // SAFETY: test-side disposal of the process this test spawned.
-        unsafe {
-            libc::kill(descendant as libc::pid_t, libc::SIGKILL);
-        }
-    }
-
-    #[test]
     fn pid_namespace_runs_user_command_below_init_supervisor() {
         let mut config = unrestricted();
         config.namespaces.user = true;
@@ -1072,8 +1045,8 @@ mod linux_only {
         );
     }
 
-    /// `plan-cgroup.md` M1: a process domain is the sandbox's containment
-    /// boundary first and its resource-limit carrier second. All-`Inherit`
+    /// A process domain is the sandbox's containment boundary first and its
+    /// resource-limit carrier second. All-`Inherit`
     /// limits must still yield a dedicated cgroup that children are born
     /// into, and separate domains must never share it.
     #[test]
@@ -1275,8 +1248,7 @@ mod linux_only {
 
     /// `docs/lifecycle.md` §2.1: a normally-exiting direct child must not
     /// terminate its descendants. This is the engine-level contract test for
-    /// the background (same process group) case; it is expected to fail until
-    /// the engine stops killing the owned process group on wait.
+    /// the background (same process group) case.
     #[test]
     fn background_descendant_survives_direct_child_exit() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1291,8 +1263,8 @@ mod linux_only {
         command.stdout = Stdio::Null;
         command.stderr = Stdio::Null;
         // The launcher path always creates a session per launch; the engine
-        // contract must hold for that shape, where the owned process group
-        // exists and could be (wrongly) cleaned up on wait.
+        // contract must hold for that shape even though the process group is
+        // not the sandbox's process-ownership boundary.
         command.session = SessionSetup::NewSession;
         let mut child = sandbox.spawn(command, config).expect("spawn");
         let child_pid = child.id().expect("child pid");
@@ -1308,9 +1280,8 @@ mod linux_only {
             .trim()
             .parse()
             .expect("numeric descendant pid");
-        // A process-group kill lands within microseconds of `wait()`
-        // returning; letting that window pass makes "still alive" a settled
-        // fact rather than a race with signal delivery.
+        // Let signal delivery settle before checking that normal completion
+        // did not apply a process-group cleanup operation.
         std::thread::sleep(Duration::from_millis(250));
         assert!(
             process_is_alive(pid),
@@ -1568,7 +1539,7 @@ mod linux_only {
         );
     }
 
-    /// `plan-cgroup.md` M2: `cgroup.events` `populated` is the membership
+    /// `docs/lifecycle.md` §2.4: `cgroup.events` `populated` is the membership
     /// authority; `kill_all` is the only terminating operation and an empty
     /// domain's removal must not disturb processes in other domains.
     #[test]

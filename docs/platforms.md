@@ -10,7 +10,7 @@ SSH/session layer
         -> shbox-owned PTY/process lifecycle
         -> shbox-sandbox engine (in-workspace crate)
             Linux: clone3 + pidfd + Landlock + seccomp
-                   + cgroup v2 (CLONE_INTO_CGROUP, when limits are set)
+                   + durable cgroup v2 process domain (CLONE_INTO_CGROUP)
                    + namespaces + no_new_privs + capability drop
             macOS: generated Seatbelt profile
                    via /usr/bin/sandbox-exec
@@ -92,7 +92,7 @@ setup failureはstatus pipeでparentへ返し、partially configured childを公
 
 public shbox adapter は resource limit の有無にかかわらず `SandboxId` ごとに一つの durable process domain cgroup を作り、同じ sandbox の全 concurrent launch を `clone3(CLONE_INTO_CGROUP)` で最初からその cgroup に入れる（limit 適用前の window が存在しない）。explicit limit があれば同じ domain に適用し、すべて `Inherit` でも process ownership boundary として cgroup を保持する。child exit では shared domain を削除せず、sandbox deletion が runtime cleanup を完了した後に release/remove する。`cpu_period_micros` 単独では cgroup limit を変更しない。direct `shbox-sandbox::Sandbox::spawn` は resource limit 指定時に one-shot per-launch cgroup を所有する。
 
-cgroup parent は auto-discovery（自身の cgroup から上位へ、必要 controller を `subtree_control` に有効化できる最初の階層）または `[sandbox] cgroup_parent` で明示指定できる。書き込み可能な cgroup 階層が無い場合、resource limit がある構成は fail closed する。
+cgroup parent は auto-discovery（自身の cgroup から上位へ、必要 controller を `subtree_control` に有効化できる最初の階層）または `[sandbox] cgroup_parent` で明示指定できる。書き込み可能な cgroup 階層が無い場合、public sandbox launch は limit の有無にかかわらず fail closed する。
 
 明示 limit は parent/ancestor cgroup の制限に追加される制限であり、child が inherited cgroup restriction を解除または引き上げることはできない。
 
@@ -102,12 +102,17 @@ systemd の `KillMode=control-group` を deployment artifact で使う場合、�
 
 per-sandbox の memory/swap/PID/CPU quota は `[sandbox]` 設定（[configuration.md](configuration.md)）で付与する。無指定の分野は provider/service manager 側の resource controls を継承する（`Inherit`）。macOS では memory/PID のみがそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` に変換され、CPU quota と swap limit は startup で fail closed する。
 
-### 2.8 Lifecycle containment limitation
+### 2.8 Lifecycle containment
 
-shboxはinitial sandbox session/process groupをownership unitとしてsignal/cleanupする。Linux の engine-owned direct child には parent-death behavior を設定する。PID namespace 有りではその direct child は内部 PID1 supervisor であり、通常の signal/wait API は PID1 経由で logical user PID2 を扱う。PID1 teardown は namespace 内の残processを kernel teardown へ委ねる。
+Linux の SandboxId ごとの durable cgroup process domain が process ownership unit で
+あり、engine-owned direct child の parent-death behavior と組み合わせて delete/
+shutdown の全 process 回収を担う。PID namespace 有りでは direct child は内部 PID1
+supervisor であり、通常の signal/wait API は PID1 経由で logical user PID2 を扱う。
+PID1 teardown と cgroup kill は、それぞれの namespace/domain 内の残processを終了させる。
 
-ただしdescendantが意図的に`setsid()`して別session/process groupへdetachすると、元process groupに対するlifecycle cleanupから外れ得る。これはcgroup tree containmentと同じ保証ではない。
-
+descendant が意図的に `setsid()` して別 session/process groupへ detachしても、同じ
+Linux process domain に留まる限り cgroup membership による回収対象である。process
+group は terminal signal/job-control と publication前の防御 cleanup に限定する。
 Landlock等のconfinement継承とprocess lifecycle containmentは別軸である。
 
 ## 3. macOS

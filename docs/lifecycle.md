@@ -4,7 +4,8 @@
 Linux sandbox において process の生存を誰が管理するかを layer ごとに分離し、
 それぞれの layer が担う役割と担わない役割を明示する。
 
-この契約の動機と実装計画の全体は `plan-cgroup.md` を参照すること。
+この契約の動機と実装計画の全体は、リポジトリのコミット履歴に保存された M0--M13 の
+archival commit を参照すること。
 
 ## 1. 所有権の分離
 
@@ -120,7 +121,7 @@ process group は sandbox の process inventory ではない。`kill_process_gro
 
 ## 4. テスト契約
 
-この契約は以下のテスト群で固定する（`plan-cgroup.md` Milestone 0）:
+この契約は以下のテスト群で固定する（M0--M13 の archival commit）:
 
 - 直接 child の exit 後も detached descendant が生存すること。
 - `setsid()` descendant が生存し、sandbox cgroup に留まること。

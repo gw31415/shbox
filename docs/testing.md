@@ -135,13 +135,17 @@ engine 単体で all-network denial を検証する場合は、必要な user na
 
 ### 5.3 Process cleanup proof
 
-- PID namespace無しではdirect childをreapする前にinitial owned process groupの残processを停止すること
+- Linux の SandboxId ごとの process domain が direct child の exit 後も残る
+  `setsid()` / double-fork descendant を保持し、delete/shutdown の `cgroup.kill` で回収すること
 - PID namespace有りではinternal PID1 supervisorの下でuser commandがPID2として動き、signal/status forwardingとnamespace descendant teardownが成立すること
 - signal requestがowned foreground/process groupへ届くこと
-- disconnectではtransportだけをdetachし、delete/daemon shutdownでmanaged groupを停止すること
+- disconnectではtransportだけをdetachし、delete/daemon shutdownでmanaged process domainを停止すること
 - Linux cloneはprocess-lifetime spawn-owner threadが担当し、engine-owned direct childはdaemon death時のparent-death signalを持つこと
 
-Landlock confinement inheritanceとprocess cleanupは別の保証である。意図的に新sessionへdetachしたdescendantを、process-group cleanupが完全なprocess tree containmentとして回収するとは主張しない。
+Landlock confinement inheritance と cgroup process containment は別の保証である。
+process group は foreground lookup、signal forwarding、job control、publication前の
+防御 cleanup に限って検証し、Linux の detached descendant 回収は cgroup membership
+で検証する。
 
 ## 6. macOS native confinement test
 
@@ -240,7 +244,7 @@ pipeをPTYの代用にしてはならない。
 
 release workflowは `v*` tag push時（または明示的なmanual dispatch時）だけ実行する。通常のbranch push/PRでは重いnative matrixを起動しない。
 
-release workflowはproduction inputsに、廃止済みsandbox backend、sibling launcher helper、launcher-control environment path、project-owned external sandbox CLI invocation、resource limit 無指定時の sandbox 用 control-group filesystem write pathが再導入された場合に失敗する（macOSの固定OS component `/usr/bin/sandbox-exec` は許可）。
+release workflowはproduction inputsに、廃止済みsandbox backend、sibling launcher helper、launcher-control environment path、project-owned external sandbox CLI invocation、SandboxId ごとの durable process domain を経由しない sandbox 用 control-group filesystem write pathが再導入された場合に失敗する（macOSの固定OS component `/usr/bin/sandbox-exec` は許可）。
 
 このguardはbehavior testの代用ではなく、release時にarchitecture regressionを拒否する追加条件である。開発中の検出はlocal checksを使い、必要な場合だけmanual dispatchする。
 

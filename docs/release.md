@@ -129,9 +129,14 @@ release時に確認する契約:
 - outside writeが拒否される
 - `network = "disabled"` でfresh network namespaceが使われ、実TCP `connect()`と実UDP送信のhost/external reachabilityが拒否される
 - `network = "outbound"` でcontrolled client endpointへの接続が成功する（portableなinbound behaviorは要求しない）
-- resource limit 無指定時は sandbox launch が control-group delegation を必要としない
+- resource limit の有無にかかわらず sandbox launch が delegated cgroup v2 process
+  domain を使い、指定 limit が同じ domain に適用される
 
-Linuxでは設定した memory/swap/PID/CPU limit を cgroup v2 で適用し、macOSでは memory/PID limit をそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` で適用する。macOSのCPU quota/swap limitは指定時にfail closedする。process group cleanupを完全なprocess-tree containmentとして表現しない。
+Linuxでは設定した memory/swap/PID/CPU limit と process ownership domain を cgroup v2 で
+適用し、macOSでは memory/PID limit をそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` で適用する。
+macOSのCPU quota/swap limitは指定時にfail closedする。process group は terminal/job
+control と signal forwarding のためのものであり、Linux の detached descendant
+containment は cgroup domain で確認する。
 
 ## 7. macOS confinement release contract
 
@@ -183,7 +188,8 @@ runtime proof:
 13. SSH disconnect transport detach / detached descendant survival
 14. graceful shbox shutdown cleanup
 15. Linux daemon SIGKILL時のengine-owned direct child parent-death behavior（clone ownerがprocess-lifetime threadであることを含む）
-16. deliberately detached new-session descendantの挙動記録
+16. deliberately detached new-session descendantがLinux process domainのdelete/shutdown
+    cleanupで回収されること
 17. resource limit の有無にかかわらず delegated cgroup v2 process domain を使い、指定 limit が同じ domain に適用されること
 
 このacceptanceはfilesystem/network grantを文書化されたpolicyより広げて通してはならない。
@@ -197,7 +203,7 @@ Fly Machines上でproduction acceptanceを試みたが、成功しなかった�
 結果:
 
 - ゲストカーネルは `6.12.105-fly`。`landlock_create_ruleset` が `ENOSYS` を返す（`Seccomp: 0`でフィルタによる隠蔽ではない）。Landlock LSMが無効なため `production_launcher` preflightは失敗し、sandbox launchはすべてfail-closedになった。設計どおりfallbackやpolicy拡張は行わず、この事実を記録として確定させた。
-- 実測できた項目: 非root startup、admin keyによる正規OpenSSH認証（host mode `_`）、resource limit 無指定時に cgroup controller file を使わない起動パス。sandbox launchを要するproof item（PTY suite、永続化、network mode検証等）は実行不能。
+- 旧 revision で実測できた項目: 非root startup、admin keyによる正規OpenSSH認証（host mode `_`）、limit を設定しない場合に cgroup controller file を使わない旧起動パス。これは現行の durable process domain 契約ではなく、sandbox launchを要する現行 proof item（PTY suite、永続化、network mode検証等）も実行不能だった。
 - 非特権コンテキストでの実測: `unshare(CLONE_NEWUSER)` とseccomp filterは利用可能、`chroot` と単独のmount nsは不可。usernsベースのsandboxは技術的には成立しうるが、nono/Landlockとは別の新backend実装であり、現行releaseの範囲外。
 - 公開networkの制約: Flyのshared IPv4はraw TCP（SSH）をedgeで切断するため、公開SSHにはdedicated IPv4が必要。検証はprivate network（`fly proxy`）で実施した。
 

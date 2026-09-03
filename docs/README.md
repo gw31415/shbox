@@ -38,7 +38,7 @@ SSH/session layer
         -> shbox-owned PTY/process lifecycle
         -> shbox-sandbox engine
             Linux: clone3+pidfd / Landlock / seccomp
-                   (+ cgroup v2 via CLONE_INTO_CGROUP when limits are set)
+                   (+ durable cgroup v2 process domain via CLONE_INTO_CGROUP)
             macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
 ```
 

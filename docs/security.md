@@ -187,7 +187,10 @@ concurrent sessionsでterminal device、foreground process group、window size�
 
 ## 9. Process lifecycle and cleanup
 
-normal process completionではengine-owned direct childをexactly once reapする。PID namespace無しではreap前に残るowned process groupをcleanupする。PID namespace有りでは内部PID1 supervisorがlogical user PID2をreapし、そのstatusをparentへ返した後にnamespace内の残processを停止して終了する。
+normal process completionではengine-owned direct childをexactly once reapする。Linux の
+共有 process domain は直接 child の exit では削除せず、残った descendant を domain の
+membership として保持する。PID namespace有りでは内部PID1 supervisorがlogical user
+PID2をreapし、そのstatusをparentへ返して終了する。
 
 abnormal teardownでは、published sandbox launchのchannel close/connection
 disconnectはtransport endpointだけをdetachする。process terminationを行うのは
@@ -198,18 +201,18 @@ connection handler drop時はchannel registry senderをclearし、bridge taskが
 
 Linux の engine-owned direct child には parent-death signal を設定し、その clone は process-lifetime の専用 spawn-owner thread が実行する。PID namespace 有りでは direct child は内部 PID1 supervisor で user command は PID2 として実行される。daemon abrupt death 時に process の生存は保証しないが、次回 startup は delegated parent の shbox 所有 `shbox-domain-*` と runtime root の `sandbox-*` generation を回収する。ownership prefix 外の sibling cgroup/file は変更しない。
 
-### 9.1 Detached descendant limitation
+### 9.1 Detached descendant containment
 
-process groupはprocess tree全体と同じではない。sandbox codeがdeliberateに`setsid()`し新しいsession/process groupへdetachしたdescendantは、元groupへのcleanup signalから外れ得る。
+Linux の SandboxId ごとの cgroup process domain が process inventory と delete/
+shutdown の containment boundary である。sandbox code が deliberate に `setsid()` や
+double-fork で別 session/process groupへ detachしても、同じ domain に所属する限り
+`cgroup.kill` の対象から外れない。
 
-従って:
-
-- filesystem/network confinement inheritance
-- process lifecycle containment
-
-は別のsecurity propertyとして扱う。shboxはprocess-group cleanupをcgroup tree containment相当とは主張しない。
-
-production-provider acceptanceではこのdetached behaviorを明示的に観測・記録する。
+process group は sandbox inventory ではなく、PTY foreground job lookup、SSH signal
+forwarding、shell job control、publication前の abandoned launch の graceful cleanup
+に限定する。filesystem/network confinement inheritance と process lifecycle
+containment は別の security property として扱い、provider acceptance では domain
+membership と delete/shutdown の回収を明示的に観測・記録する。
 
 ## 10. Resource control
 
@@ -309,7 +312,7 @@ releaseには少なくとも:
 - covert/side-channel isolation
 - per-sandbox UID namespace
 - documented resource limitsを超えるfile/workspace quotaや、ancestor cgroup restrictionの解除
-- deliberately detached process treeの完全回収保証
+- Linux の管理対象 process domain 外にある任意の host process tree の完全回収保証
 
 これらが必要なdeploymentは別のVM/container/provider boundaryを追加する。
 

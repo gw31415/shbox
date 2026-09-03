@@ -56,7 +56,8 @@ pub(crate) enum ReadPathClass {
 ///
 /// Curated for the Linux Landlock policy:
 /// system binaries and libraries, TLS trust stores, resolver/loader data,
-/// locale and account databases, and the entropy devices. `/tmp` is
+/// locale, account databases, and the Debian Bash remote-shell startup file,
+/// plus the entropy devices. `/tmp` is
 /// deliberately absent (host-shared; the per-launch temp directory replaces
 /// it), `/proc` and `/sys` are deliberately absent, `/dev/pts` is deliberately
 /// absent (it would expose every host pseudo-terminal), and `/dev/tty` is the
@@ -71,6 +72,7 @@ pub(crate) const CURATED_READ_PATHS: &[(&str, ReadPathClass)] = &[
     ("/etc/ssl", ReadPathClass::SystemData),
     ("/etc/pki", ReadPathClass::SystemData),
     ("/etc/ca-certificates", ReadPathClass::SystemData),
+    ("/etc/bash.bashrc", ReadPathClass::SystemData),
     ("/etc/resolv.conf", ReadPathClass::SystemData),
     ("/etc/hosts", ReadPathClass::SystemData),
     ("/etc/host.conf", ReadPathClass::SystemData),
@@ -765,6 +767,7 @@ mod tests {
             ("/etc/ssl", ReadPathClass::SystemData),
             ("/etc/pki", ReadPathClass::SystemData),
             ("/etc/ca-certificates", ReadPathClass::SystemData),
+            ("/etc/bash.bashrc", ReadPathClass::SystemData),
             ("/etc/resolv.conf", ReadPathClass::SystemData),
             ("/etc/hosts", ReadPathClass::SystemData),
             ("/etc/host.conf", ReadPathClass::SystemData),

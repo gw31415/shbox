@@ -157,11 +157,13 @@ client EOFはnon-PTY stdinを閉じる。PTY EOFのためにshboxが勝手に`0x
 
 ## 9. Process cleanup
 
-normal exitではengine-owned direct childをreapする。Linux PID namespace無しではowned process groupの残留processをreap前にcleanupし、PID namespace有りでは内部PID1 supervisorがlogical user PID2とnamespace descendantをcleanupする。
+normal exitではengine-owned direct childをreapする。Linux の共有 process domain は
+直接 child の exit では削除せず、残った descendant が domain を populated に保つ。
+PID namespace 有りでは内部PID1 supervisorがlogical user PID2のstatusを返して終了する。
 
 publication前の失敗、sandbox delete、daemon shutdownではgraceful termination後にforce-killへescalateする。published sandbox launchのchannel close/client disconnectはtransportだけをdetachする。
 
-Linux の engine-owned direct sandbox child には parent-death behavior が設定され、clone は process-lifetime spawn-owner thread が担当する。PID namespace 有りでは direct child は内部 PID1 supervisor となる。ただし PID namespace を使わない通常の process-group cleanup は cgroup tree containmentではない。descendantがdeliberateに`setsid()`してdetachした場合、元process groupのlifecycle ownershipから外れ得る。filesystem/network confinementの継承とprocess-tree cleanupの強度を同一視しない。
+Linux の engine-owned direct sandbox child には parent-death behavior が設定され、clone は process-lifetime spawn-owner thread が担当する。PID namespace 有りでは direct child は内部 PID1 supervisor となる。Linux の sandbox process ownership は SandboxId ごとの cgroup domain にあり、`setsid()` / double-fork descendant も domain が populated である限り delete/shutdown の対象になる。process group は PTY/job-control、signal forwarding、publication前の防御 cleanupに限定し、filesystem/network confinementの継承とprocess lifecycle containmentを同一視しない。
 
 ## 10. Network と filesystem
 
@@ -211,7 +213,7 @@ v0.1は次を提供しない。
 - SFTP
 - public backend/plugin selection
 - backend-specific raw policy knobs
-- process-group cleanupをcgroup tree containmentとして扱う保証
+- 任意の host process tree を process-group signal だけで containment する保証
 
 host/service manager側のresource policyを別途使うことは可能だが、それはshbox sandbox featureではない。
 

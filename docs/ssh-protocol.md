@@ -279,6 +279,10 @@ publication前の失敗、sandbox delete、daemon shutdownは別のterminate/rea
 
 を行う。
 
+ここで process group は channel の所有権を表さない。Linux sandbox の process ownership
+は SandboxId ごとの cgroup domain にあり、PTY/job-control と signal forwarding の
+process-group操作は transport detach では開始しない。
+
 ## 18. Daemon shutdown
 
 first shutdown signalでnew listener workを止め、host/sandbox runtimeをdrainする。second shutdown signalでforce-stopへ移行する。

@@ -196,17 +196,27 @@ interactive shell の job control、Ctrl-C、Ctrl-Z、`jobs`/`fg`/`bg` は OS �
 
 ## 9. Process control and cleanup
 
-normal completion では engine-owned direct child を必ず一度 reap する。PID namespace 無しでは reap 前に残る owned process group を force-cleanup する。PID namespace 有りでは内部 PID1 が user PID2 の status を返し、残descendantを停止/reapしてから終了する。最後に private temp を削除する。
+normal completion では engine-owned direct child を必ず一度 reap する。直接 child の終了では共有 process domain を削除せず、`setsid()` / double-fork を含む descendant が残れば cgroup が populated のままになる。PID namespace 有りでは内部 PID1 が user PID2 の status を返してから終了する。private runtime temp は domain が空になり、sandbox runtime が解放される時点で削除する。
 
 published sandbox launchではchannel close/client disconnectはtransport endpointだけをdetachし、processをterminateしない。publication前の失敗、sandbox delete、daemon shutdownではmanaged processをgraceful terminationからforce-killへ進める。SSH connection handler が drop すると channel registry の mailbox sender を全て閉じ、bridge task がdisconnectを観測できるようにする。
 
 Linux の engine-owned direct sandbox child には parent-death signal を設定し、その clone は process-lifetime spawn-owner thread が担当する。daemon の abrupt death 時に process の生存は保証しないが、restart 時は delegated parent の `shbox-domain-*` と runtime root の `sandbox-*` generation を ownership prefix で reconcile する。prefix 外の sibling cgroup/file は変更しない。
 
-### 9.1 重要な containment limit
+### 9.1 Process group と process domain の境界
 
-process-group cleanup は cgroup tree containment と同一ではない。sandbox descendant が自ら `setsid()` して新しい session/process groupへ deliberate に detach した場合、shbox の元 process group cleanup から外れ得る。
+Linux の public sandbox adapter では、SandboxId ごとの cgroup process domain が
+process inventory と delete/shutdown の containment boundary である。descendant が
+自ら `setsid()` して別 session/process group へ detach しても、同じ domain に残る限り
+domain の `cgroup.kill` で回収される。
 
-filesystem/network confinement は子孫へ継承されるが、process-tree lifecycle の強制回収を cgroup 相当として主張しない。この差は security/release 文書と Fly acceptance で明示的に試験する。
+process group は process inventory ではない。PTY の foreground job lookup、SSH signal
+forwarding、shell の job control、および publication 前の abandoned launch に対する
+graceful な防御 cleanup にだけ使う。macOS と host mode では Linux cgroup domain が
+ないため、adapter 固有の process-group cleanup が残るが、任意の detached process-tree
+containment としては扱わない。
+
+filesystem/network confinement の子孫への継承と process lifecycle containment は別の
+security property であり、対応する platform の実装境界として文書化する。
 
 ## 10. Delete and recovery
 
@@ -231,7 +241,9 @@ resource limit を使う Linux sandbox では、child exit だけでは `Sandbox
 
 最初の SIGINT/SIGTERM は listener を止め、host/sandbox runtime を drain する。二回目の shutdown signal は force-stop pathへ移る。
 
-host process も sandbox process も direct child ownership と process-group cleanupを持つ。正常 shutdown は waiter/cleanup completion を待つ。
+host process は direct child ownership と process-group cleanup を持つ。Linux sandbox
+process は process domain を ownership boundary とし、shutdown は各 domain の
+kill/populated=0 wait/remove と waiter/cleanup completion を待つ。
 
 ## 13. Concurrency invariants
 

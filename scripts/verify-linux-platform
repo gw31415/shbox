@@ -2,9 +2,8 @@
 # Blocking native Linux sandbox/PTTY platform gate.
 #
 # shbox owns process/PTY lifecycle on top of the in-workspace
-# shbox-sandbox engine (clone3+pidfd, Landlock, seccomp, cgroup v2 when
-# resource limits are configured). This gate requires no cgroup delegation:
-# the default configuration runs without a dedicated cgroup.
+# shbox-sandbox engine (clone3+pidfd, Landlock, seccomp, and durable cgroup v2
+# process domains). Every public sandbox launch requires cgroup delegation.
 
 set -euo pipefail
 umask 077
@@ -21,9 +20,10 @@ usage() {
 usage: scripts/verify-linux-platform --arch x86_64|aarch64 [--target TARGET]
 
 Runs the native shbox Linux gate as the current non-root account. The gate
-requires Rust 1.95, OpenSSH, a C compiler for the PTY identity fixture, and a
-kernel with Landlock ABI 4+ (6.7+). No sibling runner binary or external
-wrapper is used; cgroup resource limits stay optional.
+requires Rust 1.95, OpenSSH, a C compiler for the PTY identity fixture, a
+kernel with Landlock ABI 4+ (6.7+), and a writable delegated cgroup v2 parent.
+No sibling runner binary or external wrapper is used; the cgroup process domain
+is required even when every controller limit is inherited.
 USAGE
   exit 2
 }
@@ -122,10 +122,9 @@ printf 'Linux platform gate: arch=%s target=%s kernel=%s user=%s uid=%s\n' \
 printf 'Linux platform gate: %s\n' "$rustc_version"
 printf 'Linux platform gate: OpenSSH version\n'
 ssh -V 2>&1
-if [[ -r /proc/self/cgroup ]]; then
-  printf 'Linux platform gate: optional /proc/self/cgroup diagnostic (not a prerequisite)\n'
-  cat /proc/self/cgroup
-fi
+[[ -r /proc/self/cgroup ]] || die "/proc/self/cgroup is unavailable"
+printf 'Linux platform gate: delegated cgroup v2 parent diagnostic\n'
+cat /proc/self/cgroup
 
 # Exercise the exact engine API this launcher pins and print the detected
 # Landlock ABI and cgroup state before the larger suite. This is a real
