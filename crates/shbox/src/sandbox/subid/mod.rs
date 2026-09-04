@@ -191,8 +191,8 @@ impl SubidAllocator {
                 sandbox_id.as_str()
             )));
         }
-        let mut unavailable_uid = HashSet::new();
-        let mut unavailable_gid = HashSet::new();
+        let mut unavailable_uid = HashSet::from([0, crate::paths::euid()]);
+        let mut unavailable_gid = HashSet::from([0, effective_gid()]);
         for record in &records {
             unavailable_uid.insert(record.uid);
             unavailable_gid.insert(record.gid);
@@ -216,6 +216,7 @@ impl SubidAllocator {
             uid,
             gid,
             state: LeaseState::Reserved,
+            quarantine_reason: None,
         };
         self.store.write(&record)?;
         Ok(record)
@@ -246,6 +247,7 @@ impl SubidAllocator {
     /// cleanup carrying an older `lease_id` fails against the missing file
     /// and removes nothing (ABA protection).
     pub(crate) fn finish_release(&self, expected: &LeaseRecord) -> Result<(), Error> {
+        let _guard = self.selection.lock().expect("subid allocator");
         // Incarnation identity and the Releasing state are both verified by
         // the expected-record guard; the caller may hold any state snapshot
         // of the same incarnation.
@@ -257,7 +259,7 @@ impl SubidAllocator {
     /// Move any record of this incarnation to `Quarantined`, recording why.
     /// Quarantined IDs are never allocated automatically.
     pub(crate) fn quarantine(&self, expected: &LeaseRecord, reason: &str) -> Result<(), Error> {
-        let _ = reason; // reasons live in logs; the record keeps only state
+        let _guard = self.selection.lock().expect("subid allocator");
         let current = self
             .store
             .read(&expected.lease_id)?
@@ -268,8 +270,14 @@ impl SubidAllocator {
                 expected.lease_id
             )));
         }
-        self.store
-            .write(&current.with_state(LeaseState::Quarantined))?;
+        self.store.write(&current.with_quarantine_reason(reason))?;
+        Ok(())
+    }
+
+    fn free_reserved_absent(&self, expected: &LeaseRecord) -> Result<(), Error> {
+        let _guard = self.selection.lock().expect("subid allocator");
+        self.expected_record(expected, &["reserved"])?;
+        self.store.remove(&expected.lease_id)?;
         Ok(())
     }
 
@@ -345,10 +353,25 @@ pub(crate) enum SandboxView {
     Corrupt { reason: String },
 }
 
+/// Proof that the platform runtime sweep completed successfully. The private
+/// field prevents callers from manufacturing a value compatible with a
+/// boolean flag; the manager creates it only after its runtime sweep returns
+/// success.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuntimeReconciliationProof {
+    _private: (),
+}
+
+impl RuntimeReconciliationProof {
+    pub(crate) fn from_successful_sweep() -> RuntimeReconciliationProof {
+        RuntimeReconciliationProof { _private: () }
+    }
+}
+
 /// Startup lease reconciliation (PLANS.md §7.5, §12). `lookup` answers "does
 /// the durable sandbox exist, in which state and under which owner";
-/// `runtime_reconciled` asserts the caller has already proven no processes
-/// or ephemeral runtime state remain (stale cgroups, runtime temps). It is
+/// `runtime_proof` is present only after the caller has proven no processes or
+/// ephemeral runtime state remain (stale cgroups, runtime temps). It is
 /// required before a `Releasing` lease for an absent sandbox may be freed.
 #[derive(Debug, Default)]
 pub(crate) struct Reconciliation {
@@ -367,7 +390,7 @@ pub(crate) struct Reconciliation {
 pub(crate) fn reconcile(
     allocator: &SubidAllocator,
     lookup: &dyn Fn(&SandboxId) -> Result<Option<SandboxView>, String>,
-    runtime_reconciled: bool,
+    runtime_proof: Option<RuntimeReconciliationProof>,
 ) -> Result<Reconciliation, Error> {
     let mut report = Reconciliation::default();
     for record in allocator.load()? {
@@ -375,10 +398,17 @@ pub(crate) fn reconcile(
         match record.state {
             LeaseState::Reserved => match sandbox {
                 None => {
-                    // Startup order guarantees partial managed trees were
-                    // cleaned before lease reconciliation; nothing was ever
-                    // launchable under a Reserved lease.
-                    allocator.store.remove(&record.lease_id)?;
+                    // A Reserved lease is never launchable: the manager only
+                    // returns a handle after the durable sandbox is published
+                    // and this record has been activated. Assert that
+                    // activate-before-launch invariant before freeing the
+                    // absent reservation.
+                    assert_eq!(
+                        record.state,
+                        LeaseState::Reserved,
+                        "only a Reserved lease may be freed through absent-sandbox recovery"
+                    );
+                    allocator.free_reserved_absent(&record)?;
                     report.freed.push(record);
                 }
                 Some(SandboxView::Active { owner } | SandboxView::Deleting { owner })
@@ -438,7 +468,7 @@ pub(crate) fn reconcile(
                     allocator.quarantine(&record, &reason)?;
                     report.quarantined.push((record, reason));
                 }
-                None if runtime_reconciled => {
+                None if runtime_proof.is_some() => {
                     // Processes, namespaces, and backing are gone; the
                     // release transaction completes here.
                     allocator.finish_release(&record)?;
@@ -507,6 +537,11 @@ fn lowest_available(ranges: &[SubidRange], unavailable: &HashSet<u32>) -> Option
         .iter()
         .flat_map(|range| range.ids())
         .find(|id| *id != 0 && !unavailable.contains(id))
+}
+
+fn effective_gid() -> u32 {
+    // SAFETY: getegid is signal-safe and cannot fail.
+    unsafe { libc::getegid() }
 }
 
 fn capacity(ranges: &[SubidRange], records: &[LeaseRecord], kind: IdKind) -> PoolCapacity {
@@ -641,6 +676,33 @@ mod tests {
     }
 
     #[test]
+    fn allocation_skips_daemon_uid_and_gid() {
+        let root = scratch();
+        let alloc = allocator(&root);
+        let daemon_uid = crate::paths::euid();
+        let daemon_gid = effective_gid();
+        let around = |reserved| {
+            if reserved == u32::MAX {
+                ranges((u32::MAX - 1) as u64, 2)
+            } else {
+                ranges(reserved as u64, 2)
+            }
+        };
+        let delegation = Delegation {
+            uid_ranges: around(daemon_uid),
+            gid_ranges: around(daemon_gid),
+        };
+        let record = alloc
+            .claim(&sandbox("daemon-id"), &owner(), &delegation)
+            .expect("claim the non-daemon IDs");
+        assert_ne!(record.uid, daemon_uid);
+        assert_ne!(record.gid, daemon_gid);
+        assert_ne!(record.uid, 0);
+        assert_ne!(record.gid, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parallel_claims_are_unique() {
         let root = scratch();
         let alloc = std::sync::Arc::new(allocator(&root));
@@ -728,6 +790,22 @@ mod tests {
             .claim(&sandbox("stage"), &owner(), &tiny)
             .expect_err("quarantined pair must not be selected");
         assert!(matches!(error, Error::Exhausted { .. }), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_reason_survives_ledger_round_trip() {
+        let root = scratch();
+        let alloc = allocator(&root);
+        let record = claim_active(&alloc, "reason");
+        let reason = "owner mismatch during startup";
+        alloc.quarantine(&record, reason).expect("quarantine");
+        let persisted = alloc
+            .lease_for(&sandbox("reason"))
+            .expect("load")
+            .expect("quarantined lease");
+        assert_eq!(persisted.state, LeaseState::Quarantined);
+        assert_eq!(persisted.quarantine_reason.as_deref(), Some(reason));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -831,6 +909,7 @@ mod tests {
         let duplicate = LeaseRecord {
             lease_id: ledger::new_lease_id(),
             uid: record.uid,
+            quarantine_reason: None,
             ..record.clone()
         };
         alloc.store.write(&duplicate).expect("write duplicate");
@@ -1000,7 +1079,12 @@ mod tests {
         .collect();
         let lookup = |id: &SandboxId| Ok(views.get(id).cloned());
 
-        let report = reconcile(&alloc, &lookup, true).expect("reconcile");
+        let report = reconcile(
+            &alloc,
+            &lookup,
+            Some(RuntimeReconciliationProof::from_successful_sweep()),
+        )
+        .expect("reconcile");
         assert_eq!(report.promoted.len(), 1);
         assert_eq!(report.promoted[0].lease_id, promoting.lease_id);
         assert_eq!(report.promoted[0].state, LeaseState::Active);
@@ -1025,7 +1109,7 @@ mod tests {
         let alloc = allocator(&root);
         let record = claim_active(&alloc, "gone");
         alloc.begin_release(&record).expect("begin release");
-        let report = reconcile(&alloc, &|_| Ok(None), false).expect("reconcile");
+        let report = reconcile(&alloc, &|_| Ok(None), None).expect("reconcile");
         assert!(report.freed.is_empty(), "no free without runtime proof");
         assert_eq!(
             alloc
@@ -1035,7 +1119,12 @@ mod tests {
             record.with_state(LeaseState::Releasing)
         );
         // Once proven, the same reconciliation frees it.
-        let report = reconcile(&alloc, &|_| Ok(None), true).expect("reconcile");
+        let report = reconcile(
+            &alloc,
+            &|_| Ok(None),
+            Some(RuntimeReconciliationProof::from_successful_sweep()),
+        )
+        .expect("reconcile");
         assert_eq!(report.freed.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1057,7 +1146,7 @@ mod tests {
                     owner: other_owner(),
                 }))
             },
-            true,
+            Some(RuntimeReconciliationProof::from_successful_sweep()),
         )
         .expect("reconcile");
         assert_eq!(report.quarantined.len(), 2);
@@ -1090,7 +1179,7 @@ mod tests {
                     reason: "metadata is malformed".to_string(),
                 }))
             },
-            true,
+            Some(RuntimeReconciliationProof::from_successful_sweep()),
         )
         .expect("reconcile");
         assert!(report.freed.is_empty());
@@ -1114,8 +1203,12 @@ mod tests {
         let record = alloc
             .claim(&sandbox("unknown"), &owner(), &delegation())
             .expect("claim");
-        let error = reconcile(&alloc, &|_| Err("storage unavailable".to_string()), true)
-            .expect_err("lookup error");
+        let error = reconcile(
+            &alloc,
+            &|_| Err("storage unavailable".to_string()),
+            Some(RuntimeReconciliationProof::from_successful_sweep()),
+        )
+        .expect_err("lookup error");
         assert!(matches!(error, Error::Lookup(reason) if reason == "storage unavailable"));
         assert_eq!(
             alloc

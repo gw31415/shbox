@@ -89,6 +89,8 @@ pub(crate) struct LeaseRecord {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) state: LeaseState,
+    /// Why this lease was quarantined, if it is quarantined.
+    pub(crate) quarantine_reason: Option<String>,
 }
 
 impl LeaseRecord {
@@ -100,13 +102,22 @@ impl LeaseRecord {
             uid: self.uid,
             gid: self.gid,
             state,
+            quarantine_reason: (state == LeaseState::Quarantined)
+                .then(|| self.quarantine_reason.clone())
+                .flatten(),
         }
+    }
+
+    pub(crate) fn with_quarantine_reason(&self, reason: &str) -> LeaseRecord {
+        let mut record = self.with_state(LeaseState::Quarantined);
+        record.quarantine_reason = Some(reason.to_string());
+        record
     }
 
     /// Encode in a stable field order. Domain values are ASCII-restricted;
     /// debug string quoting keeps the serializer correct if that widens.
     pub(crate) fn encode(&self) -> String {
-        format!(
+        let mut encoded = format!(
             "version = {VERSION}\nlease_id = {:?}\nsandbox_id = {:?}\nowner = {:?}\nuid = {}\ngid = {}\nstate = {:?}\n",
             self.lease_id,
             self.sandbox_id.as_str(),
@@ -114,7 +125,11 @@ impl LeaseRecord {
             self.uid,
             self.gid,
             self.state.as_str(),
-        )
+        );
+        if let Some(reason) = &self.quarantine_reason {
+            encoded.push_str(&format!("quarantine_reason = {reason:?}\n"));
+        }
+        encoded
     }
 
     /// The record's file name: `<lease_id>.toml`. The lease token is the
@@ -153,6 +168,9 @@ impl LeaseRecord {
             return Err(Error::ZeroId);
         }
         let state = LeaseState::parse(&raw.state)?;
+        if raw.quarantine_reason.is_some() && state != LeaseState::Quarantined {
+            return Err(Error::InvalidQuarantineReason);
+        }
         Ok(LeaseRecord {
             lease_id: raw.lease_id,
             sandbox_id,
@@ -160,6 +178,7 @@ impl LeaseRecord {
             uid: raw.uid,
             gid: raw.gid,
             state,
+            quarantine_reason: raw.quarantine_reason,
         })
     }
 }
@@ -193,6 +212,8 @@ struct RawLease {
     uid: u32,
     gid: u32,
     state: String,
+    #[serde(default)]
+    quarantine_reason: Option<String>,
 }
 
 /// Filesystem-backed lease ledger. The directory is validated like every
@@ -221,6 +242,7 @@ impl LeaseStore {
                 let permissions = std::fs::Permissions::from_mode(0o700);
                 std::fs::set_permissions(root, permissions)
                     .map_err(|error| Error::io("set the lease directory mode", root, error))?;
+                sync_parent_directory(root)?;
             }
             Err(error) if !errno_is(&error, libc::EEXIST) => {
                 return Err(Error::io("create the lease directory", root, error));
@@ -358,7 +380,10 @@ impl LeaseStore {
     }
 
     fn open_root(&self) -> Result<DirFd, Error> {
-        open_directory_path(&self.root).map_err(|error| self.io("open the lease directory", error))
+        let directory = open_directory_path(&self.root)
+            .map_err(|error| self.io("open the lease directory", error))?;
+        validate_ownership(&self.root, directory.as_raw_fd())?;
+        Ok(directory)
     }
 
     fn trip(&self, point: FaultPoint) -> Result<(), Error> {
@@ -440,6 +465,7 @@ pub(crate) enum Error {
     },
     ZeroId,
     InvalidState(String),
+    InvalidQuarantineReason,
 }
 
 impl Error {
@@ -504,8 +530,22 @@ impl fmt::Display for Error {
             }
             Error::ZeroId => f.write_str("lease record maps UID or GID 0"),
             Error::InvalidState(state) => write!(f, "lease record state {state:?} is invalid"),
+            Error::InvalidQuarantineReason => {
+                f.write_str("lease record has a quarantine reason but is not quarantined")
+            }
         }
     }
+}
+
+fn sync_parent_directory(root: &Path) -> Result<(), Error> {
+    let parent = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = open_directory_path(parent)
+        .map_err(|error| Error::io("open the lease directory parent", root, error))?;
+    sync_directory(directory.as_raw_fd())
+        .map_err(|error| Error::io("fsync the lease directory parent", root, error))
 }
 
 impl std::error::Error for Error {
@@ -534,6 +574,7 @@ mod tests {
             uid: 100_000,
             gid: 200_000,
             state,
+            quarantine_reason: None,
         }
     }
 
@@ -613,6 +654,32 @@ mod tests {
         store.remove(&record.lease_id).expect("remove");
         assert!(store.load().expect("load").is_empty());
         assert_eq!(store.read(&record.lease_id).expect("read"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_reason_round_trips() {
+        let mut record = record(LeaseState::Quarantined);
+        record.quarantine_reason = Some("owner mismatch during startup".to_string());
+        let encoded = record.encode();
+        assert_eq!(
+            LeaseRecord::decode(encoded.as_bytes(), &record.lease_id).expect("decode"),
+            record
+        );
+    }
+
+    #[test]
+    fn store_revalidates_directory_mode_on_each_open() {
+        let root =
+            std::env::temp_dir().join(format!("shbox-lease-test-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = LeaseStore::open(&root, None).expect("open");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770))
+            .expect("make the directory unsafe");
+        assert!(matches!(
+            store.load(),
+            Err(Error::UnsafeDirectory(_, reason)) if reason == "group or world writable"
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

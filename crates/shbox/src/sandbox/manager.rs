@@ -268,14 +268,17 @@ impl SandboxManager {
     /// descendants in orphaned domains. If resource reconciliation fails,
     /// the manager stays unavailable and no `Deleting` tree is touched.
     pub(crate) fn reconcile_startup(&self) {
-        if let Err(error) = self.launcher.reconcile_startup_resources() {
-            tracing::error!(
-                error = %error,
-                "sandbox resource reconciliation failed; keeping manager unavailable and deferring Deleting workspace cleanup"
-            );
-            return;
-        }
-        if let Err(error) = self.reconcile_subid_leases() {
+        let runtime_proof = match self.launcher.reconcile_startup_resources() {
+            Ok(()) => super::subid::RuntimeReconciliationProof::from_successful_sweep(),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "sandbox resource reconciliation failed; keeping manager unavailable and deferring Deleting workspace cleanup"
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.reconcile_subid_leases(runtime_proof) {
             tracing::error!(
                 error = %error,
                 "subordinate identity reconciliation failed; keeping manager unavailable"
@@ -289,7 +292,10 @@ impl SandboxManager {
     /// Reconcile durable subordinate leases only after platform process
     /// resources have been proven empty. A lease record is the authority for
     /// ID reuse; an absent process domain alone never frees it.
-    fn reconcile_subid_leases(&self) -> Result<(), Error> {
+    fn reconcile_subid_leases(
+        &self,
+        runtime_proof: super::subid::RuntimeReconciliationProof,
+    ) -> Result<(), Error> {
         let Some(allocator) = &self.subids else {
             return Ok(());
         };
@@ -308,7 +314,7 @@ impl SandboxManager {
                 Ok(Entry::Absent) => Ok(None),
                 Err(error) => Err(error.to_string()),
             },
-            true,
+            Some(runtime_proof),
         )
         .map_err(|error| Error::Subid(error.to_string()))?;
         for record in report.promoted {
