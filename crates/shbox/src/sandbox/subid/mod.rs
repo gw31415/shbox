@@ -150,6 +150,11 @@ pub(crate) struct SubidAllocator {
     /// record file is keyed by lease incarnation, so this small index lets a
     /// warm `lease_for` read exactly one file instead of scanning every lease.
     lease_ids: Mutex<HashMap<SandboxId, String>>,
+    /// Claims are published as `Active` in one durable write. The manager's
+    /// follow-up activation call acknowledges that publication; keeping the
+    /// acknowledgement one-shot preserves the old transition contract for
+    /// repeated activation attempts without adding ledger state.
+    pending_activations: Mutex<HashSet<String>>,
 }
 
 impl SubidAllocator {
@@ -158,6 +163,7 @@ impl SubidAllocator {
             store,
             selection: Mutex::new(()),
             lease_ids: Mutex::new(HashMap::new()),
+            pending_activations: Mutex::new(HashSet::new()),
         }
     }
 
@@ -221,12 +227,14 @@ impl SubidAllocator {
     }
 
     /// Allocate one UID and one GID for a new sandbox incarnation and
-    /// durably publish the `Reserved` record. UID and GID pools are
-    /// independent; each gets its own lowest-available selection.
+    /// durably publish the `Active` record. UID and GID pools are independent;
+    /// each gets its own lowest-available selection.
     ///
-    /// Returns the reserved record; the caller publishes the durable sandbox
-    /// and then calls [`SubidAllocator::activate`]. Only after activation
-    /// may the lease back a launch.
+    /// Durable sandbox publication is atomic, so the separate Reserved write
+    /// is unnecessary on this path. The caller publishes the durable sandbox
+    /// and then calls [`SubidAllocator::activate`] to acknowledge the claim;
+    /// an interrupted publication leaves an `Active`+absent record for
+    /// fail-closed reconciliation rather than making the IDs appear free.
     pub(crate) fn claim(
         &self,
         sandbox_id: &SandboxId,
@@ -256,23 +264,23 @@ impl SubidAllocator {
                 sandbox_id.as_str()
             )));
         }
-        let mut unavailable_uid = HashSet::from([0, crate::paths::euid()]);
-        let mut unavailable_gid = HashSet::from([0, effective_gid()]);
+        let mut available_uid = AvailableIds::from_ranges(&delegation.uid_ranges);
+        let mut available_gid = AvailableIds::from_ranges(&delegation.gid_ranges);
+        available_uid.remove(0);
+        available_uid.remove(crate::paths::euid());
+        available_gid.remove(0);
+        available_gid.remove(effective_gid());
         for record in &records {
-            unavailable_uid.insert(record.uid);
-            unavailable_gid.insert(record.gid);
+            available_uid.remove(record.uid);
+            available_gid.remove(record.gid);
         }
-        let uid = lowest_available(&delegation.uid_ranges, &unavailable_uid).ok_or_else(|| {
-            Error::Exhausted {
-                uid: capacity(&delegation.uid_ranges, &records, IdKind::Uid),
-                gid: capacity(&delegation.gid_ranges, &records, IdKind::Gid),
-            }
+        let uid = available_uid.lowest().ok_or_else(|| Error::Exhausted {
+            uid: capacity(&delegation.uid_ranges, &records, IdKind::Uid),
+            gid: capacity(&delegation.gid_ranges, &records, IdKind::Gid),
         })?;
-        let gid = lowest_available(&delegation.gid_ranges, &unavailable_gid).ok_or_else(|| {
-            Error::Exhausted {
-                uid: capacity(&delegation.uid_ranges, &records, IdKind::Uid),
-                gid: capacity(&delegation.gid_ranges, &records, IdKind::Gid),
-            }
+        let gid = available_gid.lowest().ok_or_else(|| Error::Exhausted {
+            uid: capacity(&delegation.uid_ranges, &records, IdKind::Uid),
+            gid: capacity(&delegation.gid_ranges, &records, IdKind::Gid),
         })?;
         let record = LeaseRecord {
             lease_id: ledger::new_lease_id(),
@@ -280,10 +288,14 @@ impl SubidAllocator {
             owner: owner.clone(),
             uid,
             gid,
-            state: LeaseState::Reserved,
+            state: LeaseState::Active,
             quarantine_reason: None,
         };
         self.store.write(&record)?;
+        self.pending_activations
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .insert(record.lease_id.clone());
         self.lease_ids
             .lock()
             .map_err(|_| Error::SelectionPoisoned)?
@@ -293,11 +305,49 @@ impl SubidAllocator {
         Ok(record)
     }
 
-    /// `Reserved -> Active`: the durable sandbox has been published. The
-    /// expected record pins the incarnation (`lease_id`) so a stale caller
-    /// cannot activate a newer lease.
+    /// A newly claimed `Active` record is acknowledged without another
+    /// durable write. Legacy `Reserved` records still transition to `Active`
+    /// here. The expected record pins the incarnation (`lease_id`) so a stale
+    /// caller cannot activate a newer lease.
     pub(crate) fn activate(&self, expected: &LeaseRecord) -> Result<LeaseRecord, Error> {
-        self.transition(expected, &[LeaseState::Reserved], LeaseState::Active)
+        let _guard = self.mutation_guard()?;
+        let current = self
+            .store
+            .read(&expected.lease_id)?
+            .ok_or_else(|| Error::MissingLease(expected.lease_id.clone()))?;
+        if !same_incarnation(&current, expected) {
+            return Err(Error::StateConflict(format!(
+                "lease {} is not the expected incarnation (sandbox/owner/IDs changed)",
+                expected.lease_id
+            )));
+        }
+        match (expected.state, current.state) {
+            (LeaseState::Active, LeaseState::Active) => {
+                let acknowledged = self
+                    .pending_activations
+                    .lock()
+                    .map_err(|_| Error::SelectionPoisoned)?
+                    .remove(&expected.lease_id);
+                if acknowledged {
+                    Ok(current)
+                } else {
+                    Err(Error::StateConflict(format!(
+                        "lease {} is already active",
+                        expected.lease_id
+                    )))
+                }
+            }
+            (LeaseState::Reserved, LeaseState::Reserved) => {
+                let next = current.with_state(LeaseState::Active);
+                self.store.write(&next)?;
+                Ok(next)
+            }
+            (_, current_state) => Err(Error::StateConflict(format!(
+                "lease {} is {}, expected Reserved or a pending Active claim",
+                expected.lease_id,
+                current_state.as_str()
+            ))),
+        }
     }
 
     /// `Active -> Releasing`, durable **before** any destructive cleanup
@@ -324,6 +374,10 @@ impl SubidAllocator {
         // of the same incarnation.
         self.expected_record(expected, &["releasing"])?;
         self.store.remove(&expected.lease_id)?;
+        self.pending_activations
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .remove(&expected.lease_id);
         self.lease_ids
             .lock()
             .map_err(|_| Error::SelectionPoisoned)?
@@ -346,6 +400,10 @@ impl SubidAllocator {
             )));
         }
         self.store.write(&current.with_quarantine_reason(reason))?;
+        self.pending_activations
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .remove(&expected.lease_id);
         Ok(())
     }
 
@@ -353,6 +411,10 @@ impl SubidAllocator {
         let _guard = self.mutation_guard()?;
         self.expected_record(expected, &["reserved"])?;
         self.store.remove(&expected.lease_id)?;
+        self.pending_activations
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .remove(&expected.lease_id);
         self.lease_ids
             .lock()
             .map_err(|_| Error::SelectionPoisoned)?
@@ -442,7 +504,7 @@ impl SubidAllocator {
 }
 
 /// Guards one allocator mutation. All paths that need both locks acquire the
-/// process-local selection mutex first, then the ledger's `flock`.
+/// ledger's `flock` first, then the process-local selection mutex.
 struct MutationGuard<'a> {
     _selection: MutexGuard<'a, ()>,
     _ledger: ledger::LedgerLock<'a>,
@@ -645,15 +707,63 @@ enum IdKind {
     Gid,
 }
 
-/// Deterministic lowest-available selection across (possibly fragmented)
-/// ranges. ID 0 is never selected regardless of delegation.
-fn lowest_available(ranges: &[SubidRange], unavailable: &HashSet<u32>) -> Option<u32> {
-    let mut sorted: Vec<&SubidRange> = ranges.iter().collect();
-    sorted.sort_by_key(|range| range.start());
-    sorted
-        .iter()
-        .flat_map(|range| range.ids())
-        .find(|id| *id != 0 && !unavailable.contains(id))
+/// Sorted inclusive free intervals for one delegated ID kind. Removing a
+/// record splits at most one interval, and the lowest available ID is always
+/// the first interval's start; selection never walks every delegated ID.
+#[derive(Debug, Default)]
+struct AvailableIds {
+    intervals: BTreeMap<u32, u32>,
+}
+
+impl AvailableIds {
+    fn from_ranges(ranges: &[SubidRange]) -> AvailableIds {
+        let mut ranges: Vec<(u32, u32)> = ranges
+            .iter()
+            .map(|range| {
+                let count = range.ids().count() as u64;
+                let end = range.start() as u64 + count - 1;
+                (range.start(), end as u32)
+            })
+            .collect();
+        ranges.sort_unstable();
+
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
+                    *previous_end = (*previous_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        AvailableIds {
+            intervals: merged.into_iter().collect(),
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        let Some((&start, &end)) = self.intervals.range(..=id).next_back() else {
+            return;
+        };
+        if id > end {
+            return;
+        }
+        if start == end {
+            self.intervals.remove(&start);
+        } else if id == start {
+            self.intervals.remove(&start);
+            self.intervals.insert(id + 1, end);
+        } else if id == end {
+            self.intervals.insert(start, end - 1);
+        } else {
+            self.intervals.insert(start, id - 1);
+            self.intervals.insert(id + 1, end);
+        }
+    }
+
+    fn lowest(&self) -> Option<u32> {
+        self.intervals.first_key_value().map(|(&start, _)| start)
+    }
 }
 
 fn effective_gid() -> u32 {
@@ -1217,11 +1327,12 @@ mod tests {
                             let retry = alloc.claim(&sandbox("dev"), &owner(), &tiny);
                             assert!(retry.is_ok(), "{point:?}: {retry:?}");
                         }
-                        // Parent-sync fault leaves a durable Reserved
-                        // record; reconciliation decides, absence would be
-                        // the only free state.
+                        // Parent-sync fault leaves a durable Active record; the
+                        // atomic sandbox publication was not confirmed, so
+                        // reconciliation decides and absence remains the only free
+                        // state.
                         (Some(record), LeaseParentSync) => {
-                            assert_eq!(record.state, LeaseState::Reserved);
+                            assert_eq!(record.state, LeaseState::Active);
                         }
                         (record, point) => panic!("unexpected {record:?} at {point:?}"),
                     }
@@ -1270,10 +1381,16 @@ mod tests {
         let root = scratch();
         let alloc = allocator(&root);
 
-        // Crash window: Reserved + published Active sandbox -> promoted.
+        // Retain coverage for the legacy Reserved + published Active sandbox
+        // crash window. New claims publish Active in one ledger write.
         let promoting = alloc
             .claim(&sandbox("win"), &owner(), &delegation())
             .expect("claim");
+        let reserved = promoting.with_state(LeaseState::Reserved);
+        alloc
+            .store
+            .write(&reserved)
+            .expect("restore reserved crash window");
         // Active + absent -> quarantined.
         let orphan = claim_active(&alloc, "orphan");
         // Releasing + present -> resuming deletion.

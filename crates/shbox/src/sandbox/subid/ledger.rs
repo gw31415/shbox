@@ -19,9 +19,9 @@
 //! two daemons can select the same lowest-available pair. The lock file is
 //! created once and never unlinked (see [`LOCK_FILE_NAME`]).
 //!
-//! The allocator acquires its process-local selection mutex before this
-//! ledger lock. Any future code that needs both must use that same order and
-//! must not acquire the mutex while holding this flock. A process crash while
+//! The allocator acquires this ledger lock before its process-local selection
+//! mutex. Any future code that needs both must use that same order and must
+//! not acquire the flock while holding the mutex. A process crash while
 //! holding the flock releases it in the kernel.
 
 use std::fmt;
