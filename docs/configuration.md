@@ -1,6 +1,6 @@
 # shbox 設定仕様
 
-この文書は v0.1 の公開 TOML schema、CLI override、XDG layout、built-in concurrency cap を定義する。backend selector や raw backend option は公開しないが、§4.4 の resource limit（Linux の `cgroup_parent` を含む）は platform-specific な公開設定である。
+この文書は v0.1 の公開 TOML schema、CLI override、XDG layout、built-in concurrency cap を定義する。backend selector や raw backend option は公開しないが、§4.5 の resource limit（Linux の `cgroup_parent` を含む）は platform-specific な公開設定である。
 
 ## 1. 読み込みと lifetime
 
@@ -123,6 +123,12 @@ namespace、parent-installed one-entry map、ID-mapped workspace/runtime mount �
 ID-map broker、kernel/filesystem の ID-mapped mount 対応のいずれかが欠けている
 場合、launch は daemon identity に fallback せず fail closed する。
 
+subid delegation は shadow-utils の `getsubids` で割当ごとに照会し（NSS `subid`
+backend に従う）、`/etc/subuid`/`/etc/subgid` を直接は解釈しない。lease は
+durable sandbox と同寿命で SSH session や daemon restart を跨ぎ、ledger は
+`$XDG_DATA_HOME/shbox/subid-leases`（§8）に置く。macOS はこの分離を提供しな
+いため、`isolated` を指定した通常 sandbox の作成は fail closed する。
+
 この設定は daemon 起動時の immutable snapshot であり、admin の `_` host route
 には適用されない。`runtime_uid`/`runtime_gid` は namespace 内の `1000:1000`
 で固定され、host-visible ID は shbox が lease した値になる。通常の launch で
@@ -167,7 +173,7 @@ OS が ordinary command runtime に必要とする system/runtime path は imple
 
 macOS の `memory_max` は `RLIMIT_AS`、`pids_max` は `RLIMIT_NPROC` として child の exec 前に設定され、descendant に継承される。これらは Linux cgroup tree quota ではない。
 
-### 4.5 `[sandbox.env]`
+### 4.6 `[sandbox.env]`
 
 全 sandbox launch に追加する `name = "value"` table。
 
@@ -246,11 +252,11 @@ Linux の private `TMPDIR` は sandbox runtime-domain generation ごとに一つ
 | sandboxes per owner | 128 |
 | SSH handshake timeout | 30 s |
 
-これらは admission/concurrency limit であり、§4.4 の per-sandbox resource limits の代替ではない。file-size/open-file quota を設定する機能でもない。`concurrent launch operations per sandbox`（内部 cap 名 `max_concurrent_launches_per_sandbox`）は `SandboxId` ごとの launch 数に対して数えられ、Linux の実 process 数は `pids.max` が cgroup 全体で数える（daemon 全体での global cap ではない）。
+これらは admission/concurrency limit であり、§4.5 の per-sandbox resource limits の代替ではない。file-size/open-file quota を設定する機能でもない。`concurrent launch operations per sandbox`（内部 cap 名 `max_concurrent_launches_per_sandbox`）は `SandboxId` ごとの launch 数に対して数えられ、Linux の実 process 数は `pids.max` が cgroup 全体で数える（daemon 全体での global cap ではない）。
 
 ## 7. Unsupported resource controls
 
-§4.4 に記載した memory、swap、PID、CPU の limit は platform ごとに実装される。v0.1 で提供しない per-launch/per-sandbox quota は次の通りである。
+§4.5 に記載した memory、swap、PID、CPU の limit は platform ごとに実装される。v0.1 で提供しない per-launch/per-sandbox quota は次の通りである。
 
 - file-size quota
 - open-file quota
@@ -270,6 +276,7 @@ $XDG_CONFIG_HOME/shbox/allowed_keys
 
 $XDG_DATA_HOME/shbox/registry.lock
 $XDG_DATA_HOME/shbox/sandboxes/<id>/
+$XDG_DATA_HOME/shbox/subid-leases/
 
 $XDG_STATE_HOME/shbox/host_key
 $XDG_STATE_HOME/shbox/lock

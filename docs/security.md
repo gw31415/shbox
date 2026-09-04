@@ -31,6 +31,7 @@ shbox は SSH authentication/authorization、durable sandbox ownership、workspa
 - disabled network policyでのhost/external network reachability
 - authentication/ownership metadata integrity
 - PTY/process descriptor ownership
+- subordinate UID/GID lease ledgerの整合性（sandbox間のID衝突と、daemon自身のUID/GIDへのmapping）
 
 ## 2. Authentication と principal
 
@@ -98,6 +99,8 @@ sandbox processの意図したwrite surface:
 
 system/runtimeのcurated pathとconfigured `read_paths`はread-only。other sandbox、shbox config/data/state、host shared tempをbroad write grantしない。
 
+isolated identityのsandboxでは、このwrite surfaceはさらにmount layerで制約される。workspace/runtime tempへの書き込みはleased subordinate UID/GIDにmapされたdetached mount経由のみで、継承したmount tree全体はchild内で再帰的にread-onlyになる。host filesystem上の当該fileのownerはleased subordinate UID/GIDとなり、daemon accountが作成したfileとはDAC levelで区別される。
+
 ## 5. Process confinement boundary
 
 ### 5.1 Backend-neutral policy
@@ -108,6 +111,7 @@ policyには:
 
 - shell
 - network mode
+- identity mode（`host`はdaemonのDAC identity、`isolated`はsubordinate UID/GID lease + mapped user namespace。Linux runtimeのみ）
 - curated/configured read paths
 - operator environment
 - private runtime temp root (Linux generation-scoped; per-launch on macOS)
@@ -125,10 +129,23 @@ security-critical rules:
 - post-fork childはallocation-heavy builderを呼ばない
 - Landlock policy apply前にworkspace/session/PTTY setupをfixed raw operationで行う
 - disabled networkはfresh user+network namespaceでhost/external reachabilityを切り離し、Landlock network mediation（ABI 4+）でもTCP `bind`/`connect`を拒否する。namespace/capability setupに失敗した場合はfail closedする
+- identity helper（`newuidmap`/`newgidmap`）やID-map brokerが要求を満たさない場合、daemon identityへfallbackせずlaunchをfail closedで拒否する
 - signal/IPC scopingはkernel ABIが提供する範囲でrequestする
-- project-owned external sandbox executable、sibling helper、self-exec pathへshell outしない
+- project-owned external sandbox executable、sibling helper、self-exec pathへshell outしない（`newuidmap`/`newgidmap`と`getsubids`はadministrator所有PATH上のshadow-utils helper、`shbox-idmap-broker`はsocket activationされる固定binary）
 
 Landlock confinementはdescendantへinheritされる。
+
+### 5.2.1 Identity isolation（`identity = "isolated"`）
+
+isolated sandboxは、durableなsubordinate UID/GID lease（1 sandbox に 1 組）と fresh user namespaceでdaemon資格から分離されたidentityで動く。defaultの`host` modeはdaemonのDAC identityを保持する互換modeであり、network disabled時に使うcaller-mapped user namespace（`unshare --map-root-user`相当）はisolationではない。
+
+mapping barrier。childは`clone3(CLONE_NEWUSER)`直後に`MAP_READY`を送ってblockし、mapのinstallはparent側が行う。engineはpidfdでchildのPIDをpinしたまま、`/proc/<pid>`のdirectory fdを継承した`newuidmap`/`newgidmap`（`fd:N`形式、env clear、固定PATH、PID pathへのfallbackなし）で「runtime ID 1000 ↔ leased host ID・長さ1」の単一entry mapをinstallし、読み戻して完全一致と`setgroups`が`allow`であることを確認してからchildを解放する。helper失敗・map不一致・child早期死亡はすべてkill & reapでfail closedする。namespaceのUID/GID 0は意図的にunmapし、leaseのhost IDにdaemon自身のUID/GIDを指定することをengine側で拒否する。
+
+identity transition。user code実行前に`setresgid` → supplementary group全消去 → `setresuid` → securebits lock（`NOROOT`/`NO_SETUID_FIXUP`/`NO_CAP_AMBIENT_RISE`全部lock）→ `no_new_privs` → capability全dropの順で遷移する。最終stateはUID/GID 1000（real/effective/saved）・supplementary groupなし・capability 0・`NoNewPrivs` 1であり、native testが`/proc/self/status`で固定する。
+
+mount layer。ID-mapped mount作成に必要なroot権限はdaemonに与えない（daemonは`CAP_SYS_ADMIN`を持たない）。daemonはsocket activationされた`shbox-idmap-broker`（root・initial user namespace）に固定長requestとSCM_RIGHTSでmount-ID-map user namespace FDとsource directory FDを渡し、detached mount FDを受け取る。brokerは`SO_PEERCRED`のpeer credential（root peerは拒否）とsource FD（daemon所有・group/world writableでない・削除済みでない・設定されたdata/runtime root配下・leased IDは0でもdaemonのIDでもない）だけを検証し、任意のpathnameやcommandを受け取らない。childは継承mount treeを`mount_setattr`で再帰的にread-only化し、broker由来のdetached mountのみをdescriptor指定でattachする。mount-ID-map用のauxiliary user namespaceはruntime-domain generationごとに作られ、generationと共に解放される。
+
+lease ledger。subordinate pairの選択と遷移はdurable ledger（`subid-leases`、daemon所有の0700 directory、1 record 1 TOML file）で直列化する。pairはUID/GID poolそれぞれで最低availableを選び、ID 0と`Releasing`/`Quarantined`のpairは決して選ばない。重複recordはcorruptionとして停止する。`lease_id`（128-bit）によるincarnation checkで、同一numeric pair再利用後のstale cleanupが新leaseを解放できないようABA保護する。delegation（`getsubids`/`getsubids -g`でNSS対応で発見。`/etc/subuid`はparseしない）はprocess-lifetime可変であり、新規claimと既存leaseの使用前に毎回再照会する。delegation外になったleaseはrecordを保持したまま新規launchをfail closedにする（削除は可能）。pairの解放はverified release transaction（`Active -> Releasing`を破壊的cleanup前にdurable記録 → cleanup証明 → record削除 + directory fsync）のみで、restart reconciliationはruntime資源の回収を証明した後にはじめて`Releasing` + sandbox不在のrecordを解放する。
 
 ### 5.3 macOS
 

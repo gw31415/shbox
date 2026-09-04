@@ -55,6 +55,8 @@ CIはさらにstable toolchainでもformat/Clippy/test/buildを実行する。
 - environment name/value、reserved name/prefix、NUL、size limitを検証すること
 - config/key/host-key/XDG pathのownership・mode・symlink safetyを検証すること
 
+auth単体testのkey-source fixtureは、directoryを0700、fileを0600で明示的に作成する。loaderはgroup/world-writableなkey fileとancestor directoryを正しく拒否するため、fixtureのpermissionはambient umaskに依存してはならない。
+
 ### 4.2 Sandbox lifecycle
 
 必須項目:
@@ -131,7 +133,7 @@ Linux sandbox availability には、resource limit の有無にかかわらず�
 
 `outbound` のportable contractは任意宛先へのclient connectionが使えることまでである。Linuxでは現在これより広いsocket accessが可能になり得るが、macOSはbind/inboundをallowしない。testはclient successを必須にし、portableなinbound behaviorを仮定しない。
 
-engine 単体で all-network denial を検証する場合は、必要な user namespace または privilege setup とともに `NetworkNamespacePolicy::Isolated` を明示し、fresh network namespaceから外部到達性がないことを確認する。public shbox adapter は `network = "disabled"` からこの構成を自動的に選択する。
+engine 単体で all-network denial を検証する場合は、`NetworkNamespacePolicy::Isolated` とともに `IdentityPolicy::CallerMappedRoot` を指定して fresh user namespace を作らせ、fresh network namespaceから外部到達性がないことを確認する。user namespace は namespace topology の選択ではなく identity policy（`IdentityPolicy`）から導かれ、unprivileged daemon が network namespace を作るための権限を供給する。public shbox adapter は `network = "disabled"` からこの構成を自動的に選択する（`identity = "isolated"` の launch は subordinate lease 由来の user namespace を使う）。
 
 ### 5.3 Process cleanup proof
 
@@ -146,6 +148,26 @@ Landlock confinement inheritance と cgroup process containment は別の保証�
 process group は foreground lookup、signal forwarding、job control、publication前の
 防御 cleanup に限って検証し、Linux の detached descendant 回収は cgroup membership
 で検証する。
+
+### 5.4 Identity proof
+
+engine の spawn test は user namespace mapping を次の両方の identity policy で証明する。
+
+`IdentityPolicy::CallerMappedRoot`:
+
+- fresh user namespace 内で caller が uid 0 に map されること（mount namespace 併用の fixture）
+- PID namespace の supervisor/signal forwarding test もこの identity で実行する
+
+`IdentityPolicy::Isolated`（isolated-identity suite）:
+
+- 実 `newuidmap`/`newgidmap` と当該 account の実 subordinate delegation（`/etc/subuid`/`/etc/subgid`）を使う。helper か delegation が無い host では skip する
+- `uid_map`/`gid_map` が runtime 1000 → leased subordinate host ID の単一 entry で、UID/GID 0 の mapping が存在しないこと
+- real/effective/saved/fs UID/GID がすべて 1000、supplementary groups が空、全 capability set が 0、`NoNewPrivs` が 1 であること
+- host 側から見た process credentials が leased subordinate pair であり、daemon 自身の UID/GID が現れないこと
+- daemon private な 0600 file が DAC alone で deny され、同階層の world-readable file は読めること（Landlock に依らない DAC 証明）
+- namespace 内での root 化（`setresuid(0)`/`setresgid(0)`）が失敗すること
+- mapper failure が exec 前に launch を abort すること（副作用を残さない）
+- mapper 無しの isolated launch が fail closed し、diagnostic が不足 seam（`UidGidMapper`）を名指しすること
 
 ## 6. macOS native confinement test
 
@@ -165,6 +187,8 @@ process group は foreground lookup、signal forwarding、job control、publicat
 production launcherはSeatbelt profileをspawn前に構築し、`sandbox-exec -p <profile> -- <shell>`で適用する。PTYはshboxが所有するため、Seatbelt smokeだけでPTY correctnessを代用しない。
 
 macOS resource-limit testでは `memory_max` が `RLIMIT_AS`、`pids_max` が `RLIMIT_NPROC` に変換されること、`cpu_quota_micros` または `swap_max` の指定が launch 前に fail closed することを確認する。
+
+macOS engine は Linux 専用 policy も spawn 前に fail closed で拒否する。seccomp filter と非 `Host` identity（user namespace 要求）は `Unsupported` として検証される。
 
 ## 7. OpenSSH / PTY blocking suite
 
@@ -239,6 +263,10 @@ pipeをPTYの代用にしてはならない。
 - malformed key update時のlast-known-good snapshot維持
 - SIGHUP再検証
 - multiple independent connections
+
+harnessのdaemon fixtureはcrate workspace直下に作成し、中間directoryも含めてすべて0700、`authorized_keys`/`allowed_keys`/`config.toml`は0600を明示する。daemonはkey sourceのancestor chain全体を検証するため、fixtureのpermissionはambient umaskに依存しない。
+
+list/deleteのmanager接続acceptanceはnative process-domain backendが必要である。backendが利用できない環境ではこれらのtestはskipし、sandbox requestのfail-closed pathは別testで検証する（generic unavailable message、またはOpenSSH client側のchannel failure rendering）。
 
 ## 9. CI migration guards
 

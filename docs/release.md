@@ -131,6 +131,11 @@ release時に確認する契約:
 - `network = "outbound"` でcontrolled client endpointへの接続が成功する（portableなinbound behaviorは要求しない）
 - resource limit の有無にかかわらず sandbox launch が delegated cgroup v2 process
   domain を使い、指定 limit が同じ domain に適用される
+- `identity = "isolated"` の launch が subordinate UID/GID lease と root の
+  socket-activated `shbox-idmap-broker` による ID-mapped mount で成立し、
+  subordinate delegation（shadow-utils `getsubids`）・broker・kernel/filesystem の
+  ID-mapped mount 対応の欠落時に fail closed すること（`host` は daemon identity の
+  互換 mode）
 
 Linuxでは設定した memory/swap/PID/CPU limit と process ownership domain を cgroup v2 で
 適用し、macOSでは memory/PID limit をそれぞれ `RLIMIT_AS`/`RLIMIT_NPROC` で適用する。
@@ -213,7 +218,7 @@ Fly Machines上でproduction acceptanceを試みたが、成功しなかった�
 
 ### systemd
 
-`deploy/systemd/shbox.service` は専用unprivileged userを使う。`NoNewPrivileges`等のservice hardeningを維持する。
+`deploy/systemd/shbox.service` は専用unprivileged userを使う。daemonは`identity = "isolated"`のlaunchでroot所有のsetuid shadow helper（`newuidmap`/`newgidmap`）をparent-side mapに使うため、unitの`NoNewPrivileges`は`false`である。user codeの実行前に`no_new_privs`を設定するのはsandbox child自身である。
 
 この unit は systemd 255 以降の `Delegate=cpu memory pids` と
 `DelegateSubgroup=daemon` で daemon を delegated leaf に置く。systemd は指定
@@ -223,6 +228,8 @@ cgroup delegation の要件を満たさないため、外部
 launcher wrapper を配置して補わない。
 
 `KillMode=control-group` はsystemd自身のservice cleanup choiceであり、shbox sandbox backendのcontroller delegation requirementを意味しない。
+
+`identity = "isolated"` を使うdeploymentでは、rootで動くsocket-activatedな`deploy/systemd/shbox-idmap-broker.socket` / `.service`も配置する（`/run/shbox-idmap-broker.sock`で`shbox --internal-idmap-broker`を起動）。brokerは`CAP_SYS_ADMIN`にcapabilityを限定し、受け取るのはdaemon所有directory FDとmount-ID-map user namespace FDだけであって任意のpathnameやcommandは扱わない。Ubuntu 24.04で`kernel.apparmor_restrict_unprivileged_userns=1`の場合は`deploy/apparmor/usr.local.bin.shbox`のprofileをロードする。
 
 ### launchd
 
@@ -252,6 +259,7 @@ release evidenceには最低限次を保存する。
 - executing username/uid
 - OpenSSH version
 - Landlock/cgroup capability diagnostics on Linux
+- subordinate delegation（`getsubids`）と `shbox-idmap-broker` availability（`identity = "isolated"` を含む場合）
 - Seatbelt smoke result on macOS
 - platform script exit status
 - full OpenSSH/PTTY test result

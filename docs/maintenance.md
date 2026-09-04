@@ -13,6 +13,8 @@ shbox は `russh`、`ssh-key`、`tokio`、`nix` などの外部 crate に依存�
 
 `ssh-key` の `-rc` 版を指定している期間は、正式版が出た時点で rc 指定を外す移行を最優先タスクとする。
 
+Linux の `identity = "isolated"` が使う `newuidmap` / `newgidmap` / `getsubids` は crates.io の依存ではなく、administrator 提供の shadow-utils helper（PATH 上の setuid binary と NSS `subid` backend）である。これらは lockfile で pin できないため、distro 側の変更（`getsubids` の出力形式や subordinate delegation の与え方を含む）は platform 系と同じく Linux native gate で確認する。
+
 ## 2. 更新手順
 
 1. 更新は crate 単位で行い、`Cargo.toml` の bump と lockfile 更新を同一 commit にまとめる（`chore(deps)`）。

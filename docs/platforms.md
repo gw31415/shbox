@@ -83,7 +83,7 @@ profile により shbox の bootstrap user namespace だけが generic
 
 ### 2.4 seccomp / namespaces
 
-engine は per-sandbox な seccomp filter（allowlist/denylist/argument filter）と namespace 選択（user/pid/mount/ipc/uts/net）を `SandboxConfig` 経由で提供する。shbox は `network = "disabled"` のとき user+network namespace を使用し、それ以外の namespace と syscall filter は現時点では有効化しない。capability drop と no_new_privs は policy によらず常に適用される。
+engine は per-sandbox な seccomp filter（allowlist/denylist/argument filter）と namespace 選択（pid/mount/ipc/uts/net）を `SandboxConfig` 経由で提供する。user namespace はこの topology 選択には含まれず、identity policy（`IdentityPolicy::Host`/`CallerMappedRoot`/`Isolated`）から導かれる。`CallerMappedRoot` と `Isolated` が fresh user namespace（`CLONE_NEWUSER`）を作り、`Isolated` は加えて fresh mount namespace（ID-mapped writable view の置き換え用）と空の capability set を要求する。shbox の Linux mapping では、`network = "disabled"` のとき network namespace を分離し、host 互換 mode はその network namespace を unprivileged に作るため `CallerMappedRoot` user namespace を使う（`network = "outbound"` の host 互換 mode は user namespace を作らない）。pid/ipc/uts namespace と syscall filter は現時点では有効化しない。capability drop と no_new_privs は policy によらず常に適用される。
 
 ### 2.5 PTY/process setup
 
@@ -151,6 +151,8 @@ profileはdeny-defaultで、validated policyから:
 
 `network = "disabled"` では network allow rule を出力しないため、macOS の Seatbelt path は network operation を許可しない。`outbound` は client-only TCP rule を出力する。macOS の resource limit は `memory_max`/`pids_max` を `RLIMIT_AS`/`RLIMIT_NPROC` に変換し、CPU quota/swap limit は startup で fail closed する。
 
+macOS に Linux user namespace identity の primitive はなく、engine mapping は identity を常に host 相当に解決する。`identity = "isolated"` は macOS では support されず、subordinate delegation の照会の時点で通常 sandbox の作成が fail closed する（engine も非 `Host` identity とあらゆる namespace/seccomp/capability 要求を明示的に拒否する）。
+
 post-fork childで動的policy builderを呼ばない。
 
 ### 3.2 PTY
@@ -200,6 +202,8 @@ generic hosted Linux gateはLinux implementationのnative proofだが、特定pr
 - unprivileged dedicated service account
 - kernelがLandlock ABI 4+（6.7+）を提供すること（filesystem/network policy 用）
 - 書き込み可能な cgroup v2 階層（delegation）。limit の有無にかかわらず、すべての Linux sandbox launch が専用 process domain cgroup を必要とするため必須
+- `identity = "isolated"` 使用時: daemon account への subordinate UID/GID delegation（shadow-utils `getsubids` で照会）と、root で動く socket-activated `shbox-idmap-broker`（`deploy/systemd/shbox-idmap-broker.socket` / `.service` が `/run/shbox-idmap-broker.sock` で `shbox --internal-idmap-broker` を起動する）
+- Ubuntu 24.04 で `kernel.apparmor_restrict_unprivileged_userns=1` の場合は `deploy/apparmor/usr.local.bin.shbox` のロード（§2.3）
 - safe XDG config/data/state directories
 - OpenSSH-facing listener bind capability
 

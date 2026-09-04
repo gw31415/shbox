@@ -8,8 +8,8 @@ standalone workspace crate.
   (0.5); cgroup v2 is a thin dirfd-based wrapper inside this crate. On macOS
   the confinement launcher is the OS-provided `/usr/bin/sandbox-exec`.
 - **No security profiles.** The crate ships no `Developer`/`Untrusted`/
-  `Strict` presets. Filesystem, network, resource, syscall, namespace, and
-  capability policy are all explicit per-spawn caller state
+  `Strict` presets. Filesystem, network, resource, syscall, namespace,
+  identity, and capability policy are all explicit per-spawn caller state
   ([`SandboxConfig`]); composing admin/user/session configuration into that
   struct is the embedding application's job.
 - **Non-negotiable safety invariants.** `PR_SET_NO_NEW_PRIVS`, capability
@@ -54,9 +54,12 @@ reported as `SandboxError::Setup` with the named stage.
 Supported policy surface: separate Landlock filesystem tiers for read-only,
 read-write, and read+execute access, Landlock TCP network restriction,
 cgroup v2 `memory.max`/`memory.swap.max`/`pids.max`/
-`cpu.max`, seccomp allow/deny filters with argument conditions, per-
-namespace selection (user namespaces map the caller to root inside, the
-`unshare --map-root-user` model), capability retention, and explicit
+`cpu.max`, seccomp allow/deny filters with argument conditions, namespace
+topology selection (pid/mount/ipc/uts/net), identity selection
+(`IdentityPolicy::Host` keeps the launcher's identity, `CallerMappedRoot` is
+the `unshare --map-root-user` model, `Isolated` installs parent-side
+delegated UID/GID maps; user namespaces come from the identity policy, not
+the namespace topology), capability retention, and explicit
 inherited file descriptors (which survive exec with their exact numbers).
 `IdentityPolicy::Isolated` requires a parent-side `UidGidMapper`; the shbox
 adapter supplies shadow-utils mapping and broker-prepared `PreparedMounts`.
@@ -68,8 +71,9 @@ The same API backed by a parent-generated Seatbelt profile enforced through
 the OS-provided `/usr/bin/sandbox-exec` launcher. Seatbelt's in-process API
 is deprecated without a stable replacement; the crate deliberately uses the
 OS component instead of guessing at private symbol signatures. Linux-only
-policy fields (namespaces, seccomp filters, retained capabilities, cpu
-quotas, swap limits) are rejected explicitly — never silently ignored.
+policy fields (namespaces, seccomp filters, non-`Host` identity, retained
+capabilities, cpu quotas, swap limits) are rejected explicitly — never
+silently ignored.
 `memory_bytes` maps to `RLIMIT_AS` and `pids` to `RLIMIT_NPROC`.
 
 ## Security boundary

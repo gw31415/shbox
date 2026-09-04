@@ -14,7 +14,7 @@ archival commit を参照すること。
 | SSH channel | I/O transport（wire 上の data/eof/close/signal/resize の配送） | process の生存 |
 | PTY / process group | foreground job control と signal routing（端末 semantics） | sandbox 全体の process inventory |
 | sandbox cgroup | その sandbox runtime に属する **すべて** の Linux process の containment | workspace や metadata の永続性 |
-| durable sandbox (workspace + metadata) | 永続状態 | 実行中 process の管理 |
+| durable sandbox (workspace + metadata + subordinate identity lease) | 永続状態（isolated sandbox は subordinate UID/GID lease を含む） | 実行中 process の管理 |
 
 不変条件（invariant）:
 
@@ -24,6 +24,12 @@ archival commit を参照すること。
 - sandbox delete は sandbox に属するすべての process を終了させる。
   `setsid()` による session 離脱、double-fork、daemonize 済みの descendant を含む。
 - daemon の graceful shutdown はすべての sandbox process を終了させる。
+- subordinate identity lease は durable sandbox と同じ lifetime を持つ。pair の
+  再利用は verified release transaction（`Active -> Releasing -> cleanup 証明 ->
+  record 削除 + directory fsync`）でのみ許され、process・namespace の消失や
+  経過時間からの推測では解放しない。identity は process より先に確保し、
+  process より後（かつ workspace/metadata と同じ delete トランザクション内）で
+  解放する。
 - daemon の crash/restart を跨いだ process の生存は保証しない。次回 startup は
   delegated parent 配下の shbox 所有 `shbox-domain-*` cgroup を enumerate し、
   kill → populated=0 待ち → remove する。対応する `sandbox-*` runtime temp と
@@ -70,17 +76,23 @@ client が一度も acknowledgment を受け取っていない launch の失敗
 
 1. durable metadata を `Deleting` に遷移させる。
 2. 新規 launch を拒否する。
-3. pre-publication 状態の launch を cancel する。
-4. in-flight launch の barrier を待つ。
-5. process domain に対して `cgroup.kill`（SIGKILL）を送る。
-6. `cgroup.events` の `populated` が `0` になるまで待つ。
-7. cgroup を削除する。
-8. runtime temp を削除する。
-9. workspace と durable metadata を削除する。
+3. isolated sandbox なら subordinate identity lease を `Releasing` に durable
+   遷移させる（破壊的 cleanup より前。`Reserved` のままの削除も同じ遷移で受ける）。
+4. pre-publication 状態の launch を cancel する。
+5. in-flight launch の barrier を待つ。
+6. process domain に対して `cgroup.kill`（SIGKILL）を送る。
+7. `cgroup.events` の `populated` が `0` になるまで待つ。
+8. cgroup を削除する。
+9. runtime temp を削除し、generation が保持する mount-ID-map user namespace の
+   descriptor を閉じる。
+10. workspace と durable metadata を削除する。
+11. identity lease record を削除して ledger directory を fsync し、subordinate
+    pair を再利用可能にする（quarantined lease は残す）。
 
 runtime lease（manager の runtime entry）は launch race の管理には有用だが、
 完全な process inventory ではない。descendant は manager に登録されないまま
-cgroup に残り得るため、削除の権威は cgroup membership にある。
+cgroup に残り得るため、削除の権威は cgroup membership にある。lease の解放も
+この順序に従う: process の回収証明より前に pair が再利用可能になることはない。
 
 ### 2.5 Daemon graceful shutdown
 
@@ -88,8 +100,9 @@ cgroup に残り得るため、削除の権威は cgroup membership にある。
 - publication 前の launch barrier と、manager に残る runtime lease の graceful
   cleanup を完了する。
 - 各 sandbox process domain に対して kill → populated=0 待ち → cgroup 削除 →
-  runtime temp 削除を行う。shutdown の process inventory を active SSH channel
-  から導出しない。
+  runtime temp 削除（isolated sandbox は generation の mount-ID-map user
+  namespace descriptor も共に解放）を行う。shutdown の process inventory を
+  active SSH channel から導出しない。
 
 ### 2.6 Daemon restart reconciliation
 
@@ -99,6 +112,14 @@ domain は cgroup membership を権威として kill、empty wait、remove す�
 では `sandbox-*` generation tree だけを recursive に削除する。名前 prefix の外側に
 ある cgroup、runtime file、workspace は変更しない。cleanup の一部が失敗した場合は
 manager を ready にせず、次回 startup または明示的な retry に ownership を残す。
+
+この runtime 資源の reconciliation に続いて subordinate lease ledger を突き合わせる。
+`Reserved` + published sandbox は `Active` へ昇格し（claim と activation の間の crash
+window）、orphan・owner 不一致・corrupt な durable sandbox の lease は `Quarantined`
+へ移す。`Releasing` の lease は、sandbox が残っていれば削除再開へ回し、sandbox が
+不在で runtime 資源の reconciliation が既に process/namespace の不在を証明している
+場合にのみ record を削除して pair を free にする。`Quarantined` は自動再割当て
+しない。lookup 自体が失敗した場合は ledger を変更せず fail closed にする。
 
 この resource reconciliation は durable な `Deleting` workspace の削除よりも
 **前に**完了しなければならない（§1 の process ownership contract: process を必ず
@@ -110,6 +131,9 @@ workspace より先に終了させる）。reconciliation が失敗した場合�
 - runtime temp（`TMPDIR`）は launch ごとではなく sandbox runtime domain ごとに
   作られる。domain 内の全 process が終了し in-flight launch がなくなった時点で
   削除される。直接 child の exit に紐付けない。
+- isolated sandbox の mount-ID-map user namespace も generation ごとの資源であり、
+  runtime temp と同じ timing で解放される。domain の空化は identity lease の解放を
+  意味しない（lease は §2.4 の削除 transaction でのみ解放される）。
 - workspace は runtime が空になっても保持される。
 
 ## 3. Process group の役割の縮小

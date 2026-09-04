@@ -34,6 +34,7 @@ sandbox は次の durable state を持つ。
 - owner fingerprint
 - lifecycle metadata
 - workspace
+- subordinate UID/GID lease（Linux の `identity = "isolated"` sandbox のみ）
 
 process、PTY、environment、runtime temp は durable sandbox stateではない。
 
@@ -205,7 +206,7 @@ v0.1は次を提供しない。
 - container/VM lifecycle
 - persistent rootfs image
 - sandbox attach API
-- UID/GID switching per sandbox
+- 非 Linux platform での UID/GID switching per sandbox（`identity = "isolated"` は Linux runtime のみ。他 platform は作成を fail closed する）
 - file-size/open-file quota
 - workspace disk quota
 - macOSのCPU quota/swap limit

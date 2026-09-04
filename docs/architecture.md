@@ -62,6 +62,8 @@ Absent -> Active -> Deleting -> Absent
 
 create/claim は owner を durable に確定してから process launch を許可する。delete は `Deleting` を durable に記録してから runtime を停止し、workspace/metadata を削除する。crash 後は startup reconciliation が incomplete delete を再開する。
 
+isolated identity の sandbox では、この durable record に加えて subordinate UID/GID lease（§3 の `subid-leases` ledger）が同じ lifetime を持つ。claim 時に `Reserved` として採番し、sandbox の publication 後に `Active` へ、delete の破壊的 cleanup 前に `Releasing` へ durable 遷移し、cleanup 完了後にはじめて record を削除する。lease は daemon restart を跨いで存続し、process/networkns の消失だけでは解放されない。
+
 ## 3. Persistent layout
 
 `xdg` crate の application prefix `shbox` を使う。
@@ -72,6 +74,8 @@ $XDG_CONFIG_HOME/shbox/allowed_keys      sandbox-only public keys
 
 $XDG_DATA_HOME/shbox/registry.lock
 $XDG_DATA_HOME/shbox/sandboxes/<id>/     metadata + workspace
+$XDG_DATA_HOME/shbox/subid-leases/<lease-id>.toml
+                                         subordinate UID/GID lease ledger
 
 $XDG_STATE_HOME/shbox/host_key
 $XDG_STATE_HOME/shbox/lock
@@ -79,6 +83,8 @@ $XDG_STATE_HOME/shbox/runtime/           sandbox-runtime private temp root
 ```
 
 shbox が作成する directory は owner-only を要求し、symlink や group/world writable path を拒否する。config directory は operator input なので自動作成しない。
+
+`subid-leases` は isolated identity（§4.3）の durable な ledger である。各 record は 1 sandbox あたり 1 つの lease（`lease_id`・`sandbox_id`・owner・leased UID/GID・state）を持ち、daemon 所有の directory に 1 record 1 file で書く。書き込みは temp file → write → fsync → rename → 親 directory fsync の durable transaction であり、metadata writer と同じ crash window を fault injection で固定する。
 
 ## 4. Module boundaries
 
@@ -90,6 +96,7 @@ shbox が作成する directory は owner-only を要求し、symlink や group/
 - global/per-owner sandbox caps
 - workspace path validation
 - active runtime lease registry
+- isolated sandbox の subordinate identity lease（claim/activate/release の durable transition と delegation 検証）
 - delete と startup reconciliation
 - daemon shutdown 時の sandbox runtime drain
 
@@ -97,12 +104,13 @@ SSH handler は metadata file を直接編集しない。
 
 ### 4.2 `ProcessLauncher`
 
-`ProcessLauncher` は private trait であり、public plugin/backend selector ではない。入力は validated workspace、shell/exec operation、PTY specification。出力は owned stdin/stdout/stderr、process control、wait result である。
+`ProcessLauncher` は private trait であり、public plugin/backend selector ではない。入力は validated workspace、shell/exec operation、PTY specification、および isolated sandbox の場合は durable lease から解決した identity である。出力は owned stdin/stdout/stderr、process control、wait result である。この trait は sandbox の runtime 資源（process domain・runtime temp・generation 毎の mount ID-map namespace）の release・startup reconciliation・shutdown も担う。
 
 backend-neutral policy は一度だけ構築し、以下を保持する。
 
 - validated shell
 - `disabled` / `outbound` network policy
+- identity mode（`host` は daemon の DAC identity、`isolated` は subordinate UID/GID lease と mapped user namespace。Linux runtime のみ、他 platform は `isolated` を拒否）
 - curated + configured read-only paths
 - operator sandbox environment
 - private runtime temp root (Linux generation-scoped; per-launch on macOS)
@@ -112,20 +120,26 @@ file-size、open-file、workspace disk quota は policy に存在しない。
 
 ### 4.3 Linux launcher
 
-Linux launcher は parent 側で shbox policy を engine の `SandboxConfig` へ解決し、engine が Landlock ruleset 構築・seccomp compile・必要な cgroup 作成をすべて child 生成前に終える。実際の `clone3` は process-lifetime の専用 spawn-owner thread が行い、`PR_SET_PDEATHSIG` が短命な caller thread に結び付かないようにする。PID namespace 無しでは user child が direct clone、PID namespace 有りでは direct clone が内部 PID1 supervisor/reaper となり user command はその PID2 child として動く。
+Linux launcher は parent 側で shbox policy を engine の `SandboxConfig` へ解決し、engine が Landlock ruleset 構築・seccomp compile・必要な cgroup 作成をすべて child 生成前に終える。実際の `clone3` は process-lifetime の専用 spawn-owner thread が行い、`PR_SET_PDEATHSIG` が短命な caller thread に結び付かないようにする。PID namespace 無しでは user child が direct clone、PID namespace 有りでは direct clone が内部 PID1 supervisor/reaper となり user command はその PID2 child として動く。identity 設定はここで policy に従って解決される: `host` は daemon の DAC identity（network disabled のみ caller-mapped user namespace）、`isolated` は durable lease の subordinate UID/GID と fresh user namespace。lease のない isolated launch、lease を伴う host launch はいずれも fail closed に拒否する。
 
 post-fork child が行うのは、事前準備済み data を使った raw/fixed operation に限定する。
 
 1. parent-death signal を設定し namespace-aware に parent liveness を確認
-2. user/mount namespace の初期化
-3. PID namespace 有りなら内部 PID1 が user PID2 を nested clone（limit 時は `CLONE_INTO_CGROUP`）
-4. user process が PTY/pipes を fd 0/1/2 に揃え `setsid()` / controlling terminal / `chdir` を実施
-5. `no_new_privs` / capability / Landlock / seccomp / FD hygiene を適用
-6. target shell を `exec`
+2. user namespace identity。`CallerMappedRoot` は child 自身が単一 entry の `uid_map` / `gid_map` を書く。`Isolated` は child が mapping barrier に `MAP_READY` を送って block し、parent 側の mapper が delegated map を install する（下記）
+3. mount namespace を recursive private にする。isolated launch はさらに継承 mount tree 全体を `mount_setattr`（`AT_RECURSIVE` + read-only）で読み取り専用化し、broker 作成済みの detached ID-mapped workspace/runtime mount を descriptor 指定の `move_mount` でのみ attach する
+4. PID namespace 有りなら内部 PID1 が user PID2 を nested clone（limit 時は `CLONE_INTO_CGROUP`）
+5. isolated launch は runtime identity へ遷移する: `setresgid` → supplementary group の全消去 → `setresuid` → securebits lock（`NOROOT` / `NO_SETUID_FIXUP` / `NO_CAP_AMBIENT_RISE` の全 lock）→ `no_new_privs` → capability 全 drop。namespace UID/GID 0 は意図的に unmap されており、user code は UID/GID 1000・補助 group なし・capability 0 で動く
+6. user process が PTY/pipes を fd 0/1/2 に揃え `setsid()` / controlling terminal / `chdir` を実施
+7. `no_new_privs` / capability / Landlock / seccomp / FD hygiene を適用
+8. target shell を `exec`
+
+isolated launch の mapping barrier は次の手順で成立する。child 生成前に 2 本の one-direction pipe を用意し、`clone3(CLONE_NEWUSER)` 直後の child は `MAP_READY` を送って block する。parent は `CLONE_PIDFD` の pidfd で PID を pin したまま、`/proc/<pid>` の directory fd を継承させた `newuidmap` / `newgidmap`（`fd:N` 形式・env clear・固定 PATH）で「runtime ID ↔ leased host ID・長さ 1」の map を install する。engine は map を読み戻し、単一 entry の完全一致と `setgroups` が `allow` であることを確認してから `MAP_INSTALLED` で child を解放する。helper 失敗・map 不一致・child の早期死亡はいずれも pidfd 経由の kill & reap で fail closed する。lease の host UID/GID に daemon 自身の ID を指定することは engine 側で拒否される。
+
+ID-mapped mount の作成には initial user namespace の root 権が必要なため、daemon は socket activation される `shbox-idmap-broker` に固定長 request と共に SCM_RIGHTS で mount-ID-map user namespace FD と workspace/runtime の source directory FD を渡し、detached mount FD を受け取る。broker（root・initial user namespace で動作）は peer credential と source FD（daemon 所有・group/world writable でない・削除済みでない・設定された data/runtime root 配下）だけを検証し、任意の pathname や command は受け取らない。daemon は `CAP_SYS_ADMIN` を持たない。mount-ID-map 用の auxiliary user namespace は runtime-domain generation ごとに 1 つ作成され（同じ parent 側 mapper barrier で map を install）、その descriptor は generation と同じ lifetime で保持・解放される。同一 sandbox の既存 generation の identity が durable lease と一致しない launch は拒否される。
 
 child setup failure は CLOEXEC status pipe で stage/errno を parent に返し、client には generic launch failure を返す。
 
-confinement engine は workspace 内 crate `shbox-sandbox`（landlock 0.4 / seccompiler 0.5）である。Linux では project-owned な外部 sandbox executable、sibling helper、self-exec path を使わない。
+confinement engine は workspace 内 crate `shbox-sandbox`（landlock 0.4 / seccompiler 0.5）である。Linux では project-owned な外部 sandbox executable、sibling helper、self-exec path を使わない。`newuidmap` / `newgidmap` と `getsubids` は administrator 所有の PATH 上の shadow-utils helper であり、project artifact ではない。
 
 ### 4.4 macOS launcher
 
@@ -152,7 +166,7 @@ startup の主要順序は次である。
 7. backend-neutral launch policy construct
 8. production `ProcessLauncher` preflight
 9. listener bind
-10. managed mode なら startup reconciliation
+10. managed mode なら startup reconciliation。順序は runtime 資源（stale `shbox-domain-*` cgroup と runtime temp generation）→ subordinate lease ledger → durable `Deleting` workspace の削除再開、である。いずれかが失敗すれば manager を ready にしない。lease ledger の reconciliation は、`Reserved` + published sandbox を `Active` へ昇格し、orphan・owner 不一致・corrupt sandbox の lease を `Quarantined` へ移し、runtime 資源の回収を既に証明した上で sandbox が不在の `Releasing` lease のみを削除して pair を再利用可能にする。`Quarantined` は自動再割当てしない。
 
 config と launch policy は process-lifetime snapshot であり SIGHUP では再読込しない。SIGHUP は key source の再検証だけを強制する。
 
@@ -175,8 +189,9 @@ launch ごとの disposable state:
 - stdin/stdout/stderr pipes（non-PTY 時）
 - sandbox-runtime-scoped private `TMPDIR` (Linux); per-launch private temp on macOS
 - runtime lease
+- isolated sandbox の runtime identity（durable lease から解決。lease が `Active`・owner が一致・leased UID/GID が現在の delegation 内であることを launch ごとに再検証する）
 
-workspace は `HOME` と initial `PWD` になる。shell は `SHELL`。PTY request があると `TERM` は request 値が authoritative で、`TMPDIR` は shbox の private runtime directory が authoritative である。Linux では同じ sandbox runtime-domain generation の launch が同じ `TMPDIR` を共有し、domain が空になった後にだけ削除する。
+workspace は `HOME` と initial `PWD` になる。shell は `SHELL`。PTY request があると `TERM` は request 値が authoritative で、`TMPDIR` は shbox の private runtime directory が authoritative である。Linux では同じ sandbox runtime-domain generation の launch が同じ `TMPDIR` を共有し、domain が空になった後にだけ削除する。isolated sandbox では generation は `TMPDIR` に加えて mount-ID-map user namespace も共有する。
 
 ## 8. PTY lifecycle
 
@@ -224,14 +239,16 @@ delete は runtime と persistent state の競合を避ける。
 
 1. Active metadata を Deleting に durable transition
 2. new launch を拒否
-3. registered runtime leases を terminate/force cleanup
-4. workspace tree を安全に削除
-5. metadata を削除
-6. global reservation を解放
+3. isolated sandbox なら identity lease を `Releasing` に durable transition（破壊的 cleanup より前。publication 前の `Reserved` のままの削除も同じ遷移で受ける）
+4. pre-publication の launch を cancel し、in-flight launch の barrier を待ってから process domain を kill → populated=0 待ち → remove、runtime temp（と generation の mount-ID-map namespace descriptor）を解放する
+5. workspace tree を安全に削除
+6. metadata を削除
+7. global reservation を解放
+8. identity lease record を削除して ledger directory を fsync し、subordinate pair を再利用可能にする（quarantined にした lease は record を残す）
 
 resource limit を使う Linux sandbox では、child exit だけでは `SandboxId` の durable resource domain を削除しない。runtime cancellation と child cleanup の完了後、この delete path が domain を release/remove する。
 
-途中 crash では `Deleting` record が restart 後の再開点になる。target workspace が既に無い場合も idempotent に完了する。
+途中 crash では `Deleting` record が restart 後の再開点になる。target workspace が既に無い場合も idempotent に完了する。lease 側では、`Releasing` record が残る crash window を startup reconciliation が閉じる: runtime 資源の reconciliation が process/namespace の不在を証明した後のみ record を削除して pair を free にする。record の不在のみが free を意味し、`Releasing` / `Quarantined` の pair は決して自動再割当てしない。lease の incarnation（128-bit `lease_id`）は同一 numeric pair の再利用後も stale cleanup が新しい lease を削除できないよう ABA 保護に使う。
 
 ## 11. List semantics
 
@@ -253,6 +270,7 @@ kill/populated=0 wait/remove と waiter/cleanup completion を待つ。
 - PTY slave/setup descriptors は spawn 後 parent に残さない。
 - concurrent PTYs は controlling terminal、foreground PGID、window size、signals を共有しない。
 - one connection の teardown はその connection の channel mailboxes を確実に閉じる。
+- isolated sandbox の runtime-domain generation の identity は durable lease と一致しなければならず、不一致の launch は拒否する。lease の UID/GID は ledger 上で一意（重複 record は corruption として停止する）であり、ID 0 は決して選択しない。
 
 ## 14. Error and panic policy
 

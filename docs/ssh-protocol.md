@@ -18,6 +18,8 @@ principal は認証済み Ed25519 key fingerprint と role であり、username 
 
 public-key authenticationのみを通常の認証方式として受理する。invalid key/non-public-key methodは拒否する。
 
+key sourceはhost `authorized_keys` とsandbox `allowed_keys` の2つであり、stat identityが変化した次の認証要求で再読み込みされる。拒否されたrefresh（malformed内容、group/world-writableなfileやancestor directory）ではlast-known-good snapshotが引き続き応答する。SIGHUPは両key sourceの強制再検証のみを行い、config fileは再読み込みしない。
+
 認証成功時に principal と username を connection state に固定する。後続 channel が別 username/identity として振る舞うことはない。
 
 ### 1.2 Admission caps
@@ -108,6 +110,8 @@ launch開始前にrequestをacknowledgeしない。spawn/setup/confinement失敗
 ### 6.1 `list`
 
 `list` はcurrent principalから見えるActive sandbox IDsをsorted textとして返す。
+
+list接続時のusernameはconnection contextにすぎず、owner filteringは認証済みfingerprintを使うため、username自体が有効なSandboxIdである必要はない。
 
 PTY付きlistは拒否する。subsystemに追加argumentはない。
 
@@ -263,6 +267,8 @@ shbox: request cannot be completed
 
 internal path/kernel/policy detailsはoperator logだけに残す。
 
+この状況でOpenSSH clientはdaemonのgeneric stderrを転送せず、独自のchannel failure message（例: `exec request failed on channel`）を表示することがある。fail-closed acceptanceは両方のrenderingを受理する。
+
 ## 17. Channel close / disconnect
 
 started channelがcloseされた場合はbridgeへ`Close` eventを送る。mailboxがfullで送れない場合registry entryをremoveしsenderをdropする。
@@ -293,7 +299,7 @@ SSH channelのprocess ownershipとdaemon global shutdown ownershipがraceして�
 
 SSH `env` requestはsandbox/host process environmentへ反映しない。request拒否だけでconnection全体をkillしない。
 
-sandbox environmentはconfig snapshotとshbox authoritative valuesだけから構成する。
+sandbox environmentはconfig snapshotとshbox authoritative valuesだけから構成する。configはdaemon起動時のimmutable snapshotであり、SIGHUPや認証要求で再読み込みしない。反映には再起動が必要である。
 
 ## 20. Backpressure
 
