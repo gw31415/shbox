@@ -238,7 +238,7 @@ impl SandboxManager {
             SandboxIdentity::Host => None,
             SandboxIdentity::Isolated => {
                 let store = super::subid::LeaseStore::open(paths.subid_leases_root(), None)
-                    .map_err(|error| Error::Subid(error.to_string()))?;
+                    .map_err(|error| Error::Subid(error.into()))?;
                 Some(Arc::new(super::subid::SubidAllocator::new(store)))
             }
         };
@@ -316,7 +316,7 @@ impl SandboxManager {
             },
             Some(runtime_proof),
         )
-        .map_err(|error| Error::Subid(error.to_string()))?;
+        .map_err(Error::Subid)?;
         for record in report.promoted {
             tracing::info!(
                 sandbox_id = %record.sandbox_id,
@@ -472,9 +472,7 @@ impl SandboxManager {
         let metadata = match entry {
             Entry::Absent => {
                 if let Some(allocator) = &self.subids
-                    && let Some(record) = allocator
-                        .lease_for(id)
-                        .map_err(|error| Error::Subid(error.to_string()))?
+                    && let Some(record) = allocator.lease_for(id).map_err(Error::Subid)?
                 {
                     if !authorized(principal, &record.owner) {
                         return Ok(DeleteResult::Noop);
@@ -484,9 +482,7 @@ impl SandboxManager {
                             self.launcher
                                 .release_sandbox_resources(id)
                                 .map_err(Error::Launch)?;
-                            allocator
-                                .finish_release(&record)
-                                .map_err(|error| Error::Subid(error.to_string()))?;
+                            allocator.finish_release(&record).map_err(Error::Subid)?;
                         }
                         super::subid::LeaseState::Quarantined => {
                             // The resources can still be cleaned, but an
@@ -526,7 +522,7 @@ impl SandboxManager {
             .map(|allocator| {
                 allocator
                     .lease_for(id)
-                    .map_err(|error| Error::Subid(error.to_string()))?
+                    .map_err(Error::Subid)?
                     .ok_or(Error::Unavailable)
             })
             .transpose()?;
@@ -543,9 +539,7 @@ impl SandboxManager {
                 super::subid::LeaseState::Active | super::subid::LeaseState::Reserved
             )
         {
-            allocator
-                .begin_release(record)
-                .map_err(|error| Error::Subid(error.to_string()))?;
+            allocator.begin_release(record).map_err(Error::Subid)?;
         }
         // Cancel a launch/running process before opening the directory tree
         // for deletion. The durable and in-memory Deleting state prevents a
@@ -563,9 +557,7 @@ impl SandboxManager {
         if let (Some(allocator), Some(record)) = (&self.subids, lease.as_ref())
             && record.state != super::subid::LeaseState::Quarantined
         {
-            allocator
-                .finish_release(record)
-                .map_err(|error| Error::Subid(error.to_string()))?;
+            allocator.finish_release(record).map_err(Error::Subid)?;
         }
         self.remove_record(id);
         Ok(DeleteResult::Deleted)
@@ -1266,12 +1258,11 @@ impl SandboxManager {
         let Some(allocator) = &self.subids else {
             return Ok(None);
         };
-        let delegation = super::subid::delegation::query_delegation()
-            .map_err(|error| Error::Subid(error.to_string()))?;
+        let delegation = super::subid::delegation::query_delegation().map_err(Error::Delegation)?;
         allocator
             .claim(id, owner, &delegation)
             .map(Some)
-            .map_err(|error| Error::Subid(error.to_string()))
+            .map_err(Error::Subid)
     }
 
     /// Resolve and validate the active lease before admitting a launch. The
@@ -1283,16 +1274,15 @@ impl SandboxManager {
         };
         let record = allocator
             .lease_for(metadata.id())
-            .map_err(|error| Error::Subid(error.to_string()))?
+            .map_err(Error::Subid)?
             .ok_or(Error::Unavailable)?;
         if record.owner != *metadata.owner() || record.state != super::subid::LeaseState::Active {
             return Err(Error::Unavailable);
         }
-        let delegation = super::subid::delegation::query_delegation()
-            .map_err(|error| Error::Subid(error.to_string()))?;
+        let delegation = super::subid::delegation::query_delegation().map_err(Error::Delegation)?;
         allocator
             .validate_delegated(&record, &delegation)
-            .map_err(|error| Error::Subid(error.to_string()))?;
+            .map_err(Error::Subid)?;
         Ok(Some(IsolatedIdentity {
             runtime_uid: ISOLATED_RUNTIME_UID_GID,
             runtime_gid: ISOLATED_RUNTIME_UID_GID,
@@ -1465,7 +1455,8 @@ fn terminate_and_wait(process: &Arc<dyn platform::RunningProcess>) {
 #[derive(Debug)]
 pub(crate) enum Error {
     Storage(storage::Error),
-    Subid(String),
+    Subid(super::subid::Error),
+    Delegation(super::subid::delegation::Error),
     Cleanup { source: storage::Error },
     RuntimeCleanup,
     Launch(platform::LaunchError),
@@ -1501,6 +1492,9 @@ impl fmt::Display for Error {
         match self {
             Error::Storage(error) => write!(f, "sandbox storage failed: {error}"),
             Error::Subid(error) => write!(f, "sandbox subordinate identity unavailable: {error}"),
+            Error::Delegation(error) => {
+                write!(f, "sandbox subordinate identity unavailable: {error}")
+            }
             Error::Cleanup { source } => write!(f, "sandbox cleanup failed: {source}"),
             Error::RuntimeCleanup => {
                 f.write_str("sandbox process cleanup did not finish before deletion deadline")
@@ -1516,6 +1510,8 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Storage(error) => Some(error),
+            Error::Subid(error) => Some(error),
+            Error::Delegation(error) => Some(error),
             Error::Cleanup { source } => Some(source),
             Error::Launch(source) => Some(source),
             _ => None,
@@ -1540,6 +1536,16 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn helper_missing_diagnostic_survives_manager_error() {
+        let error = Error::Delegation(crate::sandbox::subid::delegation::Error::HelperMissing);
+
+        assert_eq!(
+            error.to_string(),
+            "sandbox subordinate identity unavailable: getsubids is not installed or not on PATH"
+        );
+    }
 
     fn fingerprint(fill: char) -> KeyFingerprint {
         KeyFingerprint::parse(&format!("SHA256:{}A", fill.to_string().repeat(42)))

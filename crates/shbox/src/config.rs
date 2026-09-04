@@ -947,7 +947,7 @@ mod tests {
         let (_home, paths) = test_paths();
         // `ensure` no longer creates the read-only config directory.
         create_private_dir(paths.config_dir());
-        write_config_file(&paths.config_file(), "");
+        write_config_file(paths.config_file(), "");
         let snapshot = Config::load_snapshot(&paths, None);
         #[cfg(feature = "tcp")]
         {
@@ -1406,14 +1406,14 @@ read_paths = [""]"#
         // `ensure` no longer creates the read-only config directory.
         create_private_dir(paths.config_dir());
         let path = paths.config_file();
-        write_config_file(&path, b"#");
+        write_config_file(path, b"#");
         // Build a file just over the limit out of harmless comment lines.
         let line = "# ".repeat(511) + "\n";
         let mut body = String::new();
         while (body.len() as u64) <= MAX_CONFIG_BYTES {
             body.push_str(&line);
         }
-        write_config_file(&path, &body);
+        write_config_file(path, &body);
         assert!(matches!(
             Config::load_snapshot(&paths, None),
             Err(Error::TooLarge { .. })
