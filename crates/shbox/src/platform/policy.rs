@@ -26,7 +26,7 @@ use shbox_sandbox::{
 #[cfg(target_os = "linux")]
 use shbox_sandbox::NetworkNamespacePolicy;
 
-use super::{LaunchError, LaunchOperation};
+use super::{ISOLATED_RUNTIME_UID_GID, LaunchError, LaunchOperation};
 use crate::config::{Config, NetworkMode, SandboxIdentity, SandboxResources};
 
 /// Maximum remote command length accepted for `shell -c` execution.
@@ -405,8 +405,8 @@ impl SandboxLaunchPolicy {
         match (self.identity, isolated_identity) {
             (SandboxIdentity::Isolated, Some(identity)) => IdentityPolicy::Isolated(identity),
             (SandboxIdentity::Isolated, None) => IdentityPolicy::Isolated(IsolatedIdentity {
-                runtime_uid: 1000,
-                runtime_gid: 1000,
+                runtime_uid: ISOLATED_RUNTIME_UID_GID,
+                runtime_gid: ISOLATED_RUNTIME_UID_GID,
                 host_uid: 0,
                 host_gid: 0,
             }),

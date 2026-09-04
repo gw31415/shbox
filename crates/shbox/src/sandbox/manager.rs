@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::auth::{KeyFingerprint, Principal, Role};
 use crate::config::{Caps, SandboxIdentity};
 use crate::paths::Paths;
-use crate::platform::{self, LaunchRequest, ProcessLauncher};
+use crate::platform::{self, ISOLATED_RUNTIME_UID_GID, LaunchRequest, ProcessLauncher};
 use shbox_sandbox::IsolatedIdentity;
 
 use super::id::SandboxId;
@@ -1288,8 +1288,8 @@ impl SandboxManager {
             .validate_delegated(&record, &delegation)
             .map_err(|error| Error::Subid(error.to_string()))?;
         Ok(Some(IsolatedIdentity {
-            runtime_uid: 1000,
-            runtime_gid: 1000,
+            runtime_uid: ISOLATED_RUNTIME_UID_GID,
+            runtime_gid: ISOLATED_RUNTIME_UID_GID,
             host_uid: record.uid,
             host_gid: record.gid,
         }))

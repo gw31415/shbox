@@ -40,6 +40,9 @@ pub(crate) use self::policy::SandboxLaunchPolicy;
 #[cfg(unix)]
 pub(crate) use self::terminal::{apply_terminal_modes, apply_window_size};
 
+/// Namespace-local UID and GID used by isolated sandboxes.
+pub(crate) const ISOLATED_RUNTIME_UID_GID: u32 = 1000;
+
 /// Serialize every daemon-owned process spawn with adapter pipe creation.
 ///
 /// macOS has no `pipe2(O_CLOEXEC)` equivalent exposed by the supported libc

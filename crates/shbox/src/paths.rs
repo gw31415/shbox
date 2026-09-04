@@ -119,7 +119,6 @@ impl Paths {
 
     /// Root of the subordinate-ID lease ledger for isolated Linux
     /// sandboxes: `$XDG_DATA_HOME/shbox/subid-leases` (PLANS.md §7.1).
-    #[allow(dead_code)]
     pub fn subid_leases_root(&self) -> &Path {
         &self.subid_leases_root
     }
