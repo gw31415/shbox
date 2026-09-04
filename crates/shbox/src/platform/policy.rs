@@ -266,7 +266,10 @@ impl SandboxLaunchPolicy {
         &self.resources
     }
 
-    /// The configured normal-sandbox identity mode.
+    /// The configured normal-sandbox identity mode (consumed by the Linux
+    /// launcher's request validation; other platforms reject isolated
+    /// requests before consulting it).
+    #[cfg(target_os = "linux")]
     pub(crate) fn identity(&self) -> SandboxIdentity {
         self.identity
     }
