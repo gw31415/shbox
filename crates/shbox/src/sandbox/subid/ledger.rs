@@ -12,10 +12,22 @@
 //! Every write is durable before it is reported: temp file, write, fsync,
 //! rename, parent-directory fsync — the same crash windows as the metadata
 //! writer, with fault-injection points to match.
+//!
+//! Mutating operations are additionally serialized **across processes** by an
+//! exclusive [`LeaseStore::lock`] on `<ledger>/.lease.lock` (`flock(2)`): one
+//! read-modify-write — scan, verify, write — must complete under one hold, or
+//! two daemons can select the same lowest-available pair. The lock file is
+//! created once and never unlinked (see [`LOCK_FILE_NAME`]).
+//!
+//! The allocator acquires its process-local selection mutex before this
+//! ledger lock. Any future code that needs both must use that same order and
+//! must not acquire the mutex while holding this flock. A process crash while
+//! holding the flock releases it in the kernel.
 
 use std::fmt;
+use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +53,16 @@ const LEASE_ID_HEX: usize = 32;
 const RECORD_SUFFIX: &str = ".toml";
 const TEMP_PREFIX: &str = ".lease.toml.tmp";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Cross-process ledger lock, inside the ledger directory so it is covered by
+/// the same ownership validation as the records.
+///
+/// The file is created once and **never unlinked**: unlinking a held lock file
+/// would let the next opener create a fresh inode and take a lock that
+/// excludes nothing. A leftover file is therefore normal, carries no state,
+/// and is skipped by [`LeaseStore::load`].
+const LOCK_FILE_NAME: &[u8] = b".lease.lock\0";
+const LOCK_FILE_BASENAME: &str = ".lease.lock";
 
 /// Durable lease state. All four recorded states exclude their UID/GID from
 /// allocation; only record removal (absence) makes a pair free.
@@ -225,6 +247,9 @@ struct RawLease {
 pub(crate) struct LeaseStore {
     root: PathBuf,
     faults: Option<Arc<FaultInjector>>,
+    /// Descriptor of `LOCK_FILE_NAME`, open for the whole store lifetime so
+    /// every `flock` in this process targets one open file description.
+    lock_file: File,
 }
 
 impl LeaseStore {
@@ -252,14 +277,40 @@ impl LeaseStore {
         let directory = open_directory_path(root)
             .map_err(|error| Error::io("open the lease directory", root, error))?;
         validate_ownership(root, directory.as_raw_fd())?;
+        let lock_file = open_lock_file(root, directory.as_raw_fd())?;
         Ok(LeaseStore {
             root: root.to_path_buf(),
             faults,
+            lock_file,
         })
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Take the exclusive cross-process ledger lock, waiting until every other
+    /// holder releases it or exits. The hold spans exactly one read-modify-
+    /// write and is released when the returned [`LedgerLock`] is dropped.
+    ///
+    /// A holder that dies — crash or `kill -9` — has the lock released by the
+    /// kernel, so a crashed daemon can never wedge the ledger; the only
+    /// residue is the empty lock file, which is expected and skipped on scan.
+    pub(crate) fn lock(&self) -> Result<LedgerLock<'_>, Error> {
+        loop {
+            // SAFETY: the descriptor is valid for the store's lifetime.
+            if unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(self.io("lock the lease ledger", error));
+        }
+        Ok(LedgerLock {
+            file: &self.lock_file,
+        })
     }
 
     /// Load every record. Corrupt records, duplicate lease IDs, and unknown
@@ -276,6 +327,11 @@ impl LeaseStore {
                 // self-validating.
                 unlink_at(directory.as_raw_fd(), name.as_bytes(), 0)
                     .map_err(|error| self.io("remove a stale temp file", error))?;
+                continue;
+            }
+            if name == LOCK_FILE_BASENAME {
+                // The cross-process lock file, not a lease. It must survive
+                // the scan: it is deliberately never removed.
                 continue;
             }
             let record = self.read_named(&directory, &name)?;
@@ -398,6 +454,83 @@ impl LeaseStore {
     fn io(&self, operation: &'static str, error: std::io::Error) -> Error {
         Error::io(operation, &self.root, error)
     }
+}
+
+/// A held cross-process ledger lock. Dropping it releases the lock.
+#[derive(Debug)]
+pub(crate) struct LedgerLock<'a> {
+    file: &'a File,
+}
+
+impl Drop for LedgerLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is valid for the store's lifetime, which
+        // outlives this guard.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            // Not expected for an owned, open descriptor. The lock would then
+            // linger until the store itself is closed, so say so.
+            tracing::warn!("failed to release the lease ledger lock");
+        }
+    }
+}
+
+/// Open the ledger lock file under the already validated ledger directory,
+/// creating it mode `0600` on first use and re-validating it on every open.
+fn open_lock_file(root: &Path, directory: std::os::fd::RawFd) -> Result<File, Error> {
+    // The trailing NUL is part of the literal: openat takes a C string.
+    let fd = unsafe {
+        libc::openat(
+            directory,
+            LOCK_FILE_NAME.as_ptr().cast(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::io(
+            "open the lease ledger lock file",
+            root,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: openat returned a unique owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let (is_regular, owner, mode) = {
+        // SAFETY: zeroed is a valid initialization for libc::stat; fstat fills it.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: stat points to writable storage for the valid descriptor.
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(Error::io(
+                "stat the lease ledger lock file",
+                root,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        (
+            is_regular(stat.st_mode),
+            stat.st_uid,
+            mode_bits(stat.st_mode),
+        )
+    };
+    if !is_regular {
+        return Err(Error::UnsafeDirectory(
+            root.to_path_buf(),
+            "ledger lock file is not a regular file".into(),
+        ));
+    }
+    if owner != crate::paths::euid() {
+        return Err(Error::UnsafeDirectory(
+            root.to_path_buf(),
+            "ledger lock file is not owned by the daemon user".into(),
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(Error::UnsafeDirectory(
+            root.to_path_buf(),
+            "ledger lock file is group or world writable".into(),
+        ));
+    }
+    Ok(file)
 }
 
 fn validate_ownership(root: &Path, fd: std::os::fd::RawFd) -> Result<(), Error> {
@@ -701,6 +834,38 @@ mod tests {
         // Corrupt the record body: still fail-closed.
         std::fs::write(root.join(record.file_name()), b"version = 1\n").expect("corrupt");
         assert!(matches!(store.load(), Err(Error::CorruptRecord { .. })));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ledger_lock_excludes_a_second_store_and_is_skipped_by_the_scan() {
+        let root =
+            std::env::temp_dir().join(format!("shbox-lease-test-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = LeaseStore::open(&root, None).expect("open");
+        let second = LeaseStore::open(&root, None).expect("open");
+        // Separate `open` calls hold separate descriptions, exactly like two
+        // daemon processes sharing the directory.
+        let guard = first.lock().expect("lock");
+        let attempted =
+            unsafe { libc::flock(second.lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_ne!(attempted, 0, "a second store must be excluded");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+        drop(guard);
+        // The kernel-released / explicitly unlocked lock is taken again.
+        assert_eq!(
+            unsafe { libc::flock(second.lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // The lock file is not a lease record and never trips the scan.
+        assert!(first.load().expect("load").is_empty());
+        assert_eq!(
+            unsafe { libc::flock(second.lock_file.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

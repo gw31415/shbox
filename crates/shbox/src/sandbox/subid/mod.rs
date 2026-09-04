@@ -22,7 +22,7 @@ pub(crate) use ledger::{LeaseRecord, LeaseState, LeaseStore};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::auth::KeyFingerprint;
 
@@ -47,6 +47,9 @@ pub(crate) enum Error {
         uid_delegated: bool,
         gid_delegated: bool,
     },
+    /// The allocator's process-local serialization mutex was poisoned by a
+    /// panic while it was held; fail closed rather than mutate the ledger.
+    SelectionPoisoned,
     /// No delegated UID or GID is free. The counts explain where the pool
     /// went; remedies are completing `Releasing` cleanup, repairing
     /// `Quarantined` entries, or enlarging the delegation.
@@ -104,6 +107,9 @@ impl fmt::Display for Error {
                     f,
                     "lease {lease_id} IDs are {uid} (UID) / {gid} (GID) inside the current subordinate delegation; new isolated launches using it fail closed",
                 )
+            }
+            Error::SelectionPoisoned => {
+                f.write_str("subordinate-ID allocator selection lock is poisoned")
             }
             Error::Exhausted { uid, gid } => write!(
                 f,
@@ -180,7 +186,7 @@ impl SubidAllocator {
         owner: &KeyFingerprint,
         delegation: &Delegation,
     ) -> Result<LeaseRecord, Error> {
-        let _guard = self.selection.lock().expect("subid allocator");
+        let _guard = self.mutation_guard()?;
         let records = self.load()?;
         if records
             .iter()
@@ -247,7 +253,7 @@ impl SubidAllocator {
     /// cleanup carrying an older `lease_id` fails against the missing file
     /// and removes nothing (ABA protection).
     pub(crate) fn finish_release(&self, expected: &LeaseRecord) -> Result<(), Error> {
-        let _guard = self.selection.lock().expect("subid allocator");
+        let _guard = self.mutation_guard()?;
         // Incarnation identity and the Releasing state are both verified by
         // the expected-record guard; the caller may hold any state snapshot
         // of the same incarnation.
@@ -259,7 +265,7 @@ impl SubidAllocator {
     /// Move any record of this incarnation to `Quarantined`, recording why.
     /// Quarantined IDs are never allocated automatically.
     pub(crate) fn quarantine(&self, expected: &LeaseRecord, reason: &str) -> Result<(), Error> {
-        let _guard = self.selection.lock().expect("subid allocator");
+        let _guard = self.mutation_guard()?;
         let current = self
             .store
             .read(&expected.lease_id)?
@@ -275,7 +281,7 @@ impl SubidAllocator {
     }
 
     fn free_reserved_absent(&self, expected: &LeaseRecord) -> Result<(), Error> {
-        let _guard = self.selection.lock().expect("subid allocator");
+        let _guard = self.mutation_guard()?;
         self.expected_record(expected, &["reserved"])?;
         self.store.remove(&expected.lease_id)?;
         Ok(())
@@ -309,11 +315,27 @@ impl SubidAllocator {
         from: &[LeaseState],
         to: LeaseState,
     ) -> Result<LeaseRecord, Error> {
+        let _guard = self.mutation_guard()?;
         let names: Vec<&str> = from.iter().map(|state| state.as_str()).collect();
         let current = self.expected_record(expected, &names)?;
         let next = current.with_state(to);
         self.store.write(&next)?;
         Ok(next)
+    }
+
+    /// Acquire the process-local and cross-process guards for one ledger
+    /// read-modify-write. The field order releases the flock before the
+    /// process-local mutex, reversing the acquisition order cleanly.
+    fn mutation_guard(&self) -> Result<MutationGuard<'_>, Error> {
+        let selection = self
+            .selection
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?;
+        let ledger = self.store.lock()?;
+        Ok(MutationGuard {
+            _ledger: ledger,
+            _selection: selection,
+        })
     }
 
     /// Read the on-disk record for `expected.lease_id` and verify it is the
@@ -343,6 +365,13 @@ impl SubidAllocator {
         }
         Ok(current)
     }
+}
+
+/// Guards one allocator mutation. All paths that need both locks acquire the
+/// process-local selection mutex first, then the ledger's `flock`.
+struct MutationGuard<'a> {
+    _ledger: ledger::LedgerLock<'a>,
+    _selection: MutexGuard<'a, ()>,
 }
 
 /// What the durable-sandbox scan reports for one sandbox.
@@ -733,6 +762,109 @@ mod tests {
             "duplicate pair allocated: {pairs:?}"
         );
         assert_eq!(pairs.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claims_from_separate_allocator_instances_are_unique() {
+        let root = scratch();
+        let first = std::sync::Arc::new(allocator(&root));
+        let second = std::sync::Arc::new(allocator(&root));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let pairs = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let first_start = std::sync::Arc::clone(&start);
+            let first_pairs = &pairs;
+            let first = std::sync::Arc::clone(&first);
+            let first_result = scope.spawn(move || {
+                first_start.wait();
+                let mut claimed = Vec::new();
+                for index in 0..2 {
+                    let record = first
+                        .claim(&sandbox(&format!("first{index}")), &owner(), &delegation())
+                        .expect("claim from first allocator");
+                    claimed.push((record.uid, record.gid));
+                }
+                first_pairs.lock().expect("pairs").extend(claimed);
+            });
+
+            let second_start = std::sync::Arc::clone(&start);
+            let second_pairs = &pairs;
+            let second = std::sync::Arc::clone(&second);
+            let second_result = scope.spawn(move || {
+                second_start.wait();
+                let mut claimed = Vec::new();
+                for index in 0..2 {
+                    let record = second
+                        .claim(&sandbox(&format!("second{index}")), &owner(), &delegation())
+                        .expect("claim from second allocator");
+                    claimed.push((record.uid, record.gid));
+                }
+                second_pairs.lock().expect("pairs").extend(claimed);
+            });
+            first_result.join().expect("first claim thread");
+            second_result.join().expect("second claim thread");
+        });
+
+        let pairs = pairs.into_inner().expect("pairs");
+        let mut unique = pairs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(unique.len(), pairs.len(), "pair overlap: {pairs:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_and_activate_race_preserves_the_winning_transition() {
+        let root = scratch();
+        let first = std::sync::Arc::new(allocator(&root));
+        let second = std::sync::Arc::new(allocator(&root));
+        let record = first
+            .claim(&sandbox("race"), &owner(), &delegation())
+            .expect("claim");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (activation, quarantine) = std::thread::scope(|scope| {
+            let activation_start = std::sync::Arc::clone(&start);
+            let activation_allocator = std::sync::Arc::clone(&first);
+            let activation_record = record.clone();
+            let activation = scope.spawn(move || {
+                activation_start.wait();
+                activation_allocator.activate(&activation_record)
+            });
+
+            let quarantine_start = std::sync::Arc::clone(&start);
+            let quarantine_allocator = std::sync::Arc::clone(&second);
+            let quarantine_record = record.clone();
+            let quarantine = scope.spawn(move || {
+                quarantine_start.wait();
+                quarantine_allocator.quarantine(&quarantine_record, "race")
+            });
+            (
+                activation.join().expect("activation thread"),
+                quarantine.join().expect("quarantine thread"),
+            )
+        });
+
+        let final_record = allocator(&root)
+            .lease_for(&sandbox("race"))
+            .expect("load")
+            .expect("race lease");
+        match (activation, quarantine) {
+            (Ok(active), Err(Error::StateConflict(_))) => {
+                assert_eq!(active.state, LeaseState::Active);
+                assert_eq!(final_record.state, LeaseState::Active);
+            }
+            (Err(Error::StateConflict(_)), Ok(())) => {
+                assert_eq!(final_record.state, LeaseState::Quarantined);
+            }
+            (Ok(_), Ok(())) => {
+                assert_eq!(final_record.state, LeaseState::Quarantined);
+            }
+            (activation, quarantine) => {
+                panic!("unexpected activation/quarantine results: {activation:?}, {quarantine:?}")
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
