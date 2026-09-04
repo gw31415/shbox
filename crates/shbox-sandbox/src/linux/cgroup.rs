@@ -437,7 +437,7 @@ fn owned_directory_names(dir: &OwnedFd) -> Result<Vec<std::ffi::OsString>, Sandb
     let iteration_fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
-            b".\0".as_ptr().cast::<libc::c_char>(),
+            c".".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };

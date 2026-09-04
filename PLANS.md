@@ -15,7 +15,7 @@ Implementation started 2026-09-04 on a native aarch64 Linux host (Oracle ARM, ke
 | I0 identity API freeze | **done** | See below. |
 | I1 subid ledger | **done** | Ledger, delegation parser, and manager claim/delete/reconcile wiring are implemented; manager wiring landed after the config seam became available. |
 | I2 parent mapping barrier | **done (native seam proof)** | Fresh `CLONE_NEWUSER` barrier, exact one-entry map verification, group clear, UID/GID 1000 transition, securebits/NNP/capability drop, and `ShadowUidGidMapper` are implemented. The Ubuntu 24.04 host keeps the distro `uidmap` package, while verified upstream shadow-utils 4.20.2 `getsubids/newuidmap/newgidmap` are installed under `/usr/local` for the production helper path. |
-| I3 mount ns + broker | **in progress** | Engine-side prepared mount attachment, generation-scoped auxiliary mount-ID-map namespace, fixed-size SCM_RIGHTS broker protocol/client/server, source-root validation, and systemd units are implemented. Real root-broker/filesystem acceptance is still pending on a supported deployment host. |
+| I3 mount ns + broker | **in progress** | Engine-side prepared mount attachment, generation-scoped auxiliary mount-ID-map namespace, fixed-size SCM_RIGHTS broker protocol/client/server, source-root validation, and systemd units are implemented. 2026-09-04 review found the daemon side statically unreachable (engine_namespaces never set mount=true, so validate_identity failed every isolated launch before clone3; fixed by §24 R-0). Real root-broker/filesystem acceptance is still pending on a supported deployment host. |
 | I4 network integration | not started | |
 | I5 PID ns compatibility | not started | |
 | I6 lifecycle/crash | **in progress** | Durable lease transitions are wired through manager create/delete/startup reconciliation; generation mount-ID-map FD cleanup and crash/native lifecycle acceptance remain. |
@@ -1730,3 +1730,28 @@ Adopt only if post-R-8/R-9 latency breakdown justifies each.
    §24.2 present and passing. 5. PLANS.md §0 caveat corrected (I3 integration was
    statically unreachable pre-R-0, not merely pending a host) and evidence
    retention (§12) extended with delegation/broker availability.
+
+### 24.5 Execution record (2026-09-04, all items complete)
+
+| item | commit | agent | notes |
+|---|---|---|---|
+| R-0 mount flag + policy test | 89d4047 | reuse of calibrated TB-L1 patch | 4-combo test; central re-verify |
+| R-11a const + stale allow | 9b64b9f | reuse of calibrated TA-L1 patch | import order via cargo fmt |
+| R-1 lease-less Err, R-2 non-Linux reject | ebd8cc4 | codex/luna | engine_identity -> Result + try_ variant; macOS defense in depth |
+| R-6 transitions/durability, R-7 exclusions/typed proof, R-13 reason | 82a581b | codex/luna | 32 subid tests |
+| R-3 cross-process flock | 038057e | codex/luna over partial glm session | glm bg session stalled (no edits 10+ min, own worktree); +3 race tests, 35 green |
+| R-4 confinement, R-5 leak/threads | 80f4d7e | codex/luna | 1 reviewer fixup (umask-sensitive fixture); 6 broker tests |
+| R-8 cache/fast-path, R-9 mutex narrowing | c9a4a44 | codex/luna | reviewer follow-up: scan-time temp sweep raced same-fd threads (flock is re-entrant); load() now skips, sweep runs under flock+selection |
+| R-12 SAFETY/systemd/profile | ba75ced | codex/luna | zero behavior diff |
+| R-10 free-list/coalesce | f9733a2 | codex/luna | fault windows kept covered |
+| R-11b typed errors/clippy | 0bc0f8f | codex/luna | shbox clippy zero |
+| pre-existing cgroup clippy warning | (this commit) | reviewer direct | 1-line c" literal; workspace clippy now zero warnings |
+| §0 I3 caveat correction | (this commit) | reviewer direct | defect recorded, not just host-pending |
+
+Final gate state: fmt clean, workspace clippy zero warnings, bin tests 236
+passed + 1 environmental failure (`engine_capability_probe`, needs user-ns;
+turns green on a capable host along with the 8 spawn/env tests). New tests
+added across items: +13 net (policy mount/lease-less/macOS, subid race/lease,
+broker negative/leak/roots, HelperMissing message, free-list). Routing lesson
+applied: glm stalled twice on L items (>10 min, one session wrote to its own
+worktree); codex completed all waves — L items went to codex with L3 detail.
