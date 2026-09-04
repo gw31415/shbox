@@ -309,13 +309,20 @@ fn validate_identity(raw: Option<&str>) -> Result<SandboxIdentity, Error> {
     let Some(word) = raw else {
         return Ok(SandboxIdentity::Host);
     };
-    SandboxIdentity::from_word(word).ok_or_else(|| Error::Invalid {
+    let identity = SandboxIdentity::from_word(word).ok_or_else(|| Error::Invalid {
         field: "sandbox.identity",
         message: format!(
             "sandbox.identity must be one of {}, got {word:?}",
             SandboxIdentity::WORDS.join(", ")
         ),
-    })
+    })?;
+    if identity == SandboxIdentity::Isolated && !cfg!(target_os = "linux") {
+        return Err(Error::Invalid {
+            field: "sandbox.identity",
+            message: "sandbox.identity = \"isolated\" is only supported on Linux".into(),
+        });
+    }
+    Ok(identity)
 }
 
 /// The listener the daemon binds when the config file names none: the
@@ -987,6 +994,10 @@ mod tests {
                 "ws://[::1]:2222/b".to_string(),
             ],
         );
+        #[cfg(target_os = "linux")]
+        let identity = "isolated";
+        #[cfg(not(target_os = "linux"))]
+        let identity = "host";
         let config = build_ok(&format!(
             r#"
             listen = [{listen}]
@@ -995,7 +1006,7 @@ mod tests {
             [sandbox]
             shell = "/bin/bash"
             network = "outbound"
-            identity = "isolated"
+            identity = "{identity}"
             read_paths = ["/usr/share/terminfo"]
 
             [sandbox.env]
@@ -1013,7 +1024,10 @@ mod tests {
         );
         assert_eq!(config.log_level(), LogLevel::Debug);
         assert_eq!(config.network(), NetworkMode::Outbound);
+        #[cfg(target_os = "linux")]
         assert_eq!(config.identity(), SandboxIdentity::Isolated);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(config.identity(), SandboxIdentity::Host);
         assert_eq!(config.read_paths().len(), 1);
         assert_eq!(
             config.sandbox_env().get("LANG").map(String::as_str),
@@ -1042,10 +1056,16 @@ mod tests {
             build_ok("[sandbox]\nidentity = \"host\"").identity(),
             SandboxIdentity::Host
         );
+        #[cfg(target_os = "linux")]
         assert_eq!(
             build_ok("[sandbox]\nidentity = \"isolated\"").identity(),
             SandboxIdentity::Isolated
         );
+        #[cfg(not(target_os = "linux"))]
+        {
+            let message = build_err("[sandbox]\nidentity = \"isolated\"");
+            assert!(message.contains("only supported on Linux"), "{message}");
+        }
         let message = build_err("[sandbox]\nidentity = \"root\"");
         assert!(message.contains("sandbox.identity"), "{message}");
         assert!(message.contains("host"), "{message}");

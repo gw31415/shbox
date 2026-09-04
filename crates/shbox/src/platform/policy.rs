@@ -26,7 +26,7 @@ use shbox_sandbox::{
 #[cfg(target_os = "linux")]
 use shbox_sandbox::NetworkNamespacePolicy;
 
-use super::{ISOLATED_RUNTIME_UID_GID, LaunchError, LaunchOperation};
+use super::{LaunchError, LaunchOperation};
 use crate::config::{Config, NetworkMode, SandboxIdentity, SandboxResources};
 
 /// Maximum remote command length accepted for `shell -c` execution.
@@ -317,15 +317,27 @@ impl SandboxLaunchPolicy {
     }
 
     /// Build the engine configuration with the durable sandbox's leased
-    /// identity. A missing lease in isolated mode intentionally produces an
-    /// invalid zero-ID policy so the engine fails closed instead of silently
-    /// selecting daemon identity.
+    /// identity. A missing lease in isolated mode is rejected before the
+    /// engine sees the configuration.
     pub(crate) fn engine_config_with_identity(
         &self,
         workspace: &Path,
         launch_temp: &Path,
         isolated_identity: Option<IsolatedIdentity>,
     ) -> EngineConfig {
+        self.try_engine_config_with_identity(workspace, launch_temp, isolated_identity)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`Self::engine_config_with_identity`] for launchers
+    /// that must preserve policy diagnostics instead of relying on the
+    /// compatibility wrapper's invariant.
+    pub(crate) fn try_engine_config_with_identity(
+        &self,
+        workspace: &Path,
+        launch_temp: &Path,
+        isolated_identity: Option<IsolatedIdentity>,
+    ) -> Result<EngineConfig, LaunchError> {
         let (mut read_only, execute) = self.resolved_filesystem_paths();
         let mut read_write = self.curated_write_paths();
         read_write.push(workspace.to_path_buf());
@@ -337,7 +349,7 @@ impl SandboxLaunchPolicy {
                 .any(|write| Path::new(write) == path)
         });
 
-        EngineConfig {
+        Ok(EngineConfig {
             filesystem: FilesystemPolicy::Restricted {
                 read_only: read_only.into_iter().map(PathRule::new).collect(),
                 read_write: read_write.into_iter().map(PathRule::new).collect(),
@@ -347,11 +359,11 @@ impl SandboxLaunchPolicy {
             resources: self.engine_resources(),
             syscalls: shbox_sandbox::SyscallPolicy::Unrestricted,
             namespaces: self.engine_namespaces(),
-            identity: self.engine_identity(isolated_identity),
+            identity: self.engine_identity(isolated_identity)?,
             capabilities: shbox_sandbox::CapabilityPolicy::DropAll,
             inherited_fds: Vec::new(),
             cgroup_parent: self.cgroup_parent.clone(),
-        }
+        })
     }
 
     /// Map the operator network mode onto the engine policy.
@@ -378,9 +390,9 @@ impl SandboxLaunchPolicy {
     /// The `isolated` identity mode always adds a fresh mount namespace:
     /// [`IdentityPolicy::Isolated`] is only valid with one, because the
     /// engine replaces the writable views with ID-mapped mounts inside it.
-    /// The mount follows the identity mode — both `engine_identity` arms for
-    /// `SandboxIdentity::Isolated`, leased or not, resolve to
-    /// [`IdentityPolicy::Isolated`] — and never the network mode.
+    /// The mount follows the identity mode when a lease is available; a
+    /// missing lease is rejected by `engine_identity` — and never the network
+    /// mode.
     #[cfg(target_os = "linux")]
     fn engine_namespaces(&self) -> NamespacePolicy {
         let mut namespaces = NamespacePolicy::default();
@@ -401,27 +413,35 @@ impl SandboxLaunchPolicy {
     /// opt-in `isolated` mode instead consumes the durable subordinate lease
     /// supplied by the manager and uses the parent-installed maps.
     #[cfg(target_os = "linux")]
-    fn engine_identity(&self, isolated_identity: Option<IsolatedIdentity>) -> IdentityPolicy {
+    fn engine_identity(
+        &self,
+        isolated_identity: Option<IsolatedIdentity>,
+    ) -> Result<IdentityPolicy, LaunchError> {
         match (self.identity, isolated_identity) {
-            (SandboxIdentity::Isolated, Some(identity)) => IdentityPolicy::Isolated(identity),
-            (SandboxIdentity::Isolated, None) => IdentityPolicy::Isolated(IsolatedIdentity {
-                runtime_uid: ISOLATED_RUNTIME_UID_GID,
-                runtime_gid: ISOLATED_RUNTIME_UID_GID,
-                host_uid: 0,
-                host_gid: 0,
-            }),
+            (SandboxIdentity::Isolated, Some(identity)) => Ok(IdentityPolicy::Isolated(identity)),
+            (SandboxIdentity::Isolated, None) => Err(LaunchError::new(
+                "isolated sandbox launch has no active subordinate identity lease",
+            )),
             (SandboxIdentity::Host, _) if self.network == NetworkMode::Disabled => {
-                IdentityPolicy::CallerMappedRoot
+                Ok(IdentityPolicy::CallerMappedRoot)
             }
-            (SandboxIdentity::Host, _) => IdentityPolicy::Host,
+            (SandboxIdentity::Host, _) => Ok(IdentityPolicy::Host),
         }
     }
 
-    /// macOS has no Linux user-namespace identity primitive; Seatbelt
-    /// confinement keeps the host identity.
+    /// Non-Linux backends have no Linux user-namespace identity primitive;
+    /// isolated identity is rejected rather than silently downgraded.
     #[cfg(not(target_os = "linux"))]
-    fn engine_identity(&self, _isolated_identity: Option<IsolatedIdentity>) -> IdentityPolicy {
-        shbox_sandbox::IdentityPolicy::Host
+    fn engine_identity(
+        &self,
+        _isolated_identity: Option<IsolatedIdentity>,
+    ) -> Result<IdentityPolicy, LaunchError> {
+        if self.identity == SandboxIdentity::Isolated {
+            return Err(LaunchError::new(
+                "sandbox identity \"isolated\" is unsupported on this platform",
+            ));
+        }
+        Ok(shbox_sandbox::IdentityPolicy::Host)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -991,7 +1011,9 @@ mod tests {
         let policy = test_policy("/bin/sh");
         let namespaces = policy.engine_namespaces();
         assert_eq!(
-            policy.engine_identity(None),
+            policy
+                .engine_identity(None)
+                .expect("host identity policy should be valid"),
             IdentityPolicy::CallerMappedRoot,
             "a user namespace is required to create the network namespace without host capabilities"
         );
@@ -1027,9 +1049,10 @@ mod tests {
     fn namespaces_mount_only_when_identity_is_isolated() {
         let workspace = Path::new("/state/workspace");
         let launch_temp = Path::new("/state/runtime/launch-abc");
-        let namespaces = |policy: &SandboxLaunchPolicy| {
+        let namespaces = |policy: &SandboxLaunchPolicy, identity| {
             policy
-                .engine_config_with_identity(workspace, launch_temp, None)
+                .try_engine_config_with_identity(workspace, launch_temp, identity)
+                .expect("valid identity policy")
                 .namespaces
         };
 
@@ -1039,11 +1062,20 @@ mod tests {
         let isolated_disabled =
             policy_with_identity(SandboxIdentity::Isolated, NetworkMode::Disabled);
 
-        assert!(!namespaces(&host).mount, "host identity never mounts");
-        assert!(!namespaces(&host_disabled).mount);
+        assert!(!namespaces(&host, None).mount, "host identity never mounts");
+        assert!(!namespaces(&host_disabled, None).mount);
+
+        let identity = Some(IsolatedIdentity {
+            runtime_uid: crate::platform::ISOLATED_RUNTIME_UID_GID,
+            runtime_gid: crate::platform::ISOLATED_RUNTIME_UID_GID,
+            host_uid: 165_536,
+            host_gid: 165_536,
+        });
 
         for policy in [&isolated, &isolated_disabled] {
-            let config = policy.engine_config_with_identity(workspace, launch_temp, None);
+            let config = policy
+                .try_engine_config_with_identity(workspace, launch_temp, identity)
+                .expect("isolated identity lease");
             assert!(
                 matches!(config.identity, IdentityPolicy::Isolated(_)),
                 "the isolated mode resolves to the isolated identity policy"
@@ -1055,10 +1087,30 @@ mod tests {
         }
 
         // Network topology stays a function of the network mode alone.
-        assert_eq!(namespaces(&isolated).network, namespaces(&host).network);
         assert_eq!(
-            namespaces(&isolated_disabled).network,
-            namespaces(&host_disabled).network
+            namespaces(&isolated, identity).network,
+            namespaces(&host, None).network
+        );
+        assert_eq!(
+            namespaces(&isolated_disabled, identity).network,
+            namespaces(&host_disabled, None).network
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_identity_without_a_lease_is_rejected_during_policy_construction() {
+        let policy = policy_with_identity(SandboxIdentity::Isolated, NetworkMode::Outbound);
+        let error = policy
+            .try_engine_config_with_identity(
+                Path::new("/state/workspace"),
+                Path::new("/state/runtime/launch-abc"),
+                None,
+            )
+            .expect_err("isolated policy construction requires an active lease");
+        assert_eq!(
+            error.to_string(),
+            "isolated sandbox launch has no active subordinate identity lease"
         );
     }
 

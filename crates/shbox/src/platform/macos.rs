@@ -75,6 +75,11 @@ impl MacosLauncher {
 
 impl ProcessLauncher for MacosLauncher {
     fn launch(&self, request: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
+        if request.identity.is_some() {
+            return Err(LaunchError::new(
+                "isolated sandbox identity is unsupported on macOS",
+            ));
+        }
         let workspace = fs::canonicalize(&request.workspace)
             .map_err(|_| LaunchError::new("sandbox workspace is unavailable"))?;
         if !workspace.is_dir() {
@@ -85,7 +90,11 @@ impl ProcessLauncher for MacosLauncher {
         // TMPDIR the child sees must name the same canonical directory.
         let launch_temp_path = fs::canonicalize(launch_temp.path())
             .map_err(|_| LaunchError::new("sandbox launch temp directory became unavailable"))?;
-        let mut config: EngineConfig = self.policy.engine_config(&workspace, &launch_temp_path);
+        let mut config: EngineConfig = self.policy.try_engine_config_with_identity(
+            &workspace,
+            &launch_temp_path,
+            request.identity,
+        )?;
         promote_runtime_grants(&mut config, &self.policy);
 
         let mut command = CommandSpec::new(self.policy.shell());
