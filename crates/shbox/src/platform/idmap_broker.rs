@@ -26,9 +26,14 @@ const PROTOCOL_VERSION: u32 = 1;
 const OP_CREATE_IDMAPPED_MOUNTS: u32 = 1;
 const REQUEST_LEN: usize = 40;
 const RESPONSE_LEN: usize = 32;
-const SOURCE_FD_COUNT: usize = 3;
+// The request's source_count describes the two source directory trees. The
+// SCM_RIGHTS payload has one additional descriptor for the ID-map user ns.
+const SOURCE_COUNT: u32 = 2;
+const SOURCE_FD_COUNT: usize = 1 + SOURCE_COUNT as usize;
 const MOUNT_FD_COUNT: usize = 2;
 
+// Response status values are ordered from protocol/authorization failures to
+// source validation and kernel mount capability failures.
 const STATUS_OK: u32 = 0;
 const STATUS_INVALID_REQUEST: u32 = 1;
 const STATUS_UNAUTHORIZED: u32 = 2;
@@ -95,6 +100,8 @@ impl PinnedRoot {
                 "ID-map broker root contains an interior NUL",
             )
         })?;
+        // SAFETY: `path_cstr` is a live, NUL-terminated path and the flags do
+        // not cause libc to retain the pointer after this call.
         let fd = unsafe {
             libc::open(
                 path_cstr.as_ptr(),
@@ -188,11 +195,13 @@ fn encode_request(request_id: u64, identity: IsolatedIdentity) -> [u8; REQUEST_L
     put_u32(&mut request, 20, effective_gid());
     put_u32(&mut request, 24, identity.host_uid);
     put_u32(&mut request, 28, identity.host_gid);
-    put_u32(&mut request, 32, 2);
+    put_u32(&mut request, 32, SOURCE_COUNT);
     request
 }
 
 fn connect(path: &Path) -> io::Result<OwnedFd> {
+    // SAFETY: `socket` has no Rust pointers or borrowed memory arguments; the
+    // requested AF_UNIX SOCK_CLOEXEC descriptor is returned to this function.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -200,6 +209,8 @@ fn connect(path: &Path) -> io::Result<OwnedFd> {
     // SAFETY: fd is a fresh descriptor owned by this function on all paths.
     let socket = unsafe { OwnedFd::from_raw_fd(fd) };
     let (address, length) = unix_address(path)?;
+    // SAFETY: `address` is a live sockaddr_un whose length was computed from
+    // the validated path and remains valid for the duration of connect(2).
     let result = unsafe {
         libc::connect(
             socket.as_raw_fd(),
@@ -244,12 +255,15 @@ pub(crate) fn run_from_systemd() -> io::Result<()> {
             "ID-map broker requires one socket-activated listener",
         ));
     }
+    // SAFETY: fd 3 is the descriptor named by the validated systemd socket
+    // activation environment; F_GETFD does not dereference a Rust pointer.
     if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: systemd owns fd 3 and LISTEN_FDS validation above establishes
     // that it is the single listener handed to this process.
     let listener = unsafe { OwnedFd::from_raw_fd(3) };
+    // SAFETY: geteuid(2) has no pointer arguments and only reads process state.
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -326,6 +340,9 @@ impl Drop for HandlerPermit {
 fn serve(listener: OwnedFd, roots: BrokerRoots) -> io::Result<()> {
     let handlers = Arc::new(HandlerSemaphore::new());
     loop {
+        // SAFETY: `listener` is the live socket-activated listener and the two
+        // null address arguments explicitly request that accept4 discard peer
+        // address information.
         let client = unsafe {
             libc::accept4(
                 listener.as_raw_fd(),
@@ -375,12 +392,22 @@ fn handle_client(client: OwnedFd, roots: &BrokerRoots) -> io::Result<()> {
     let request = decode_request(&request_bytes).inspect_err(|_| {
         let _ = send_response(client.as_raw_fd(), STATUS_INVALID_REQUEST, 0, 0, 1, &[]);
     })?;
-    if peer.uid == 0
-        || request.daemon_uid != peer.uid
-        || request.daemon_gid != peer.gid
-        || request.source_count as usize != 2
-        || fds.len() != SOURCE_FD_COUNT
-    {
+    // A valid request describes two source trees, but carries three FDs: the
+    // ID-map user namespace followed by the workspace and runtime sources.
+    // A count mismatch is malformed protocol input, not an authorization
+    // failure; in particular, a zero-FD message must not be STATUS_UNAUTHORIZED.
+    if request.source_count != SOURCE_COUNT || fds.len() != SOURCE_FD_COUNT {
+        send_response(
+            client.as_raw_fd(),
+            STATUS_INVALID_REQUEST,
+            request.request_id,
+            0,
+            2,
+            &[],
+        )?;
+        return Ok(());
+    }
+    if peer.uid == 0 || request.daemon_uid != peer.uid || request.daemon_gid != peer.gid {
         send_response(
             client.as_raw_fd(),
             STATUS_UNAUTHORIZED,
@@ -477,6 +504,11 @@ fn create_mounts(
 ) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut mounts = Vec::with_capacity(MOUNT_FD_COUNT);
     for source in [workspace, runtime] {
+        // SAFETY: `source` is one of the three live descriptors received from
+        // SCM_RIGHTS; the caller validated the two directory descriptors and
+        // the empty path plus flags are fixed NUL-terminated syscall inputs.
+        // The syscall ABI accepts these integer arguments without borrowing
+        // Rust memory beyond this call.
         let detached = unsafe {
             libc::syscall(
                 shbox_sandbox::syscall_number("open_tree").ok_or_else(|| {
@@ -498,6 +530,9 @@ fn create_mounts(
             propagation: 0,
             userns_fd: userns as u64,
         };
+        // SAFETY: `attributes` is a live repr(C) MountAttr with the exact
+        // kernel ABI size; `detached` and `userns` are valid descriptors for
+        // this request, and the empty path pointer is a static NUL byte.
         let result = unsafe {
             libc::syscall(
                 shbox_sandbox::syscall_number("mount_setattr").ok_or_else(|| {
@@ -528,6 +563,8 @@ fn create_mounts(
 }
 
 fn validate_mapped_root(fd: RawFd, expected_uid: u32, expected_gid: u32) -> io::Result<()> {
+    // SAFETY: `fd` is a live detached O_PATH directory descriptor and the
+    // static path is a valid NUL-terminated name for openat(2).
     let root = unsafe {
         libc::openat(
             fd,
@@ -538,8 +575,13 @@ fn validate_mapped_root(fd: RawFd, expected_uid: u32, expected_gid: u32) -> io::
     if root < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: libc::stat is a repr(C) integer/padding record for which an
+    // all-zero bit pattern is valid, and fstat initializes it before use.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `root` is the descriptor returned by the successful openat(2)
+    // above and `metadata` is a live writable stat record.
     let result = unsafe { libc::fstat(root, std::ptr::addr_of_mut!(metadata)) };
+    // SAFETY: `root` is closed exactly once here after the final fstat call.
     unsafe { libc::close(root) };
     if result < 0 {
         return Err(io::Error::last_os_error());
@@ -572,6 +614,11 @@ struct BrokerRequest {
     source_count: u32,
 }
 
+// Request wire layout (little-endian, exactly REQUEST_LEN bytes):
+// version, operation, request ID, daemon UID/GID, leased UID/GID, then
+// source_count (= SOURCE_COUNT, the two directory sources), followed by four
+// reserved bytes. The accompanying SCM_RIGHTS record has SOURCE_FD_COUNT FDs:
+// the ID-map user namespace plus those two directory sources.
 fn decode_request(bytes: &[u8]) -> io::Result<BrokerRequest> {
     if bytes.len() != REQUEST_LEN {
         return Err(io::Error::new(
@@ -579,7 +626,9 @@ fn decode_request(bytes: &[u8]) -> io::Result<BrokerRequest> {
             "ID-map broker request has the wrong size",
         ));
     }
-    if get_u32(bytes, 0) != PROTOCOL_VERSION || get_u32(bytes, 4) != OP_CREATE_IDMAPPED_MOUNTS {
+    let version = get_u32(bytes, 0)?;
+    let operation = get_u32(bytes, 4)?;
+    if version != PROTOCOL_VERSION || operation != OP_CREATE_IDMAPPED_MOUNTS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ID-map broker request has an unsupported operation",
@@ -592,17 +641,28 @@ fn decode_request(bytes: &[u8]) -> io::Result<BrokerRequest> {
         ));
     }
     Ok(BrokerRequest {
-        request_id: get_u64(bytes, 8),
-        daemon_uid: get_u32(bytes, 16),
-        daemon_gid: get_u32(bytes, 20),
-        leased_uid: get_u32(bytes, 24),
-        leased_gid: get_u32(bytes, 28),
-        source_count: get_u32(bytes, 32),
+        request_id: get_u64(bytes, 8)?,
+        daemon_uid: get_u32(bytes, 16)?,
+        daemon_gid: get_u32(bytes, 20)?,
+        leased_uid: get_u32(bytes, 24)?,
+        leased_gid: get_u32(bytes, 28)?,
+        source_count: get_u32(bytes, 32)?,
     })
 }
 
+// Response wire layout (little-endian, exactly RESPONSE_LEN bytes): version,
+// status, request ID, mount_count (= MOUNT_FD_COUNT on success), error code,
+// then eight reserved bytes. Successful responses carry MOUNT_FD_COUNT FDs;
+// rejection responses carry zero FDs.
 fn decode_response(bytes: &[u8]) -> Result<(u32, u64, u32, u32), LaunchError> {
-    if bytes.len() != RESPONSE_LEN || get_u32(bytes, 0) != PROTOCOL_VERSION {
+    if bytes.len() != RESPONSE_LEN {
+        return Err(LaunchError::new(
+            "ID-map broker returned an invalid protocol response",
+        ));
+    }
+    let version = get_u32(bytes, 0)
+        .map_err(|_| LaunchError::new("ID-map broker returned an invalid protocol response"))?;
+    if version != PROTOCOL_VERSION {
         return Err(LaunchError::new(
             "ID-map broker returned an invalid protocol response",
         ));
@@ -613,10 +673,14 @@ fn decode_response(bytes: &[u8]) -> Result<(u32, u64, u32, u32), LaunchError> {
         ));
     }
     Ok((
-        get_u32(bytes, 4),
-        get_u64(bytes, 8),
-        get_u32(bytes, 16),
-        get_u32(bytes, 20),
+        get_u32(bytes, 4)
+            .map_err(|_| LaunchError::new("ID-map broker returned an invalid protocol response"))?,
+        get_u64(bytes, 8)
+            .map_err(|_| LaunchError::new("ID-map broker returned an invalid protocol response"))?,
+        get_u32(bytes, 16)
+            .map_err(|_| LaunchError::new("ID-map broker returned an invalid protocol response"))?,
+        get_u32(bytes, 20)
+            .map_err(|_| LaunchError::new("ID-map broker returned an invalid protocol response"))?,
     ))
 }
 
@@ -644,6 +708,9 @@ fn send_with_fds(fd: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<()> {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
+    // SAFETY: libc::msghdr is a repr(C) pointer/length record for which the
+    // all-zero bit pattern is valid; every field used by sendmsg is populated
+    // from live buffers below before the call.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = std::ptr::addr_of_mut!(iovec);
     message.msg_iovlen = 1;
@@ -651,6 +718,9 @@ fn send_with_fds(fd: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<()> {
     message.msg_controllen = control.len();
     if !fds.is_empty() {
         let header = message.msg_control.cast::<libc::cmsghdr>();
+        // SAFETY: `control` has cmsg_space(size_of_val(fds)) bytes, so its
+        // start is a writable cmsghdr area and cmsg_data(header) leaves room
+        // for exactly the contiguous RawFd payload copied below.
         unsafe {
             (*header).cmsg_len = cmsg_len(size_of_val(fds));
             (*header).cmsg_level = libc::SOL_SOCKET;
@@ -662,6 +732,8 @@ fn send_with_fds(fd: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<()> {
             );
         }
     }
+    // SAFETY: `fd` is a live socket for the caller, and `message` points only
+    // to live `bytes`, `iovec`, and control storage held until sendmsg returns.
     let sent = unsafe { libc::sendmsg(fd, std::ptr::addr_of!(message), libc::MSG_NOSIGNAL) };
     if sent < 0 {
         Err(io::Error::last_os_error())
@@ -682,11 +754,16 @@ fn receive_message(fd: RawFd, expected_fds: usize) -> io::Result<(Vec<u8>, Vec<O
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
     };
+    // SAFETY: libc::msghdr is a repr(C) pointer/length record for which the
+    // all-zero bit pattern is valid; every field used by recvmsg is populated
+    // from live writable buffers below before the call.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = std::ptr::addr_of_mut!(iovec);
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = control.len();
+    // SAFETY: `fd` is a live socket for the caller; `message` points to live
+    // writable byte/control buffers and recvmsg is told their exact lengths.
     let received =
         unsafe { libc::recvmsg(fd, std::ptr::addr_of_mut!(message), libc::MSG_CMSG_CLOEXEC) };
     if received < 0 {
@@ -720,6 +797,9 @@ fn collect_control_fds(message: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
         let header_address = base + offset;
         // The kernel supplies aligned cmsghdr records. Use unaligned reads
         // nevertheless: `Vec<u8>` does not promise cmsghdr alignment.
+        // SAFETY: the loop checked that a complete cmsghdr fits from
+        // `header_address` to `end`; the address lies in recvmsg's live
+        // control buffer, and read_unaligned does not require alignment.
         let header = unsafe { std::ptr::read_unaligned(header_address as *const libc::cmsghdr) };
         let length = header.cmsg_len;
         let remaining = end - header_address;
@@ -746,6 +826,9 @@ fn collect_control_fds(message: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
             }
             let data = header_address + cmsg_header_len();
             for index in 0..payload_bytes / size_of::<RawFd>() {
+                // SAFETY: the validated cmsg length and RawFd divisibility
+                // establish that this complete RawFd lies within the control
+                // buffer and payload; read_unaligned handles Vec<u8> alignment.
                 let raw = unsafe {
                     std::ptr::read_unaligned((data + index * size_of::<RawFd>()) as *const RawFd)
                 };
@@ -772,6 +855,8 @@ fn peer_credentials(fd: RawFd) -> io::Result<libc::ucred> {
         gid: 0,
     };
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` and `length` are live writable objects of the
+    // sizes advertised to getsockopt, and `fd` is the live client socket.
     let result = unsafe {
         libc::getsockopt(
             fd,
@@ -793,6 +878,8 @@ fn set_receive_timeout(fd: RawFd) -> io::Result<()> {
         tv_sec: CLIENT_RECEIVE_TIMEOUT.as_secs() as _,
         tv_usec: CLIENT_RECEIVE_TIMEOUT.subsec_micros() as _,
     };
+    // SAFETY: `timeout` is live for the call and its exact timeval size is
+    // passed to setsockopt; `fd` is the live client socket.
     let result = unsafe {
         libc::setsockopt(
             fd,
@@ -816,7 +903,11 @@ struct FileIdentity {
 }
 
 fn stat_fd(fd: RawFd) -> io::Result<libc::stat> {
+    // SAFETY: libc::stat is a repr(C) integer/padding record for which an
+    // all-zero bit pattern is valid, and fstat initializes it before use.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `metadata` is a live writable stat record and `fd` is supplied
+    // by the caller as the descriptor being inspected.
     if unsafe { libc::fstat(fd, std::ptr::addr_of_mut!(metadata)) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -831,7 +922,11 @@ fn stat_path(path: &Path) -> io::Result<libc::stat> {
             "ID-map broker path contains an interior NUL",
         )
     })?;
+    // SAFETY: libc::stat is a repr(C) integer/padding record for which an
+    // all-zero bit pattern is valid, and stat initializes it before use.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a live NUL-terminated CString and `metadata` is a live
+    // writable stat record for the duration of stat(2).
     if unsafe { libc::stat(path.as_ptr(), std::ptr::addr_of_mut!(metadata)) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -872,6 +967,9 @@ fn openat2_beneath(root: RawFd, relative_path: &Path) -> io::Result<OwnedFd> {
             "ID-map broker requires the openat2 system call",
         )
     })?;
+    // SAFETY: `relative_path` is a live NUL-terminated CString, `how` is a
+    // live repr(C) OpenHow with its exact ABI size, and `root` is the pinned
+    // directory descriptor used for this lookup.
     let fd = unsafe {
         libc::syscall(
             syscall,
@@ -950,10 +1048,12 @@ fn is_user_namespace_fd(fd: RawFd) -> bool {
 }
 
 fn effective_uid() -> u32 {
+    // SAFETY: geteuid(2) has no pointer arguments and only reads process state.
     unsafe { libc::geteuid() }
 }
 
 fn effective_gid() -> u32 {
+    // SAFETY: getegid(2) has no pointer arguments and only reads process state.
     unsafe { libc::getegid() }
 }
 
@@ -975,6 +1075,8 @@ fn align(value: usize) -> usize {
 }
 
 unsafe fn cmsg_data(header: *mut libc::cmsghdr) -> *mut u8 {
+    // SAFETY: the caller guarantees that `header` points into a control
+    // buffer with at least cmsg_header_len() bytes available after it.
     unsafe { header.cast::<u8>().add(cmsg_header_len()) }
 }
 
@@ -986,20 +1088,30 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn get_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed protocol field"),
-    )
+fn get_u32(bytes: &[u8], offset: usize) -> io::Result<u32> {
+    let end = offset
+        .checked_add(size_of::<u32>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "protocol field overflow"))?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short protocol field"))?;
+    let field: [u8; size_of::<u32>()] = field
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short protocol field"))?;
+    Ok(u32::from_le_bytes(field))
 }
 
-fn get_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("fixed protocol field"),
-    )
+fn get_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
+    let end = offset
+        .checked_add(size_of::<u64>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "protocol field overflow"))?;
+    let field = bytes
+        .get(offset..end)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short protocol field"))?;
+    let field: [u8; size_of::<u64>()] = field
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "short protocol field"))?;
+    Ok(u64::from_le_bytes(field))
 }
 
 #[cfg(test)]
@@ -1033,7 +1145,14 @@ mod tests {
         assert_eq!(decoded.daemon_gid, effective_gid());
         assert_eq!(decoded.leased_uid, 165536);
         assert_eq!(decoded.leased_gid, 165537);
-        assert_eq!(decoded.source_count, 2);
+        assert_eq!(decoded.source_count, SOURCE_COUNT);
+    }
+
+    #[test]
+    fn short_protocol_fields_are_errors_not_panics() {
+        assert!(get_u32(&[0, 0, 0], 0).is_err());
+        assert!(get_u64(&[0; 7], 0).is_err());
+        assert!(get_u32(&[0; 4], usize::MAX).is_err());
     }
 
     #[test]
@@ -1047,6 +1166,8 @@ mod tests {
     #[test]
     fn descriptor_messages_round_trip_without_pathnames() {
         let mut sockets = [0_i32; 2];
+        // SAFETY: `sockets` is a live writable two-element array, and
+        // socketpair initializes both descriptor slots before returning.
         let result = unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
@@ -1056,6 +1177,8 @@ mod tests {
             )
         };
         assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: successful socketpair initialized both non-negative slots;
+        // ownership is transferred exactly once to these OwnedFds.
         let left = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
         let right = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
         let source = std::fs::File::open("/dev/null").expect("source");
@@ -1064,6 +1187,8 @@ mod tests {
         let (received, fds) = receive_message(right.as_raw_fd(), 1).expect("receive");
         assert_eq!(received, payload);
         assert_eq!(fds.len(), 1);
+        // SAFETY: the descriptor was received into an OwnedFd and remains
+        // live for this assertion; F_GETFD has no pointer arguments.
         assert!(unsafe { libc::fcntl(fds[0].as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 
@@ -1123,6 +1248,8 @@ mod tests {
     fn truncated_message_drops_all_received_descriptors() {
         let baseline = fd_count();
         let mut sockets = [0_i32; 2];
+        // SAFETY: `sockets` is a live writable two-element array, and
+        // socketpair initializes both descriptor slots before returning.
         let result = unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
@@ -1132,6 +1259,8 @@ mod tests {
             )
         };
         assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: successful socketpair initialized both non-negative slots;
+        // ownership is transferred exactly once to these OwnedFds.
         let left = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
         let right = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
         let source = fs::File::open("/dev/null").expect("source");

@@ -14,3 +14,11 @@ profile shbox /usr/local/bin/shbox flags=(unconfined) {
 
     include if exists <local/shbox>
 }
+
+# The broker is the same self-executable in a different mode. Keep this
+# profile unattached so an arbitrary local exec of /usr/local/bin/shbox cannot
+# select the broker profile; the broker unit opts into it with
+# AppArmorProfile=shbox-idmap-broker. The broker receives an already-created
+# user namespace FD and therefore deliberately has no userns rule of its own.
+profile shbox-idmap-broker flags=(unconfined) {
+}

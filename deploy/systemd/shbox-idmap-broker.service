@@ -6,6 +6,9 @@ After=shbox-idmap-broker.socket
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/shbox --internal-idmap-broker
+# Select the broker-only named profile explicitly. The executable is shared
+# with the daemon, so the AppArmor profile cannot be selected by pathname.
+AppArmorProfile=shbox-idmap-broker
 User=root
 Group=root
 NoNewPrivileges=true
@@ -16,6 +19,13 @@ RestrictAddressFamilies=AF_UNIX
 ProtectSystem=full
 ProtectHome=true
 UMask=0077
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+# @system-service supplies the runtime/socket/filesystem baseline; @mount is
+# the narrowly added mount syscall family used by open_tree/mount_setattr.
+SystemCallFilter=@system-service @mount
+MemoryMax=256M
+TasksMax=64
 # Keep these roots in sync with the XDG roots in shbox.service. The broker
 # accepts only daemon-owned directory FDs whose live paths remain below one
 # of these roots.
