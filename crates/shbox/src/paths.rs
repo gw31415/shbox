@@ -37,6 +37,7 @@ pub struct Paths {
     data_dir: PathBuf,
     sandboxes_root: PathBuf,
     registry_lock: PathBuf,
+    subid_leases_root: PathBuf,
     state_dir: PathBuf,
     host_key: PathBuf,
     state_lock: PathBuf,
@@ -70,6 +71,7 @@ impl Paths {
             allowed_keys_file: config_dir.join("allowed_keys"),
             sandboxes_root: data_dir.join("sandboxes"),
             registry_lock: data_dir.join("registry.lock"),
+            subid_leases_root: data_dir.join("subid-leases"),
             host_key: state_dir.join("host_key"),
             state_lock: state_dir.join("lock"),
             runtime_dir: state_dir.join("runtime"),
@@ -93,6 +95,7 @@ impl Paths {
         }
         ensure_dir(&self.data_dir)?;
         ensure_dir(&self.sandboxes_root)?;
+        ensure_dir(&self.subid_leases_root)?;
         ensure_dir(&self.state_dir)?;
         ensure_dir(&self.runtime_dir)?;
         Ok(())
@@ -112,6 +115,13 @@ impl Paths {
     /// Sandbox data root: `$XDG_DATA_HOME/shbox`.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Root of the subordinate-ID lease ledger for isolated Linux
+    /// sandboxes: `$XDG_DATA_HOME/shbox/subid-leases` (PLANS.md §7.1).
+    #[allow(dead_code)]
+    pub fn subid_leases_root(&self) -> &Path {
+        &self.subid_leases_root
     }
 
     /// Directory holding per-sandbox metadata and workspace directories.
@@ -330,6 +340,7 @@ mod tests {
     fn ensure_validates_an_existing_config_directory() {
         let (_home, paths) = temp_paths();
         fs::create_dir(paths.config_dir()).expect("create config dir");
+        fs::set_permissions(paths.config_dir(), fs::Permissions::from_mode(0o700)).expect("chmod");
         paths.ensure().expect("writable config dir passes");
         fs::set_permissions(paths.config_dir(), fs::Permissions::from_mode(0o730)).expect("chmod");
         let err = paths.ensure().expect_err("group writable config dir");

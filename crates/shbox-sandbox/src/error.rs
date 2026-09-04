@@ -121,8 +121,27 @@ pub enum ChildStage {
     ControllingTerminal,
     /// `chdir` into the requested working directory.
     WorkingDirectory,
-    /// User-namespace UID/GID mapping writes.
+    /// User-namespace UID/GID mapping writes. Legacy
+    /// [`IdentityPolicy::CallerMappedRoot`](crate::IdentityPolicy::CallerMappedRoot)
+    /// launches self-map here; isolated launches use the dedicated
+    /// [`ChildStage::MapBarrier`] handshake instead.
     UserNamespace,
+    /// Isolated-identity mapping barrier: child signaling `MAP_READY`,
+    /// blocking for `MAP_INSTALLED`, or the parent installing/verifying
+    /// the delegated UID/GID maps.
+    MapBarrier,
+    /// Clearing supplementary groups after the mapping barrier.
+    GroupClear,
+    /// Attaching prepared detached mounts in the fresh mount namespace.
+    MountAttach,
+    /// Applying recursive read-only attributes to the inherited mount tree.
+    MountReadOnly,
+    /// Transitioning the real/effective/saved UID to the runtime identity.
+    SetUid,
+    /// Transitioning the real/effective/saved GID to the runtime identity.
+    SetGid,
+    /// Locking securebits for the runtime identity.
+    Securebits,
     /// Mount-namespace propagation setup.
     MountPropagation,
     /// `PR_SET_NO_NEW_PRIVS`.
@@ -147,7 +166,7 @@ impl ChildStage {
     /// Every stage in wire-code order (`code` = index + 1). Both directions
     /// derive from this one table, so adding a stage cannot desynchronize
     /// them.
-    const STAGES: [Self; 14] = [
+    const STAGES: [Self; 21] = [
         Self::ParentDeath,
         Self::Session,
         Self::ControllingTerminal,
@@ -162,6 +181,13 @@ impl ChildStage {
         Self::Exec,
         Self::Supervisor,
         Self::ResourceLimits,
+        Self::MapBarrier,
+        Self::GroupClear,
+        Self::MountAttach,
+        Self::MountReadOnly,
+        Self::SetUid,
+        Self::SetGid,
+        Self::Securebits,
     ];
 
     /// Stable wire code for the stage, used by the child status record.

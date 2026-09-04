@@ -1,0 +1,12 @@
+[Unit]
+Description=shbox privileged ID-mapped mount broker socket
+
+[Socket]
+ListenSequentialPacket=/run/shbox-idmap-broker.sock
+SocketUser=shbox
+SocketGroup=shbox
+SocketMode=0600
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

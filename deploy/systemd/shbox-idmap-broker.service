@@ -1,0 +1,26 @@
+[Unit]
+Description=shbox privileged ID-mapped mount broker
+Requires=shbox-idmap-broker.socket
+After=shbox-idmap-broker.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/shbox --internal-idmap-broker
+User=root
+Group=root
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=full
+ProtectHome=true
+UMask=0077
+# Keep these roots in sync with the XDG roots in shbox.service. The broker
+# accepts only daemon-owned directory FDs whose live paths remain below one
+# of these roots.
+Environment=SHBOX_IDMAP_DATA_ROOT=/var/lib/shbox/sandboxes
+Environment=SHBOX_IDMAP_RUNTIME_ROOT=/var/lib/shbox-state/shbox/runtime
+
+[Install]
+WantedBy=multi-user.target

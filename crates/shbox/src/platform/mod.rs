@@ -14,8 +14,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use shbox_sandbox::IsolatedIdentity;
+
 use crate::sandbox::SandboxId;
 
+#[cfg(target_os = "linux")]
+mod idmap_broker;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -25,6 +29,8 @@ mod policy;
 #[cfg(unix)]
 mod terminal;
 
+#[cfg(target_os = "linux")]
+pub(crate) use self::idmap_broker::run_from_systemd as run_idmap_broker;
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux::LinuxLauncher;
 #[cfg(target_os = "macos")]
@@ -74,6 +80,9 @@ pub(crate) struct PtySpec {
 pub(crate) struct LaunchRequest {
     pub(crate) sandbox_id: SandboxId,
     pub(crate) workspace: PathBuf,
+    /// Durable subordinate identity for an isolated Linux launch. `None`
+    /// means the compatibility host policy.
+    pub(crate) identity: Option<IsolatedIdentity>,
     pub(crate) operation: LaunchOperation,
     pub(crate) pty: Option<PtySpec>,
     /// Daemon-authored compatibility variables derived from the accepted SSH
@@ -676,6 +685,7 @@ mod tests {
         LaunchRequest {
             sandbox_id: SandboxId::parse("dev").expect("sandbox id"),
             workspace: PathBuf::from("/tmp/shbox-dev"),
+            identity: None,
             operation: LaunchOperation::Exec(b"printf fake".to_vec()),
             pty,
             environment: BTreeMap::new(),

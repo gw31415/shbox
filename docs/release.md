@@ -215,6 +215,13 @@ Fly Machines上でproduction acceptanceを試みたが、成功しなかった�
 
 `deploy/systemd/shbox.service` は専用unprivileged userを使う。`NoNewPrivileges`等のservice hardeningを維持する。
 
+この unit は systemd 255 以降の `Delegate=cpu memory pids` と
+`DelegateSubgroup=daemon` で daemon を delegated leaf に置く。systemd は指定
+controller を利用可能にするが `cgroup.subtree_control` は有効化しないため、shbox が
+limit 用 child cgroup の作成時に必要な controller だけを有効化する。古い systemd では
+cgroup delegation の要件を満たさないため、外部
+launcher wrapper を配置して補わない。
+
 `KillMode=control-group` はsystemd自身のservice cleanup choiceであり、shbox sandbox backendのcontroller delegation requirementを意味しない。
 
 ### launchd

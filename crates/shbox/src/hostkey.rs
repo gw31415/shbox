@@ -259,6 +259,14 @@ mod tests {
         dir.join("host_key")
     }
 
+    /// Write a key fixture with private permissions, independent of the
+    /// ambient umask.
+    fn write_key_fixture(path: &PathBuf, content: impl AsRef<[u8]>) {
+        fs::write(path, content).expect("write fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("fixture must be private");
+    }
+
     #[test]
     fn creates_missing_key_with_mode_0600() {
         let home = TempDir::new().expect("tempdir");
@@ -289,7 +297,7 @@ mod tests {
     fn never_replaces_corrupt_existing_key() {
         let home = TempDir::new().expect("tempdir");
         let path = temp_key_path(&home);
-        fs::write(&path, b"not an openssh key").expect("write corrupt");
+        write_key_fixture(&path, b"not an openssh key");
         let err = HostKey::load_or_create(&path).expect_err("corrupt key");
         assert!(matches!(err, Error::Invalid { .. }), "{err}");
         assert_eq!(fs::read(&path).expect("unchanged"), b"not an openssh key");

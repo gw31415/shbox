@@ -30,6 +30,10 @@ shell = "/bin/bash"
 # 省略時: disabled
 network = "disabled"
 
+# host | isolated
+# 省略時: host（互換モード。isolated は subordinate ID と broker が必要）
+identity = "host"
+
 # 追加 read-only path。単一 string も一要素配列として受理する。
 # 省略時: []
 read_paths = ["/opt/toolchain"]
@@ -110,7 +114,21 @@ Linux/macOS の enforcement 差は [platforms.md](platforms.md) を参照する�
 
 `outbound` は isolation を弱めるため startup log で operator に警告する。外部到達範囲をさらに制限したい場合は host/provider firewall を併用する。
 
-### 4.3 `read_paths`
+### 4.3 `identity`
+
+`host`（default）は従来互換の daemon host identity を使う。`isolated` は
+Linux の通常 sandbox に durable な subordinate UID/GID lease、fresh user/mount
+namespace、parent-installed one-entry map、ID-mapped workspace/runtime mount を
+要求する。`newuidmap`/`newgidmap`、subid delegation、socket-activated privileged
+ID-map broker、kernel/filesystem の ID-mapped mount 対応のいずれかが欠けている
+場合、launch は daemon identity に fallback せず fail closed する。
+
+この設定は daemon 起動時の immutable snapshot であり、admin の `_` host route
+には適用されない。`runtime_uid`/`runtime_gid` は namespace 内の `1000:1000`
+で固定され、host-visible ID は shbox が lease した値になる。通常の launch で
+workspace を recursive `chown` することはない。
+
+### 4.4 `read_paths`
 
 sandbox process に追加で read-only access を与える absolute path。single string または string array。
 
@@ -126,7 +144,7 @@ validation:
 
 OS が ordinary command runtime に必要とする system/runtime path は implementation の curated set として別途追加され、public config には列挙しない。
 
-### 4.4 Resource limits
+### 4.5 Resource limits
 
 `sandbox` table の optional key で、sandbox ごとの resource limit を指定する。Linux では cgroup v2、macOS では表現可能な値を child の `setrlimit` に変換する。macOS で CPU quota または swap limit を指定した場合は起動を fail closed する。`cgroup_parent` は Linux 用であり、macOS では使われない。
 
@@ -143,7 +161,7 @@ OS が ordinary command runtime に必要とする system/runtime path は imple
 
 なお、`shbox-sandbox::Sandbox::spawn` を直接利用する engine path は、resource limit を使う場合に spawn ごとの one-shot per-child cgroup semantics を採用し得る。これは public shbox adapter の `SandboxId` 共有 domain とは別の lifecycle である。
 
-`cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、process domain を作成できる階層を使う。書き込み可能な階層が無ければ Linux sandbox launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=yes` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。
+`cgroup_parent` 省略時は engine が自身の cgroup から上位へ探索し、process domain を作成できる階層を使う。書き込み可能な階層が無ければ Linux sandbox launch は fail closed する。systemd で delegation する場合は当該 unit に `Delegate=cpu memory pids` を設定し、その cgroup directory を `cgroup_parent` に指定するのが確実である。systemd は controller を利用可能にするが `cgroup.subtree_control` は有効化しないため、shbox が limit 用 child cgroup の作成時に必要な controller だけを有効化する。
 
 **排他所有権**: `cgroup_parent` と runtime temp root は、それぞれ同時に 1 つの shbox daemon instance だけが所有する。daemon は起動時の reconciliation で当該 parent 直下のすべての `shbox-domain-*` cgroup（および runtime root 直下のすべての `sandbox-*` tree）を自らの所有物として回収する。この名前空間は per-daemon-instance ではないため、2 つの daemon が同一の parent/runtime root を共有する構成は支持されず、一方の起動が他方の稼働中 domain を kill する。複数 daemon を動かす場合は親子の異なる delegated directory をそれぞれに与えること。
 

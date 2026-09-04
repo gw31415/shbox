@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{KeyFingerprint, Principal, Role};
-use crate::config::Caps;
+use crate::config::{Caps, SandboxIdentity};
 use crate::paths::Paths;
 use crate::platform::{self, LaunchRequest, ProcessLauncher};
+use shbox_sandbox::IsolatedIdentity;
 
 use super::id::SandboxId;
 use super::metadata::{Metadata, State};
@@ -39,6 +40,7 @@ pub(crate) struct SandboxHandle {
     id: SandboxId,
     owner: KeyFingerprint,
     workspace: PathBuf,
+    identity: Option<IsolatedIdentity>,
     created: bool,
 }
 
@@ -57,6 +59,10 @@ impl SandboxHandle {
 
     pub(crate) fn created(&self) -> bool {
         self.created
+    }
+
+    pub(crate) fn identity(&self) -> Option<IsolatedIdentity> {
+        self.identity
     }
 }
 
@@ -134,6 +140,7 @@ pub(crate) struct SandboxManager {
     storage: Storage,
     caps: Caps,
     launcher: Arc<dyn ProcessLauncher>,
+    subids: Option<Arc<super::subid::SubidAllocator>>,
     ledger: Mutex<Ledger>,
     runtime_changed: std::sync::Condvar,
     lifecycle_locks: Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
@@ -157,6 +164,20 @@ impl SandboxManager {
         Self::open_with_faults_and_launcher(paths, caps, None, launcher)
     }
 
+    /// Open the manager with the staged normal-sandbox identity policy.
+    /// Isolated mode creates the durable subordinate-ID ledger; host mode
+    /// keeps the compatibility manager path unchanged.
+    pub(crate) fn open_with_launcher_and_identity(
+        paths: &Paths,
+        caps: Caps,
+        launcher: Arc<dyn ProcessLauncher>,
+        identity: SandboxIdentity,
+    ) -> Result<SandboxManager, Error> {
+        let manager = Self::open_loaded(paths, caps, launcher, None, identity)?;
+        manager.reconcile_startup();
+        Ok(manager)
+    }
+
     /// Open the manager and load its durable index without waiting for the
     /// startup deletion reconciliation. Managed mode uses this constructor so
     /// the admin host route can be published while sandbox operations remain
@@ -166,7 +187,18 @@ impl SandboxManager {
         caps: Caps,
         launcher: Arc<dyn ProcessLauncher>,
     ) -> Result<SandboxManager, Error> {
-        Self::open_loaded(paths, caps, launcher, None)
+        Self::open_loaded(paths, caps, launcher, None, SandboxIdentity::Host)
+    }
+
+    /// Like [`open_unreconciled_with_launcher`](Self::open_unreconciled_with_launcher),
+    /// with the isolated subordinate-ID ledger enabled.
+    pub(crate) fn open_unreconciled_with_launcher_and_identity(
+        paths: &Paths,
+        caps: Caps,
+        launcher: Arc<dyn ProcessLauncher>,
+        identity: SandboxIdentity,
+    ) -> Result<SandboxManager, Error> {
+        Self::open_loaded(paths, caps, launcher, None, identity)
     }
 
     pub(crate) fn open_with_faults(
@@ -188,7 +220,7 @@ impl SandboxManager {
         faults: Option<Arc<storage::FaultInjector>>,
         launcher: Arc<dyn ProcessLauncher>,
     ) -> Result<SandboxManager, Error> {
-        let manager = Self::open_loaded(paths, caps, launcher, faults)?;
+        let manager = Self::open_loaded(paths, caps, launcher, faults, SandboxIdentity::Host)?;
         manager.reconcile_startup();
         Ok(manager)
     }
@@ -198,13 +230,23 @@ impl SandboxManager {
         caps: Caps,
         launcher: Arc<dyn ProcessLauncher>,
         faults: Option<Arc<storage::FaultInjector>>,
+        identity: SandboxIdentity,
     ) -> Result<SandboxManager, Error> {
         let storage =
             Storage::with_faults(paths.sandboxes_root(), faults).map_err(Error::Storage)?;
+        let subids = match identity {
+            SandboxIdentity::Host => None,
+            SandboxIdentity::Isolated => {
+                let store = super::subid::LeaseStore::open(paths.subid_leases_root(), None)
+                    .map_err(|error| Error::Subid(error.to_string()))?;
+                Some(Arc::new(super::subid::SubidAllocator::new(store)))
+            }
+        };
         let manager = SandboxManager {
             storage,
             caps,
             launcher,
+            subids,
             ledger: Mutex::new(Ledger::default()),
             runtime_changed: std::sync::Condvar::new(),
             lifecycle_locks: Mutex::new(HashMap::new()),
@@ -233,8 +275,65 @@ impl SandboxManager {
             );
             return;
         }
+        if let Err(error) = self.reconcile_subid_leases() {
+            tracing::error!(
+                error = %error,
+                "subordinate identity reconciliation failed; keeping manager unavailable"
+            );
+            return;
+        }
         self.reconcile_deleting();
         self.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reconcile durable subordinate leases only after platform process
+    /// resources have been proven empty. A lease record is the authority for
+    /// ID reuse; an absent process domain alone never frees it.
+    fn reconcile_subid_leases(&self) -> Result<(), Error> {
+        let Some(allocator) = &self.subids else {
+            return Ok(());
+        };
+        let report = super::subid::reconcile(
+            allocator,
+            &|id| match self.storage.inspect(id) {
+                Ok(Entry::Active(metadata)) => Ok(Some(super::subid::SandboxView::Active {
+                    owner: metadata.owner().clone(),
+                })),
+                Ok(Entry::Deleting(metadata)) => Ok(Some(super::subid::SandboxView::Deleting {
+                    owner: metadata.owner().clone(),
+                })),
+                Ok(Entry::Corrupt { reason }) => {
+                    Ok(Some(super::subid::SandboxView::Corrupt { reason }))
+                }
+                Ok(Entry::Absent) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+            true,
+        )
+        .map_err(|error| Error::Subid(error.to_string()))?;
+        for record in report.promoted {
+            tracing::info!(
+                sandbox_id = %record.sandbox_id,
+                lease_id = %record.lease_id,
+                "promoted a subordinate identity lease after restart"
+            );
+        }
+        for record in report.freed {
+            tracing::info!(
+                sandbox_id = %record.sandbox_id,
+                lease_id = %record.lease_id,
+                "released a subordinate identity lease after restart"
+            );
+        }
+        for (record, reason) in report.quarantined {
+            tracing::error!(
+                sandbox_id = %record.sandbox_id,
+                lease_id = %record.lease_id,
+                reason = %reason,
+                "quarantined an ambiguous subordinate identity lease"
+            );
+        }
+        Ok(())
     }
 
     /// Atomically claim an ID for the principal, creating its workspace only
@@ -256,7 +355,8 @@ impl SandboxManager {
                 if !authorized(principal, metadata.owner()) {
                     return Err(Error::Unavailable);
                 }
-                Ok(self.handle(&metadata, false))
+                let identity = self.identity_for(&metadata)?;
+                Ok(self.handle(&metadata, identity, false))
             }
             Entry::Deleting(metadata) => {
                 self.note_valid_record(id, &metadata);
@@ -275,13 +375,43 @@ impl SandboxManager {
                     return Err(Error::Unavailable);
                 }
                 self.reserve_sandbox(&principal.fingerprint)?;
+                let reserved_identity = match self.reserve_identity(id, &principal.fingerprint) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.release_sandbox(&principal.fingerprint);
+                        return Err(error);
+                    }
+                };
                 let created = self.storage.create_active(id, &principal.fingerprint);
                 match created {
                     Ok(metadata) => {
                         self.insert_reserved(metadata.clone());
-                        Ok(self.handle(&metadata, true))
+                        if let Some(record) = reserved_identity.as_ref()
+                            && let Err(error) = self
+                                .subids
+                                .as_ref()
+                                .expect("reserved identity has an allocator")
+                                .activate(record)
+                        {
+                            tracing::error!(
+                                sandbox_id = %id,
+                                error = %error,
+                                "could not activate the subordinate identity for a published sandbox"
+                            );
+                            let _ = self
+                                .subids
+                                .as_ref()
+                                .expect("reserved identity has an allocator")
+                                .quarantine(record, "activation failed after sandbox publication");
+                            return Err(Error::Unavailable);
+                        }
+                        let identity = self.identity_for(&metadata)?;
+                        Ok(self.handle(&metadata, identity, true))
                     }
                     Err(error) => {
+                        if let Some(record) = reserved_identity.as_ref() {
+                            self.release_reserved_identity(record);
+                        }
                         self.release_sandbox(&principal.fingerprint);
                         if matches!(error, storage::Error::AlreadyExists { .. }) {
                             Err(Error::Unavailable)
@@ -335,6 +465,39 @@ impl SandboxManager {
         let entry = self.storage.inspect(id).map_err(Error::Storage)?;
         let metadata = match entry {
             Entry::Absent => {
+                if let Some(allocator) = &self.subids
+                    && let Some(record) = allocator
+                        .lease_for(id)
+                        .map_err(|error| Error::Subid(error.to_string()))?
+                {
+                    if !authorized(principal, &record.owner) {
+                        return Ok(DeleteResult::Noop);
+                    }
+                    match record.state {
+                        super::subid::LeaseState::Releasing => {
+                            self.launcher
+                                .release_sandbox_resources(id)
+                                .map_err(Error::Launch)?;
+                            allocator
+                                .finish_release(&record)
+                                .map_err(|error| Error::Subid(error.to_string()))?;
+                        }
+                        super::subid::LeaseState::Quarantined => {
+                            // The resources can still be cleaned, but an
+                            // ambiguous identity must remain quarantined even
+                            // after its durable sandbox tree is gone.
+                            self.launcher
+                                .release_sandbox_resources(id)
+                                .map_err(Error::Launch)?;
+                        }
+                        _ => {
+                            // Active/Reserved without a durable sandbox is an
+                            // impossible incarnation; never infer that its
+                            // IDs are free.
+                            return Err(Error::Unavailable);
+                        }
+                    }
+                }
                 self.remove_record(id);
                 return Ok(DeleteResult::Noop);
             }
@@ -351,12 +514,32 @@ impl SandboxManager {
             return Ok(DeleteResult::Noop);
         }
 
+        let lease = self
+            .subids
+            .as_ref()
+            .map(|allocator| {
+                allocator
+                    .lease_for(id)
+                    .map_err(|error| Error::Subid(error.to_string()))?
+                    .ok_or(Error::Unavailable)
+            })
+            .transpose()?;
         if metadata.state() == State::Active {
             let deleting = metadata.with_state(State::Deleting);
             self.storage
                 .write_metadata(&deleting)
                 .map_err(Error::Storage)?;
             self.replace_record(deleting);
+        }
+        if let (Some(allocator), Some(record)) = (&self.subids, lease.as_ref())
+            && matches!(
+                record.state,
+                super::subid::LeaseState::Active | super::subid::LeaseState::Reserved
+            )
+        {
+            allocator
+                .begin_release(record)
+                .map_err(|error| Error::Subid(error.to_string()))?;
         }
         // Cancel a launch/running process before opening the directory tree
         // for deletion. The durable and in-memory Deleting state prevents a
@@ -371,6 +554,13 @@ impl SandboxManager {
         self.storage
             .remove_tree(id)
             .map_err(|source| Error::Cleanup { source })?;
+        if let (Some(allocator), Some(record)) = (&self.subids, lease.as_ref())
+            && record.state != super::subid::LeaseState::Quarantined
+        {
+            allocator
+                .finish_release(record)
+                .map_err(|error| Error::Subid(error.to_string()))?;
+        }
         self.remove_record(id);
         Ok(DeleteResult::Deleted)
     }
@@ -483,6 +673,7 @@ impl SandboxManager {
         let request = LaunchRequest {
             sandbox_id: handle.id.clone(),
             workspace: handle.workspace.clone(),
+            identity: handle.identity,
             operation,
             pty,
             environment,
@@ -861,8 +1052,60 @@ impl SandboxManager {
             .map(|(id, _)| id.clone())
             .collect();
         for id in deleting {
+            let lease = match &self.subids {
+                None => None,
+                Some(allocator) => match allocator.lease_for(&id) {
+                    Ok(Some(record)) => {
+                        match record.state {
+                            super::subid::LeaseState::Active
+                            | super::subid::LeaseState::Reserved => {
+                                if let Err(error) = allocator.begin_release(&record) {
+                                    tracing::warn!(
+                                        sandbox_id = %id,
+                                        error = %error,
+                                        "could not mark subordinate identity as releasing"
+                                    );
+                                    continue;
+                                }
+                            }
+                            super::subid::LeaseState::Releasing
+                            | super::subid::LeaseState::Quarantined => {}
+                        }
+                        Some(record)
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            "deleting isolated sandbox has no lease record"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(sandbox_id = %id, error = %error, "could not read subordinate identity lease");
+                        continue;
+                    }
+                },
+            };
+            if let Err(error) = self.launcher.release_sandbox_resources(&id) {
+                tracing::warn!(sandbox_id = %id, error = %error, "sandbox deletion reconciliation is pending");
+                continue;
+            }
             match self.storage.remove_tree(&id) {
-                Ok(()) => self.remove_record(&id),
+                Ok(()) => {
+                    if let Some(record) = lease.as_ref()
+                        && let Some(allocator) = &self.subids
+                        && record.state != super::subid::LeaseState::Quarantined
+                        && let Err(error) = allocator.finish_release(record)
+                    {
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            error = %error,
+                            "sandbox tree is gone but subordinate lease release is pending"
+                        );
+                        continue;
+                    }
+                    self.remove_record(&id);
+                }
                 Err(error) => {
                     tracing::warn!(sandbox_id = %id, error = %error, "sandbox deletion reconciliation is pending");
                 }
@@ -1006,11 +1249,82 @@ impl SandboxManager {
         remove_record_from_ledger(&mut self.ledger.lock().expect("sandbox ledger"), id);
     }
 
-    fn handle(&self, metadata: &Metadata, created: bool) -> SandboxHandle {
+    /// Claim the durable subordinate identity for a newly-created sandbox.
+    /// Delegation is queried for every allocation so a range shrink cannot
+    /// silently change the set of IDs the daemon may issue.
+    fn reserve_identity(
+        &self,
+        id: &SandboxId,
+        owner: &KeyFingerprint,
+    ) -> Result<Option<super::subid::LeaseRecord>, Error> {
+        let Some(allocator) = &self.subids else {
+            return Ok(None);
+        };
+        let delegation = super::subid::delegation::query_delegation()
+            .map_err(|error| Error::Subid(error.to_string()))?;
+        allocator
+            .claim(id, owner, &delegation)
+            .map(Some)
+            .map_err(|error| Error::Subid(error.to_string()))
+    }
+
+    /// Resolve and validate the active lease before admitting a launch. The
+    /// live delegation is checked again because subordinate ranges may be
+    /// edited while the daemon remains running.
+    fn identity_for(&self, metadata: &Metadata) -> Result<Option<IsolatedIdentity>, Error> {
+        let Some(allocator) = &self.subids else {
+            return Ok(None);
+        };
+        let record = allocator
+            .lease_for(metadata.id())
+            .map_err(|error| Error::Subid(error.to_string()))?
+            .ok_or(Error::Unavailable)?;
+        if record.owner != *metadata.owner() || record.state != super::subid::LeaseState::Active {
+            return Err(Error::Unavailable);
+        }
+        let delegation = super::subid::delegation::query_delegation()
+            .map_err(|error| Error::Subid(error.to_string()))?;
+        allocator
+            .validate_delegated(&record, &delegation)
+            .map_err(|error| Error::Subid(error.to_string()))?;
+        Ok(Some(IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid: record.uid,
+            host_gid: record.gid,
+        }))
+    }
+
+    /// Abort a reservation whose durable sandbox publication failed. Any
+    /// uncertain transition is quarantined so an ID is never guessed free.
+    fn release_reserved_identity(&self, record: &super::subid::LeaseRecord) {
+        let Some(allocator) = &self.subids else {
+            return;
+        };
+        let result = allocator
+            .begin_release(record)
+            .and_then(|_| allocator.finish_release(record));
+        if let Err(error) = result {
+            tracing::error!(
+                lease_id = %record.lease_id,
+                error = %error,
+                "could not release an unpublished subordinate identity; quarantining it"
+            );
+            let _ = allocator.quarantine(record, "reservation cleanup was ambiguous");
+        }
+    }
+
+    fn handle(
+        &self,
+        metadata: &Metadata,
+        identity: Option<IsolatedIdentity>,
+        created: bool,
+    ) -> SandboxHandle {
         SandboxHandle {
             id: metadata.id().clone(),
             owner: metadata.owner().clone(),
             workspace: self.storage.workspace_path(metadata.id()),
+            identity,
             created,
         }
     }
@@ -1145,6 +1459,7 @@ fn terminate_and_wait(process: &Arc<dyn platform::RunningProcess>) {
 #[derive(Debug)]
 pub(crate) enum Error {
     Storage(storage::Error),
+    Subid(String),
     Cleanup { source: storage::Error },
     RuntimeCleanup,
     Launch(platform::LaunchError),
@@ -1179,6 +1494,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Storage(error) => write!(f, "sandbox storage failed: {error}"),
+            Error::Subid(error) => write!(f, "sandbox subordinate identity unavailable: {error}"),
             Error::Cleanup { source } => write!(f, "sandbox cleanup failed: {source}"),
             Error::RuntimeCleanup => {
                 f.write_str("sandbox process cleanup did not finish before deletion deadline")
@@ -1454,6 +1770,59 @@ mod tests {
             DeleteResult::Noop
         );
         assert!(manager.claim(&other, &id).expect("new owner").created());
+    }
+
+    #[test]
+    fn deleting_a_quarantined_identity_keeps_the_lease_quarantined() {
+        let root = TempDir::new().expect("tempdir");
+        let paths = paths_for(&root);
+        paths.ensure().expect("paths");
+        let launcher = FakeLauncher::default();
+        let manager = SandboxManager::open_with_launcher_and_identity(
+            &paths,
+            Caps::default(),
+            Arc::new(launcher),
+            crate::config::SandboxIdentity::Isolated,
+        )
+        .expect("manager");
+        let owner = principal('A', Role::Normal);
+        let id = SandboxId::parse("quarantined").expect("sandbox id");
+        let metadata = manager
+            .storage
+            .create_active(&id, &owner.fingerprint)
+            .expect("sandbox");
+        manager.note_valid_record(&id, &metadata);
+
+        let allocator = manager.subids.as_ref().expect("isolated allocator");
+        let delegation = crate::sandbox::subid::Delegation {
+            uid_ranges: vec![
+                crate::sandbox::subid::SubidRange::new(100_000, 1).expect("uid range"),
+            ],
+            gid_ranges: vec![
+                crate::sandbox::subid::SubidRange::new(200_000, 1).expect("gid range"),
+            ],
+        };
+        let record = allocator
+            .claim(&id, &owner.fingerprint, &delegation)
+            .expect("lease");
+        allocator.activate(&record).expect("activate");
+        allocator
+            .quarantine(&record, "test ambiguity")
+            .expect("quarantine");
+
+        assert_eq!(
+            manager.delete(&owner, &id).expect("delete"),
+            DeleteResult::Deleted
+        );
+        assert!(matches!(manager.storage.inspect(&id), Ok(Entry::Absent)));
+        assert_eq!(
+            allocator
+                .lease_for(&id)
+                .expect("lease lookup")
+                .expect("quarantined lease")
+                .state,
+            crate::sandbox::subid::LeaseState::Quarantined
+        );
     }
 
     #[test]
@@ -1816,6 +2185,7 @@ mod tests {
             Some(platform::LaunchRequest {
                 sandbox_id: id,
                 workspace: handle.workspace().clone(),
+                identity: None,
                 operation: platform::LaunchOperation::Exec(b"printf fake".to_vec()),
                 pty: Some(platform::PtySpec {
                     term: "xterm-256color".into(),

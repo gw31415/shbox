@@ -28,7 +28,8 @@ parent:  cgroup create + limits      Landlock ruleset build    seccomp compile
          │
          clone3(CLONE_PIDFD | namespaces… [| CLONE_INTO_CGROUP])
          │
-child:   PDEATHSIG → userns maps → mount-rprivate → [PID namespace split]
+child:   PDEATHSIG → userns mapping barrier → mount-rprivate
+                  → recursive read-only → detached mount attach → [PID namespace split]
          │
          ├─ no PID namespace: stdio/session/ctty → chdir → hardening → execve
          │
@@ -57,6 +58,9 @@ cgroup v2 `memory.max`/`memory.swap.max`/`pids.max`/
 namespace selection (user namespaces map the caller to root inside, the
 `unshare --map-root-user` model), capability retention, and explicit
 inherited file descriptors (which survive exec with their exact numbers).
+`IdentityPolicy::Isolated` requires a parent-side `UidGidMapper`; the shbox
+adapter supplies shadow-utils mapping and broker-prepared `PreparedMounts`.
+Missing mapping or mount prerequisites fail closed.
 
 ## macOS backend (best-effort local development isolation)
 

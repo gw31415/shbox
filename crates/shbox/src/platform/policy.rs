@@ -18,15 +18,16 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-use shbox_sandbox::NetworkNamespacePolicy;
 use shbox_sandbox::{
-    FilesystemPolicy, Limit, NamespacePolicy, NetworkPolicy as SandboxNetwork, PathRule,
-    ResourceLimits, SandboxConfig as EngineConfig,
+    FilesystemPolicy, IdentityPolicy, IsolatedIdentity, Limit, NamespacePolicy,
+    NetworkPolicy as SandboxNetwork, PathRule, ResourceLimits, SandboxConfig as EngineConfig,
 };
 
+#[cfg(target_os = "linux")]
+use shbox_sandbox::NetworkNamespacePolicy;
+
 use super::{LaunchError, LaunchOperation};
-use crate::config::{Config, NetworkMode, SandboxResources};
+use crate::config::{Config, NetworkMode, SandboxIdentity, SandboxResources};
 
 /// Maximum remote command length accepted for `shell -c` execution.
 pub(crate) const MAX_COMMAND_BYTES: usize = 32 * 1024;
@@ -149,6 +150,7 @@ pub(crate) struct SandboxLaunchPolicy {
     temp_root: PathBuf,
     resources: SandboxResources,
     cgroup_parent: Option<PathBuf>,
+    identity: SandboxIdentity,
     /// Invariant filesystem tiers resolved once at snapshot construction, so
     /// a launch never re-stats or canonicalizes policy paths.
     resolved: ResolvedFilesystem,
@@ -178,6 +180,7 @@ impl fmt::Debug for SandboxLaunchPolicy {
                 "cgroup_parent",
                 &self.cgroup_parent.as_deref().map(Path::display),
             )
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -191,7 +194,7 @@ impl SandboxLaunchPolicy {
         shell: impl Into<PathBuf>,
         temp_root: impl Into<PathBuf>,
     ) -> Self {
-        Self::from_parts(
+        let mut policy = Self::from_parts(
             shell.into(),
             config.network(),
             config.read_paths().to_vec(),
@@ -199,7 +202,9 @@ impl SandboxLaunchPolicy {
             temp_root.into(),
             *config.resources(),
             config.cgroup_parent().map(Path::to_path_buf),
-        )
+        );
+        policy.identity = config.identity();
+        policy
     }
 
     /// Assemble a policy from explicit parts. The production path is
@@ -242,6 +247,7 @@ impl SandboxLaunchPolicy {
             temp_root,
             resources,
             cgroup_parent,
+            identity: SandboxIdentity::Host,
             resolved: ResolvedFilesystem { read_only, execute },
         }
     }
@@ -258,6 +264,11 @@ impl SandboxLaunchPolicy {
     /// The operator-specified resource limits for this policy snapshot.
     pub(crate) fn resources(&self) -> &crate::config::SandboxResources {
         &self.resources
+    }
+
+    /// The configured normal-sandbox identity mode.
+    pub(crate) fn identity(&self) -> SandboxIdentity {
+        self.identity
     }
 
     /// The operator-specified cgroup v2 creation parent, if any.
@@ -300,7 +311,21 @@ impl SandboxLaunchPolicy {
     ///
     /// `is_pty` selects the process/session shape the terminal path needs
     /// (new session plus controlling terminal).
+    #[allow(dead_code)]
     pub(crate) fn engine_config(&self, workspace: &Path, launch_temp: &Path) -> EngineConfig {
+        self.engine_config_with_identity(workspace, launch_temp, None)
+    }
+
+    /// Build the engine configuration with the durable sandbox's leased
+    /// identity. A missing lease in isolated mode intentionally produces an
+    /// invalid zero-ID policy so the engine fails closed instead of silently
+    /// selecting daemon identity.
+    pub(crate) fn engine_config_with_identity(
+        &self,
+        workspace: &Path,
+        launch_temp: &Path,
+        isolated_identity: Option<IsolatedIdentity>,
+    ) -> EngineConfig {
         let (mut read_only, execute) = self.resolved_filesystem_paths();
         let mut read_write = self.curated_write_paths();
         read_write.push(workspace.to_path_buf());
@@ -322,6 +347,7 @@ impl SandboxLaunchPolicy {
             resources: self.engine_resources(),
             syscalls: shbox_sandbox::SyscallPolicy::Unrestricted,
             namespaces: self.engine_namespaces(),
+            identity: self.engine_identity(isolated_identity),
             capabilities: shbox_sandbox::CapabilityPolicy::DropAll,
             inherited_fds: Vec::new(),
             cgroup_parent: self.cgroup_parent.clone(),
@@ -352,10 +378,40 @@ impl SandboxLaunchPolicy {
     fn engine_namespaces(&self) -> NamespacePolicy {
         let mut namespaces = NamespacePolicy::default();
         if self.network == NetworkMode::Disabled {
-            namespaces.user = true;
             namespaces.network = NetworkNamespacePolicy::Isolated;
         }
         namespaces
+    }
+
+    /// Process identity for the launch.
+    ///
+    /// Compatibility `host` mode keeps the daemon's host DAC identity. When
+    /// networking is disabled it still uses `CallerMappedRoot` so an
+    /// unprivileged daemon can create the isolated network namespace. The
+    /// opt-in `isolated` mode instead consumes the durable subordinate lease
+    /// supplied by the manager and uses the parent-installed maps.
+    #[cfg(target_os = "linux")]
+    fn engine_identity(&self, isolated_identity: Option<IsolatedIdentity>) -> IdentityPolicy {
+        match (self.identity, isolated_identity) {
+            (SandboxIdentity::Isolated, Some(identity)) => IdentityPolicy::Isolated(identity),
+            (SandboxIdentity::Isolated, None) => IdentityPolicy::Isolated(IsolatedIdentity {
+                runtime_uid: 1000,
+                runtime_gid: 1000,
+                host_uid: 0,
+                host_gid: 0,
+            }),
+            (SandboxIdentity::Host, _) if self.network == NetworkMode::Disabled => {
+                IdentityPolicy::CallerMappedRoot
+            }
+            (SandboxIdentity::Host, _) => IdentityPolicy::Host,
+        }
+    }
+
+    /// macOS has no Linux user-namespace identity primitive; Seatbelt
+    /// confinement keeps the host identity.
+    #[cfg(not(target_os = "linux"))]
+    fn engine_identity(&self, _isolated_identity: Option<IsolatedIdentity>) -> IdentityPolicy {
+        shbox_sandbox::IdentityPolicy::Host
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -924,8 +980,9 @@ mod tests {
     fn disabled_network_uses_an_unprivileged_isolated_network_namespace() {
         let policy = test_policy("/bin/sh");
         let namespaces = policy.engine_namespaces();
-        assert!(
-            namespaces.user,
+        assert_eq!(
+            policy.engine_identity(None),
+            IdentityPolicy::CallerMappedRoot,
             "a user namespace is required to create the network namespace without host capabilities"
         );
         assert_eq!(namespaces.network, NetworkNamespacePolicy::Isolated);

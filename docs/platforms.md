@@ -11,7 +11,8 @@ SSH/session layer
         -> shbox-sandbox engine (in-workspace crate)
             Linux: clone3 + pidfd + Landlock + seccomp
                    + durable cgroup v2 process domain (CLONE_INTO_CGROUP)
-                   + namespaces + no_new_privs + capability drop
+                   + namespaces + subordinate identity + ID-mapped mounts
+                   + no_new_privs + capability drop
             macOS: generated Seatbelt profile
                    via /usr/bin/sandbox-exec
 ```
@@ -44,6 +45,13 @@ parent process は child を作る前に:
 - public shbox adapter は resource limit の有無にかかわらず `SandboxId` 共有 process domain cgroup を child 生成前に準備し、explicit limit があれば同じ domain に書き込む
 - argv/envp/cwd を C string まで marshal
 
+`[sandbox] identity = "isolated"` を選択した場合は、subordinate UID/GID lease
+に対する parent mapping barrier を完了し、root の socket-activated
+`shbox-idmap-broker` から detached ID-mapped workspace/runtime mount FD を受け
+取る。broker は任意 pathname や command を受け取らず、source directory FD と
+mount-ID-map user namespace FD だけを検証する。broker または ID-mapped mount が
+利用できない場合は host identity に戻さず launch を拒否する。
+
 する。実際の `clone3` は process-lifetime の専用 spawn-owner thread が担当するため、`PR_SET_PDEATHSIG` の親 thread は短命な Tokio blocking worker にならない。PID namespace 無しでは user child を `clone3(CLONE_PIDFD | … | CLONE_INTO_CGROUP)` で直接生成する。PID namespace 有りでは outer clone を内部 PID1 supervisor/reaper とし、user PID2 を同じ process domain cgroup 内へ直接生成する。post-clone path は固定順序・allocation-free で、path lookup、policy allocation、filter compile を行わない。
 
 engine の invariant（no_new_privs、capability drop、FD hygiene、setup 失敗時の fail-closed、pidfd supervision）は shbox policy からは弱められない。
@@ -67,6 +75,11 @@ Landlock restriction は descendant に継承される。
 `disabled` は fresh user+network namespace と Landlock network rules を組み合わせる。fresh network namespace が host/external network reachability を切り離し、child は capability drop 後に exec されるため初期状態で down の loopback を再構成できない。Landlock（ABI 4+）は TCP `bind`/`connect` も deny する。必要な namespace setup または Landlock network rights が利用できなければ launch は fail closed する。
 
 `outbound` のpublic contractは任意remote endpointへのclient connectionを利用可能にすることまでとする。Linux mappingは `NetworkPolicy::Unrestricted`（Landlock network ruleなし）であり、任意remote portへのconnectだけをwildcard許可してbindだけを禁止するportless Landlock ruleとして偽装しない。このためLinuxではcontractより広いsocket operationが可能になり得る。macOSは別途bind/inbound ruleを付与しない。
+
+Ubuntu 24.04 では `kernel.apparmor_restrict_unprivileged_userns=1` の環境を想定し、
+deployment artifact の `deploy/apparmor/usr.local.bin.shbox` をロードする。この専用
+profile により shbox の bootstrap user namespace だけが generic
+`unprivileged_userns` profile による `CAP_SETGID`/`CAP_SYS_ADMIN` 拒否を受けない。
 
 ### 2.4 seccomp / namespaces
 
@@ -97,6 +110,12 @@ cgroup parent は auto-discovery（自身の cgroup から上位へ、必要 con
 明示 limit は parent/ancestor cgroup の制限に追加される制限であり、child が inherited cgroup restriction を解除または引き上げることはできない。
 
 systemd の `KillMode=control-group` を deployment artifact で使う場合、それはservice managerがdaemon service全体をcleanupする方針であり、per-sandbox cgroup delegationとは別の概念である。
+
+systemd deployment では `Delegate=cpu memory pids` と `DelegateSubgroup=daemon` を設定し、daemon
+自身を delegated leaf に置く。systemd は指定 controller を delegated subtree から利用可能にするが、
+`cgroup.subtree_control` 自体は有効化しないため、shbox が limit 用 child cgroup の作成時に必要な
+controller だけを有効化する。`DelegateSubgroup` を持たない古い systemd はこの
+deployment tier の対象外であり、launcher wrapper で代替しない。
 
 ### 2.7 Resource limits
 

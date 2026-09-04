@@ -9,30 +9,68 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
 use std::fs;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use shbox_sandbox::{
-    CommandSpec, ProcessDomain, ProcessDomainScope, Sandbox, SandboxConfig as EngineConfig,
-    SandboxError, SessionSetup, Stdio,
+    CommandSpec, PreparedMounts, ProcessDomain, ProcessDomainScope, Sandbox,
+    SandboxConfig as EngineConfig, SandboxError, SessionSetup, ShadowUidGidMapper, Stdio,
 };
 
+use super::idmap_broker::{self, BrokerMounts};
 use super::policy::{RuntimeTemp, SandboxLaunchPolicy, login_shell_argv0, validated_shell_command};
 use super::terminal::{PtyIo, PtyPair, duplicate_fd};
 use super::{
     LaunchError, LaunchRequest, LaunchedProcess, ProcessExit, ProcessLauncher, ProcessReader,
     ProcessWriter, RunningProcess,
 };
-use crate::config::NetworkMode;
+use crate::config::{NetworkMode, SandboxIdentity};
 use crate::sandbox::SandboxId;
 
 /// Deadline for a killed process domain to report `populated 0`.
 const DOMAIN_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn open_mount_directory(path: &Path) -> std::io::Result<OwnedFd> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mount directory path contains NUL",
+        )
+    })?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn validate_request_identity(
+    policy: SandboxIdentity,
+    request: Option<shbox_sandbox::IsolatedIdentity>,
+) -> Result<(), LaunchError> {
+    match (policy, request) {
+        (SandboxIdentity::Isolated, None) => Err(LaunchError::new(
+            "isolated sandbox launch has no active subordinate identity lease",
+        )),
+        (SandboxIdentity::Host, Some(_)) => Err(LaunchError::new(
+            "host sandbox launch received an isolated identity lease",
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// One sandbox's runtime-domain state (plan M5). The lifecycle is the enum:
 /// every state carries exactly the fields that exist in it, so contradictory
@@ -59,6 +97,8 @@ enum DomainSlot {
         /// Runtime-scoped `TMPDIR` retained while this generation is
         /// populated or has a launch in flight.
         runtime_temp: RuntimeTemp,
+        identity: Option<shbox_sandbox::IsolatedIdentity>,
+        mount_idmap_userns: Option<OwnedFd>,
     },
     Deleting {
         generation: u64,
@@ -67,6 +107,8 @@ enum DomainSlot {
         /// still awaits a filesystem cleanup retry.
         domain: Option<Arc<ProcessDomain>>,
         runtime_temp: Option<RuntimeTemp>,
+        identity: Option<shbox_sandbox::IsolatedIdentity>,
+        mount_idmap_userns: Option<OwnedFd>,
     },
     /// The domain cgroup is already removed but its runtime temp tree could
     /// not be deleted; the next launch retries cleanup before creating a
@@ -176,6 +218,7 @@ impl Drop for DomainLease {
 pub(crate) struct LinuxLauncher {
     policy: SandboxLaunchPolicy,
     engine: Sandbox,
+    broker_socket: PathBuf,
     /// The delegated cgroup parent resolved once from the immutable policy
     /// (audit B3): every domain creation and startup reconciliation below
     /// this launcher uses the same open parent descriptor.
@@ -203,8 +246,17 @@ impl fmt::Debug for LinuxLauncher {
 
 impl LinuxLauncher {
     pub(crate) fn new(policy: SandboxLaunchPolicy) -> Result<Self, LaunchError> {
-        let engine =
-            Sandbox::detect_with(policy.cgroup_parent().map(shbox_sandbox::CgroupParent::new));
+        Self::new_with_broker_socket(policy, PathBuf::from(idmap_broker::DEFAULT_SOCKET_PATH))
+    }
+
+    fn new_with_broker_socket(
+        policy: SandboxLaunchPolicy,
+        broker_socket: PathBuf,
+    ) -> Result<Self, LaunchError> {
+        let engine = Sandbox::detect_with_mapper(
+            policy.cgroup_parent().map(shbox_sandbox::CgroupParent::new),
+            Arc::new(ShadowUidGidMapper::new()),
+        );
         let capabilities = engine.capabilities();
 
         // Landlock is the filesystem confinement layer; without it the
@@ -247,6 +299,7 @@ impl LinuxLauncher {
         Ok(Self {
             policy,
             engine,
+            broker_socket,
             domain_scope: std::sync::OnceLock::new(),
             registry: Arc::new(DomainRegistry::default()),
         })
@@ -292,6 +345,46 @@ impl LinuxLauncher {
         Ok(command)
     }
 
+    fn prepare_mounts(
+        &self,
+        workspace: &Path,
+        runtime_temp: &Path,
+        identity: shbox_sandbox::IsolatedIdentity,
+        mount_idmap_userns: RawFd,
+    ) -> Result<PreparedMounts, LaunchError> {
+        let workspace_source = open_mount_directory(workspace).map_err(|error| {
+            LaunchError::with_source("sandbox workspace mount source could not be opened", error)
+        })?;
+        let runtime_source = open_mount_directory(runtime_temp).map_err(|error| {
+            LaunchError::with_source(
+                "sandbox runtime-temp mount source could not be opened",
+                error,
+            )
+        })?;
+        let workspace_target = open_mount_directory(workspace).map_err(|error| {
+            LaunchError::with_source("sandbox workspace mount target could not be opened", error)
+        })?;
+        let runtime_target = open_mount_directory(runtime_temp).map_err(|error| {
+            LaunchError::with_source(
+                "sandbox runtime-temp mount target could not be opened",
+                error,
+            )
+        })?;
+        let BrokerMounts { workspace, runtime } = idmap_broker::create_idmapped_mounts(
+            &self.broker_socket,
+            identity,
+            mount_idmap_userns,
+            workspace_source.as_raw_fd(),
+            runtime_source.as_raw_fd(),
+        )?;
+        Ok(PreparedMounts::new(
+            workspace,
+            workspace_target,
+            runtime,
+            runtime_target,
+        ))
+    }
+
     /// Whether this host can currently provide the mandatory per-sandbox
     /// process domain. Test seams use this to self-skip on hosts without a
     /// delegated cgroup v2 parent, mirroring the engine's contract.
@@ -331,7 +424,8 @@ impl LinuxLauncher {
     fn process_domain(
         &self,
         sandbox_id: &SandboxId,
-    ) -> Result<(Arc<ProcessDomain>, DomainLease, PathBuf), LaunchError> {
+        identity: Option<shbox_sandbox::IsolatedIdentity>,
+    ) -> Result<(Arc<ProcessDomain>, DomainLease, PathBuf, Option<OwnedFd>), LaunchError> {
         let mut slots = self
             .registry
             .slots
@@ -347,13 +441,22 @@ impl LinuxLauncher {
                 StartCreating,
                 WaitCreating,
                 Joined,
+                IdentityMismatch,
                 Deleting,
                 CleanPending,
             }
             let join = match slots.get_mut(sandbox_id) {
                 None => Join::StartCreating,
                 Some(DomainSlot::Creating) => Join::WaitCreating,
-                Some(DomainSlot::Active { .. }) => Join::Joined,
+                Some(DomainSlot::Active {
+                    identity: current, ..
+                }) => {
+                    if *current == identity {
+                        Join::Joined
+                    } else {
+                        Join::IdentityMismatch
+                    }
+                }
                 Some(DomainSlot::Deleting { .. }) => Join::Deleting,
                 Some(DomainSlot::CleanupPending { .. }) => Join::CleanPending,
             };
@@ -383,19 +486,42 @@ impl LinuxLauncher {
                         in_flight,
                         domain,
                         runtime_temp,
+                        identity: current_identity,
+                        mount_idmap_userns,
                         ..
                     }) = slots.get_mut(sandbox_id)
                     else {
                         continue;
                     };
-                    *in_flight += 1;
                     let domain = Arc::clone(domain);
                     let runtime_temp_path = runtime_temp.path().to_path_buf();
+                    let mount_idmap_userns = match (current_identity, mount_idmap_userns.as_ref()) {
+                        (None, None) => None,
+                        (Some(_), Some(namespace)) => {
+                            Some(duplicate_fd(namespace.as_raw_fd()).map_err(|error| {
+                                LaunchError::with_source(
+                                    "sandbox mount ID-map namespace could not be duplicated",
+                                    error,
+                                )
+                            })?)
+                        }
+                        _ => {
+                            return Err(LaunchError::new(
+                                "sandbox mount ID-map namespace state is inconsistent",
+                            ));
+                        }
+                    };
+                    *in_flight += 1;
                     let lease = DomainLease {
                         registry: Arc::clone(&self.registry),
                         sandbox_id: sandbox_id.clone(),
                     };
-                    return Ok((domain, lease, runtime_temp_path));
+                    return Ok((domain, lease, runtime_temp_path, mount_idmap_userns));
+                }
+                Join::IdentityMismatch => {
+                    return Err(LaunchError::new(
+                        "sandbox process domain identity does not match the durable lease",
+                    ));
                 }
                 Join::Deleting => {
                     return Err(LaunchError::new(
@@ -442,14 +568,14 @@ impl LinuxLauncher {
         }
         // `Creating` is published; every cgroup/filesystem operation below
         // happens without the registry lock.
-        let create = self.create_generation();
+        let create = self.create_generation(identity);
         let mut slots = self
             .registry
             .slots
             .lock()
             .map_err(|_| LaunchError::new("sandbox process registry is unavailable"))?;
         match create {
-            Ok((generation, domain, runtime_temp)) => {
+            Ok((generation, domain, runtime_temp, mount_idmap_userns)) => {
                 if matches!(slots.get_mut(sandbox_id), Some(DomainSlot::Creating))
                     || !slots.contains_key(sandbox_id)
                 {
@@ -460,6 +586,8 @@ impl LinuxLauncher {
                             in_flight: 1,
                             domain: Arc::clone(&domain),
                             runtime_temp,
+                            identity,
+                            mount_idmap_userns,
                         },
                     );
                 } else {
@@ -482,11 +610,29 @@ impl LinuxLauncher {
                         _ => None,
                     })
                     .ok_or_else(|| LaunchError::new("sandbox runtime temp state is unavailable"))?;
+                let mount_idmap_userns = slots
+                    .get(sandbox_id)
+                    .and_then(|slot| match slot {
+                        DomainSlot::Active {
+                            mount_idmap_userns: Some(namespace),
+                            ..
+                        } => Some(namespace),
+                        _ => None,
+                    })
+                    .map(|namespace| {
+                        duplicate_fd(namespace.as_raw_fd()).map_err(|error| {
+                            LaunchError::with_source(
+                                "sandbox mount ID-map namespace could not be duplicated",
+                                error,
+                            )
+                        })
+                    })
+                    .transpose()?;
                 let lease = DomainLease {
                     registry: Arc::clone(&self.registry),
                     sandbox_id: sandbox_id.clone(),
                 };
-                Ok((domain, lease, runtime_temp_path))
+                Ok((domain, lease, runtime_temp_path, mount_idmap_userns))
             }
             Err(error) => {
                 // Resolution failed: release the marker so waiting launches
@@ -502,7 +648,10 @@ impl LinuxLauncher {
 
     /// Create one runtime-domain generation. Runs without the registry lock;
     /// only valid while the caller holds the `Creating` marker.
-    fn create_generation(&self) -> Result<(u64, Arc<ProcessDomain>, RuntimeTemp), LaunchError> {
+    fn create_generation(
+        &self,
+        identity: Option<shbox_sandbox::IsolatedIdentity>,
+    ) -> Result<(u64, Arc<ProcessDomain>, RuntimeTemp, Option<OwnedFd>), LaunchError> {
         let scope = self.domain_scope()?;
         let generation = self
             .registry
@@ -515,20 +664,58 @@ impl LinuxLauncher {
                 .create_domain(&resources)
                 .map_err(|error| LaunchError::new(describe_engine_error(&error)))?,
         );
-        Ok((generation, domain, runtime_temp))
+        let mount_idmap_userns = match identity {
+            Some(identity) => match self.engine.create_mount_idmap_user_namespace(identity) {
+                Ok(namespace) => Some(namespace),
+                Err(error) => {
+                    let _ = domain.kill_all();
+                    let _ = domain.wait_until_empty(DOMAIN_TEARDOWN_TIMEOUT);
+                    let _ = domain.remove_empty();
+                    let _ = runtime_temp.remove();
+                    return Err(LaunchError::new(describe_engine_error(&error)));
+                }
+            },
+            None => None,
+        };
+        Ok((generation, domain, runtime_temp, mount_idmap_userns))
     }
 }
 
 impl ProcessLauncher for LinuxLauncher {
     fn launch(&self, request: LaunchRequest) -> Result<LaunchedProcess, LaunchError> {
+        validate_request_identity(self.policy.identity(), request.identity)?;
         let workspace = fs::canonicalize(&request.workspace)
             .map_err(|_| LaunchError::new("sandbox workspace is unavailable"))?;
         if !workspace.is_dir() {
             return Err(LaunchError::new("sandbox workspace is unavailable"));
         }
-        let (process_domain, domain_lease, runtime_temp_path) =
-            self.process_domain(&request.sandbox_id)?;
-        let config: EngineConfig = self.policy.engine_config(&workspace, &runtime_temp_path);
+        let (process_domain, domain_lease, runtime_temp_path, mount_idmap_userns) =
+            self.process_domain(&request.sandbox_id, request.identity)?;
+        let config: EngineConfig = self.policy.engine_config_with_identity(
+            &workspace,
+            &runtime_temp_path,
+            request.identity,
+        );
+
+        let prepared_mounts = match (request.identity, mount_idmap_userns.as_ref()) {
+            (Some(identity), Some(namespace)) => Some(self.prepare_mounts(
+                &workspace,
+                &runtime_temp_path,
+                identity,
+                namespace.as_raw_fd(),
+            )?),
+            (Some(_), None) => {
+                return Err(LaunchError::new(
+                    "isolated sandbox generation has no mount ID-map namespace",
+                ));
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(LaunchError::new(
+                    "host sandbox generation unexpectedly has a mount ID-map namespace",
+                ));
+            }
+        };
 
         let mut command = self.command_spec(&request, &workspace)?;
         command.env = self
@@ -587,10 +774,18 @@ impl ProcessLauncher for LinuxLauncher {
         // confinement mechanism in place; failures already cleaned up.
         // Every launch joins the sandbox's shared process domain: limits or
         // no limits, containment is not optional.
-        let mut child = self
-            .engine
-            .spawn_in_process_domain(command, config, &process_domain)
-            .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
+        let mut child = match prepared_mounts {
+            Some(mounts) => self.engine.spawn_in_process_domain_with_mounts(
+                command,
+                config,
+                &process_domain,
+                mounts,
+            ),
+            None => self
+                .engine
+                .spawn_in_process_domain(command, config, &process_domain),
+        }
+        .map_err(|error| LaunchError::new(describe_engine_error(&error)))?;
         // `None` would mean the child was already reaped — a pid of 0 must
         // never reach the group-signaling control (`kill(0, ..)` would
         // signal the daemon's own process group).
@@ -653,7 +848,7 @@ impl ProcessLauncher for LinuxLauncher {
     fn release_sandbox_resources(&self, sandbox_id: &SandboxId) -> Result<(), LaunchError> {
         // Deleting transition: reject new launches first, then wait out the
         // in-flight barrier before touching the cgroup (plan M5).
-        let (mut domain, runtime_temp) = {
+        let (mut domain, runtime_temp, identity, mount_idmap_userns) = {
             let mut slots = self
                 .registry
                 .slots
@@ -726,12 +921,19 @@ impl ProcessLauncher for LinuxLauncher {
                         let Some(DomainSlot::Deleting {
                             domain,
                             runtime_temp,
+                            identity,
+                            mount_idmap_userns,
                             ..
                         }) = slots.get_mut(sandbox_id)
                         else {
                             continue;
                         };
-                        break (domain.take(), runtime_temp.take());
+                        break (
+                            domain.take(),
+                            runtime_temp.take(),
+                            *identity,
+                            mount_idmap_userns.take(),
+                        );
                     }
                     Phase::MarkDeleting => {
                         // Kill every member now: still-running launches keep
@@ -754,6 +956,8 @@ impl ProcessLauncher for LinuxLauncher {
                             in_flight,
                             domain,
                             runtime_temp,
+                            identity,
+                            mount_idmap_userns,
                         } = prior
                         else {
                             // A racing transition won; re-examine.
@@ -770,6 +974,8 @@ impl ProcessLauncher for LinuxLauncher {
                                     in_flight,
                                     domain,
                                     runtime_temp,
+                                    identity,
+                                    mount_idmap_userns,
                                 },
                             );
                             self.registry.changed.notify_all();
@@ -782,6 +988,8 @@ impl ProcessLauncher for LinuxLauncher {
                                 in_flight,
                                 domain: Some(domain),
                                 runtime_temp: Some(runtime_temp),
+                                identity,
+                                mount_idmap_userns,
                             },
                         );
                         self.registry.changed.notify_all();
@@ -880,6 +1088,8 @@ impl ProcessLauncher for LinuxLauncher {
                             in_flight: 0,
                             domain,
                             runtime_temp,
+                            identity,
+                            mount_idmap_userns,
                         },
                     );
                 }
@@ -924,6 +1134,8 @@ impl ProcessLauncher for LinuxLauncher {
                     in_flight,
                     domain,
                     runtime_temp,
+                    identity,
+                    mount_idmap_userns,
                 } = prior
                 else {
                     slots.insert(sandbox_id.clone(), prior);
@@ -943,6 +1155,8 @@ impl ProcessLauncher for LinuxLauncher {
                         in_flight,
                         domain: Some(domain),
                         runtime_temp: Some(runtime_temp),
+                        identity,
+                        mount_idmap_userns,
                     },
                 );
             }
@@ -977,6 +1191,8 @@ impl ProcessLauncher for LinuxLauncher {
                     in_flight,
                     domain,
                     runtime_temp,
+                    identity,
+                    mount_idmap_userns,
                 } = prior
                 else {
                     slots.insert(sandbox_id, prior);
@@ -990,6 +1206,8 @@ impl ProcessLauncher for LinuxLauncher {
                         in_flight,
                         domain: Some(domain),
                         runtime_temp: Some(runtime_temp),
+                        identity,
+                        mount_idmap_userns,
                     },
                 );
             }
@@ -1264,6 +1482,7 @@ mod tests {
         LaunchRequest {
             sandbox_id: sandbox_id.parse().expect("sandbox id"),
             workspace: workspace.into(),
+            identity: None,
             operation: super::super::LaunchOperation::Exec(command.as_bytes().to_vec()),
             pty: pty.then(|| super::super::PtySpec {
                 term: "xterm-256color".to_string(),
@@ -1274,6 +1493,20 @@ mod tests {
             }),
             environment: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn launch_identity_must_match_the_process_policy() {
+        let identity = shbox_sandbox::IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid: 165_536,
+            host_gid: 165_536,
+        };
+        assert!(validate_request_identity(SandboxIdentity::Host, None).is_ok());
+        assert!(validate_request_identity(SandboxIdentity::Isolated, Some(identity)).is_ok());
+        assert!(validate_request_identity(SandboxIdentity::Isolated, None).is_err());
+        assert!(validate_request_identity(SandboxIdentity::Host, Some(identity)).is_err());
     }
 
     #[tokio::test]
@@ -2052,6 +2285,7 @@ mod tests {
         let request = LaunchRequest {
             sandbox_id: "linux-test".parse().expect("sandbox id"),
             workspace: workspace.path().to_path_buf(),
+            identity: None,
             operation: super::super::LaunchOperation::Exec(command),
             pty: None,
             environment: std::collections::BTreeMap::new(),
@@ -2090,6 +2324,7 @@ mod tests {
         let request = LaunchRequest {
             sandbox_id: "linux-test".parse().expect("sandbox id"),
             workspace: workspace.path().to_path_buf(),
+            identity: None,
             operation: super::super::LaunchOperation::Shell,
             pty: None,
             environment: std::collections::BTreeMap::new(),

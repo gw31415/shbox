@@ -272,7 +272,7 @@ impl MacosBackend {
 /// silent degradation.
 fn reject_linux_only_policy(config: &SandboxConfig) -> Result<(), SandboxError> {
     let namespaces = &config.namespaces;
-    if namespaces.user
+    if config.identity != crate::policy::IdentityPolicy::Host
         || namespaces.pid
         || namespaces.mount
         || namespaces.ipc

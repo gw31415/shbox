@@ -74,13 +74,16 @@ pub use command::{CommandSpec, SessionSetup, Stdio};
 pub use error::{ChildStage, ExitStatus, SandboxError};
 pub use policy::{
     ArgLen, CAP_LAST_NUMBER, Capability, CapabilityPolicy, CgroupParent, CmpOp, CpuMax,
-    FilesystemPolicy, Limit, NamespacePolicy, NetworkNamespacePolicy, NetworkPolicy, PathRule,
-    ResourceLimits, SandboxConfig, SeccompAction, Syscall, SyscallCondition, SyscallPolicy,
-    SyscallRule,
+    FilesystemPolicy, IdentityPolicy, IsolatedIdentity, Limit, NamespacePolicy,
+    NetworkNamespacePolicy, NetworkPolicy, PathRule, ResourceLimits, SandboxConfig, SeccompAction,
+    Syscall, SyscallCondition, SyscallPolicy, SyscallRule,
 };
 
 #[cfg(target_os = "linux")]
-pub use linux::{ProcessDomain, ProcessDomainScope, syscall_number};
+pub use linux::{
+    MapperTarget, PreparedMounts, ProcessDomain, ProcessDomainScope, ShadowUidGidMapper,
+    UidGidMapper, create_mount_idmap_user_namespace, syscall_number,
+};
 
 /// Which backend a [`Sandbox`] resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +310,26 @@ impl Sandbox {
     pub fn detect_with(cgroup_parent: Option<CgroupParent>) -> Sandbox {
         let capabilities = linux::detect_capabilities(cgroup_parent.as_ref());
         Sandbox {
-            backend: Backend::Linux(Arc::new(linux::LinuxBackend::new(&capabilities))),
+            backend: Backend::Linux(Arc::new(linux::LinuxBackend::new(&capabilities, None))),
+            capabilities: Arc::new(capabilities),
+        }
+    }
+
+    /// Like [`detect_with`](Self::detect_with), with the parent-side
+    /// mapping helper isolated identity launches require. Isolated
+    /// [`IdentityPolicy`](crate::IdentityPolicy) launches fail closed
+    /// without a mapper.
+    #[cfg(target_os = "linux")]
+    pub fn detect_with_mapper(
+        cgroup_parent: Option<CgroupParent>,
+        identity_mapper: Arc<dyn UidGidMapper>,
+    ) -> Sandbox {
+        let capabilities = linux::detect_capabilities(cgroup_parent.as_ref());
+        Sandbox {
+            backend: Backend::Linux(Arc::new(linux::LinuxBackend::new(
+                &capabilities,
+                Some(identity_mapper),
+            ))),
             capabilities: Arc::new(capabilities),
         }
     }
@@ -370,6 +392,23 @@ impl Sandbox {
         }
     }
 
+    /// Create a generation-scoped auxiliary user namespace for ID-mapped
+    /// mounts. The returned descriptor is suitable for a privileged broker's
+    /// `MOUNT_ATTR_IDMAP` request and is not a namespace that user code joins.
+    #[cfg(target_os = "linux")]
+    pub fn create_mount_idmap_user_namespace(
+        &self,
+        identity: IsolatedIdentity,
+    ) -> Result<std::os::fd::OwnedFd, SandboxError> {
+        match &self.backend {
+            Backend::Linux(backend) => backend.create_mount_idmap_user_namespace(identity),
+            Backend::Unsupported => Err(SandboxError::unsupported(
+                "backend",
+                "no sandbox backend exists for this platform",
+            )),
+        }
+    }
+
     /// Reconcile stale process domains left below a delegated cgroup parent.
     ///
     /// This removes only cgroups created by the durable process-domain API;
@@ -411,6 +450,29 @@ impl Sandbox {
         validate::validate(&config, &command)?;
         match &self.backend {
             Backend::Linux(backend) => backend.spawn_in_process_domain(command, config, domain),
+            Backend::Unsupported => Err(SandboxError::unsupported(
+                "backend",
+                "no sandbox backend exists for this platform",
+            )),
+        }
+    }
+
+    /// Spawn a Linux child into an existing process domain and attach the
+    /// broker-prepared detached ID-mapped workspace/runtime views during
+    /// trusted child setup.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_in_process_domain_with_mounts(
+        &self,
+        command: CommandSpec,
+        config: SandboxConfig,
+        domain: &ProcessDomain,
+        mounts: PreparedMounts,
+    ) -> Result<SandboxChild, SandboxError> {
+        validate::validate(&config, &command)?;
+        match &self.backend {
+            Backend::Linux(backend) => {
+                backend.spawn_in_process_domain_with_mounts(command, config, domain, mounts)
+            }
             Backend::Unsupported => Err(SandboxError::unsupported(
                 "backend",
                 "no sandbox backend exists for this platform",

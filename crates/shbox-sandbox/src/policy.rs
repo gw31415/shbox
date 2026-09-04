@@ -160,14 +160,62 @@ pub enum NetworkNamespacePolicy {
     Isolated,
 }
 
-/// Linux namespace selection. Combinations are the caller's choice; the crate
-/// fixes no preset bundle.
+/// Per-launch process identity: *who the sandboxed process is* on the host,
+/// independent of namespace topology ([`NamespacePolicy`]).
+///
+/// The engine offers only **fresh** user-namespace creation. Joining an
+/// existing user namespace is deliberately absent: `setns()` into a user
+/// namespace requires `CAP_SYS_ADMIN` in the target namespace, which an
+/// unprivileged launcher does not hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IdentityPolicy {
+    /// No user namespace: the process keeps the launcher's identity for its
+    /// whole lifetime. This is **not** identity isolation.
+    #[default]
+    Host,
+    /// Legacy engine behavior: create a user namespace and map namespace
+    /// root (UID/GID 0) to the caller's effective UID/GID (the
+    /// `unshare --map-root-user` model). Kept for compatibility and for
+    /// namespace-topology use cases during the identity-isolation migration.
+    /// The host-visible identity is still the launcher's, so this is also
+    /// **not** identity isolation.
+    CallerMappedRoot,
+    /// Create a fresh user namespace for this launch. The child blocks at a
+    /// parent mapping barrier; a parent-side mapper installs exactly the
+    /// supplied delegated UID/GID entries before child setup continues.
+    ///
+    /// Requires a fresh mount namespace (`NamespacePolicy::mount`) so the
+    /// writable views can be replaced with ID-mapped mounts, and rejects any
+    /// retained capability: the runtime process must end with empty
+    /// effective/permitted/inheritable/ambient sets.
+    Isolated(IsolatedIdentity),
+}
+
+/// Numeric identity translation for [`IdentityPolicy::Isolated`].
+///
+/// Installed as exactly one `uid_map` and one `gid_map` entry
+/// (`runtime <host> 1`). Namespace UID/GID 0 stay deliberately unmapped so
+/// no bootstrap identity exists to regain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolatedIdentity {
+    /// Namespace-visible runtime UID (1000 in shbox v1). Must be non-zero.
+    pub runtime_uid: u32,
+    /// Namespace-visible runtime GID (1000 in shbox v1). Must be non-zero.
+    pub runtime_gid: u32,
+    /// Host-side leased subordinate UID. Must be non-zero and must never be
+    /// the daemon's own UID; validated against the launcher's live
+    /// credentials at spawn time on Linux.
+    pub host_uid: u32,
+    /// Host-side leased subordinate GID. Must be non-zero and must never be
+    /// the daemon's own GID.
+    pub host_gid: u32,
+}
+
+/// Linux namespace topology selection. Combinations are the caller's choice;
+/// the crate fixes no preset bundle. This says *which namespaces exist*, not
+/// *who the process inside them is* — see [`IdentityPolicy`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NamespacePolicy {
-    /// Create a new user namespace and map the caller's effective UID/GID to
-    /// root inside it (the `unshare --map-root-user` model). This is what
-    /// makes the other namespaces available without host privileges.
-    pub user: bool,
     /// Create a new PID namespace. The backend keeps an internal init/reaper
     /// as namespace PID 1 and runs the sandboxed program as its PID 2 child.
     pub pid: bool,
@@ -501,8 +549,10 @@ pub struct SandboxConfig {
     pub resources: ResourceLimits,
     /// Syscall filtering.
     pub syscalls: SyscallPolicy,
-    /// Namespace selection.
+    /// Namespace topology selection.
     pub namespaces: NamespacePolicy,
+    /// Process identity (user-namespace creation and UID/GID translation).
+    pub identity: IdentityPolicy,
     /// Capability retention.
     pub capabilities: CapabilityPolicy,
     /// File descriptors (by number, `>= 3`) that survive the child-side
@@ -525,6 +575,7 @@ impl SandboxConfig {
             resources: ResourceLimits::default(),
             syscalls: SyscallPolicy::Unrestricted,
             namespaces: NamespacePolicy::default(),
+            identity: IdentityPolicy::default(),
             capabilities: CapabilityPolicy::default(),
             inherited_fds: Vec::new(),
             cgroup_parent: None,

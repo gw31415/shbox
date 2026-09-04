@@ -15,7 +15,8 @@ use std::path::Path;
 use crate::command::{CommandSpec, Stdio};
 use crate::error::SandboxError;
 use crate::policy::{
-    FilesystemPolicy, Limit, PathRule, ResourceLimits, SandboxConfig, Syscall, SyscallPolicy,
+    CapabilityPolicy, FilesystemPolicy, IdentityPolicy, Limit, PathRule, ResourceLimits,
+    SandboxConfig, Syscall, SyscallPolicy,
 };
 
 /// Validate a config/command pair before any resource is allocated.
@@ -25,6 +26,43 @@ pub(crate) fn validate(config: &SandboxConfig, command: &CommandSpec) -> Result<
     validate_filesystem(&config.filesystem, command)?;
     validate_resources(&config.resources)?;
     validate_syscalls(&config.syscalls)?;
+    validate_identity(config)?;
+    Ok(())
+}
+
+/// Identity-policy invariants. Numeric checks are platform-neutral; the
+/// Linux backend additionally rejects a `host_uid`/`host_gid` equal to its
+/// own live credentials at spawn time.
+fn validate_identity(config: &SandboxConfig) -> Result<(), SandboxError> {
+    let IdentityPolicy::Isolated(identity) = config.identity else {
+        return Ok(());
+    };
+    if identity.runtime_uid == 0 || identity.runtime_gid == 0 {
+        return Err(SandboxError::invalid(
+            "identity",
+            "isolated identity must not map namespace UID/GID 0: no bootstrap identity may exist",
+        ));
+    }
+    if identity.host_uid == 0 || identity.host_gid == 0 {
+        return Err(SandboxError::invalid(
+            "identity",
+            "isolated identity must not map to host UID/GID 0 (root)",
+        ));
+    }
+    if !config.namespaces.mount {
+        return Err(SandboxError::invalid(
+            "identity",
+            "isolated identity requires a fresh mount namespace (NamespacePolicy::mount) for ID-mapped writable views",
+        ));
+    }
+    if let CapabilityPolicy::Retain(retained) = &config.capabilities
+        && !retained.is_empty()
+    {
+        return Err(SandboxError::invalid(
+            "identity",
+            "isolated identity is incompatible with retained capabilities: the runtime process must end with empty capability sets",
+        ));
+    }
     Ok(())
 }
 
@@ -318,11 +356,119 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::policy::SyscallRule;
-    use crate::policy::{CpuMax, PathRule, SeccompAction};
+    use crate::policy::{
+        Capability, CapabilityPolicy, CpuMax, IdentityPolicy, IsolatedIdentity, PathRule,
+        SeccompAction,
+    };
     use std::os::fd::AsRawFd;
 
     fn minimal_command() -> CommandSpec {
         CommandSpec::new("/bin/sh")
+    }
+
+    fn isolated_config(identity: IsolatedIdentity) -> SandboxConfig {
+        let mut config = SandboxConfig::unrestricted();
+        config.identity = IdentityPolicy::Isolated(identity);
+        config.namespaces.mount = true;
+        config
+    }
+
+    fn valid_identity() -> IsolatedIdentity {
+        IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid: 100_000,
+            host_gid: 200_000,
+        }
+    }
+
+    #[test]
+    fn identity_defaults_to_host_and_caller_mapped_root_passes() {
+        assert_eq!(SandboxConfig::unrestricted().identity, IdentityPolicy::Host);
+        let mut config = SandboxConfig::unrestricted();
+        config.identity = IdentityPolicy::CallerMappedRoot;
+        assert!(validate(&config, &minimal_command()).is_ok());
+    }
+
+    #[test]
+    fn isolated_identity_passes_validation_with_valid_ids() {
+        assert!(validate(&isolated_config(valid_identity()), &minimal_command()).is_ok());
+    }
+
+    #[test]
+    fn isolated_identity_rejects_zero_runtime_or_host_ids() {
+        for mutate_zero in [
+            IsolatedIdentity {
+                runtime_uid: 0,
+                ..valid_identity()
+            },
+            IsolatedIdentity {
+                runtime_gid: 0,
+                ..valid_identity()
+            },
+            IsolatedIdentity {
+                host_uid: 0,
+                ..valid_identity()
+            },
+            IsolatedIdentity {
+                host_gid: 0,
+                ..valid_identity()
+            },
+        ] {
+            let error = validate(&isolated_config(mutate_zero), &minimal_command())
+                .expect_err("zero id must be rejected");
+            assert!(
+                matches!(
+                    error,
+                    SandboxError::InvalidPolicy {
+                        field: "identity",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_identity_requires_a_fresh_mount_namespace() {
+        let mut config = isolated_config(valid_identity());
+        config.namespaces.mount = false;
+        let error = validate(&config, &minimal_command())
+            .expect_err("isolated identity without mount namespace");
+        assert!(
+            matches!(
+                error,
+                SandboxError::InvalidPolicy {
+                    field: "identity",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn isolated_identity_rejects_retained_capabilities() {
+        let mut config = isolated_config(valid_identity());
+        config.capabilities = CapabilityPolicy::Retain(vec![
+            Capability::from_number(1).expect("capability 1 (CAP_CHOWN) exists"),
+        ]);
+        let error = validate(&config, &minimal_command())
+            .expect_err("isolated identity with retained capabilities");
+        assert!(
+            matches!(
+                error,
+                SandboxError::InvalidPolicy {
+                    field: "identity",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // An empty retain list is identical to dropping everything.
+        config.capabilities = CapabilityPolicy::Retain(Vec::new());
+        assert!(validate(&config, &minimal_command()).is_ok());
     }
 
     #[test]

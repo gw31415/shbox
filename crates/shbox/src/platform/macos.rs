@@ -499,6 +499,7 @@ mod tests {
         LaunchRequest {
             sandbox_id: "macos-test".parse().expect("sandbox id"),
             workspace: workspace.to_path_buf(),
+            identity: None,
             operation: super::super::LaunchOperation::Exec(command.as_bytes().to_vec()),
             pty: pty.then(|| super::super::PtySpec {
                 term: "xterm-256color".to_string(),
@@ -754,6 +755,7 @@ mod tests {
         let request = LaunchRequest {
             sandbox_id: "macos-test".parse().expect("sandbox id"),
             workspace: workspace.path().to_path_buf(),
+            identity: None,
             operation: super::super::LaunchOperation::Exec(command),
             pty: None,
             environment: BTreeMap::new(),
@@ -789,6 +791,7 @@ mod tests {
         let request = LaunchRequest {
             sandbox_id: "macos-test".parse().expect("sandbox id"),
             workspace: workspace.path().to_path_buf(),
+            identity: None,
             operation: super::super::LaunchOperation::Shell,
             pty: None,
             environment: BTreeMap::new(),

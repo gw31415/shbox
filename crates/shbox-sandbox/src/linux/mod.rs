@@ -20,17 +20,23 @@ pub mod seccomp;
 mod syscall_names;
 pub use syscall_names::syscall_number;
 
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Error as IoError, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio as ProcessStdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::ChildStage;
 use crate::command::{CommandSpec, SessionSetup, Stdio};
 use crate::error::{ExitStatus, SandboxError};
-use crate::policy::{CgroupParent, NetworkNamespacePolicy, ResourceLimits, SandboxConfig};
+use crate::policy::{
+    CgroupParent, IdentityPolicy, IsolatedIdentity, NetworkNamespacePolicy, ResourceLimits,
+    SandboxConfig,
+};
 use crate::{BackendChild, Platform, SandboxCapabilities, SandboxChild};
 
 use cgroup::{
@@ -61,10 +67,341 @@ static SPAWN_OWNER: OnceLock<Result<mpsc::Sender<SpawnRequest>, String>> = OnceL
 
 struct SpawnRequest {
     landlock_abi: Option<u32>,
+    identity_mapper: Option<Arc<dyn UidGidMapper>>,
     command: CommandSpec,
     config: SandboxConfig,
     sandbox_cgroup: Option<Arc<Cgroup>>,
+    mounts: Option<PreparedMounts>,
     reply: mpsc::SyncSender<Result<SandboxChild, SandboxError>>,
+}
+
+/// An open `/proc/<pid>` directory descriptor addressing the
+/// barrier-blocked child of an isolated launch. The descriptor is owned by
+/// the engine; a mapper uses it (or `pid` when its helper cannot address a
+/// descriptor) to install the UID/GID maps.
+pub struct MapperTarget {
+    /// Open `O_PATH|O_DIRECTORY` descriptor on `/proc/<pid>`.
+    pub proc_dir_fd: OwnedFd,
+    /// The child's PID in the launcher's PID namespace. The engine holds
+    /// the child's pidfd for the whole handshake, so the PID cannot be
+    /// recycled while `proc_dir_fd` is alive.
+    pub pid: libc::pid_t,
+}
+
+/// Parent-side identity-mapping seam for isolated launches (the engine's
+/// only route to subordinate-ID translation).
+///
+/// The engine calls `install` exactly once per isolated launch, after the
+/// fresh `clone3(CLONE_NEWUSER)` child has signaled the mapping barrier and
+/// before it is allowed to continue. The implementation must install
+/// **exactly** the one-entry maps
+///
+/// ```text
+/// uid_map: <runtime_uid> <host_uid> 1
+/// gid_map: <runtime_gid> <host_gid> 1
+/// ```
+///
+/// into the child's user namespace (shadow-utils `newuidmap`/`newgidmap`
+/// with the proc-dir `fd:N` form is the intended production
+/// implementation). The engine independently reads the maps back and fails
+/// the launch unless they match exactly.
+pub trait UidGidMapper: Send + Sync + 'static {
+    /// Install the delegated one-entry UID/GID maps (see the trait docs).
+    /// Returning `Err` aborts the launch before user code runs.
+    fn install(&self, target: &MapperTarget, identity: &IsolatedIdentity) -> Result<(), IoError>;
+}
+
+/// Detached ID-mapped mounts prepared by a privileged broker and attached by
+/// the sandbox child after its own user namespace mapping barrier.
+///
+/// All descriptors are owned by this value. The engine consumes the value for
+/// one spawn; the parent copies are closed as soon as `clone3` succeeds and
+/// the child closes its copies during setup/FD hygiene.
+#[derive(Debug)]
+pub struct PreparedMounts {
+    workspace_mount: OwnedFd,
+    workspace_target: OwnedFd,
+    runtime_mount: OwnedFd,
+    runtime_target: OwnedFd,
+}
+
+impl PreparedMounts {
+    /// Construct the two writable views in stable workspace/runtime order.
+    pub fn new(
+        workspace_mount: OwnedFd,
+        workspace_target: OwnedFd,
+        runtime_mount: OwnedFd,
+        runtime_target: OwnedFd,
+    ) -> Self {
+        Self {
+            workspace_mount,
+            workspace_target,
+            runtime_mount,
+            runtime_target,
+        }
+    }
+}
+
+/// Parent-side mapper backed by shadow-utils' `newuidmap` and `newgidmap`.
+///
+/// The helpers are invoked with the opened `/proc/<pid>` directory as an
+/// inherited descriptor and the `fd:N` target form.  This keeps the mapping
+/// operation tied to the object opened by the engine instead of reopening a
+/// decimal PID after a possible PID reuse.  A helper that does not implement
+/// the `fd:N` form fails the isolated launch; there is no PID-path fallback.
+#[derive(Debug, Clone)]
+pub struct ShadowUidGidMapper {
+    uid_helper: PathBuf,
+    gid_helper: PathBuf,
+}
+
+impl Default for ShadowUidGidMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShadowUidGidMapper {
+    /// Use the standard shadow-utils helper names resolved through a fixed,
+    /// administrator-owned PATH.
+    pub fn new() -> Self {
+        Self::with_helpers("newuidmap", "newgidmap")
+    }
+
+    /// Use explicit helper paths.  This is primarily useful for a packaged
+    /// installation with helpers outside the usual system PATH and for
+    /// deterministic integration-test fixtures.
+    pub fn with_helpers(uid_helper: impl Into<PathBuf>, gid_helper: impl Into<PathBuf>) -> Self {
+        Self {
+            uid_helper: uid_helper.into(),
+            gid_helper: gid_helper.into(),
+        }
+    }
+
+    fn run_helper(
+        &self,
+        helper: &Path,
+        target: &MapperTarget,
+        inside: u32,
+        outside: u32,
+    ) -> Result<(), IoError> {
+        let inherited = duplicate_without_cloexec(target.proc_dir_fd.as_raw_fd())?;
+        let fd = inherited.as_raw_fd();
+        let output = Command::new(helper)
+            .arg(format!("fd:{fd}"))
+            .arg(inside.to_string())
+            .arg(outside.to_string())
+            .arg("1")
+            .env_clear()
+            .env(
+                "PATH",
+                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+            )
+            .stdin(ProcessStdio::null())
+            .stdout(ProcessStdio::null())
+            .stderr(ProcessStdio::piped())
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(IoError::other(format!(
+            "{} failed with status {}{}",
+            helper.display(),
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )))
+    }
+}
+
+impl UidGidMapper for ShadowUidGidMapper {
+    fn install(&self, target: &MapperTarget, identity: &IsolatedIdentity) -> Result<(), IoError> {
+        self.run_helper(
+            &self.uid_helper,
+            target,
+            identity.runtime_uid,
+            identity.host_uid,
+        )?;
+        self.run_helper(
+            &self.gid_helper,
+            target,
+            identity.runtime_gid,
+            identity.host_gid,
+        )
+    }
+}
+
+/// Create the auxiliary user namespace consumed by an ID-mapped mount.
+///
+/// The returned descriptor pins a fresh user namespace whose map is installed
+/// by the same parent-side mapper used for runtime launches.  The temporary
+/// keeper process is killed before this function returns; the namespace stays
+/// alive because the returned namespace descriptor owns a kernel reference to
+/// it.  `identity.runtime_uid`/`runtime_gid` are the IDs in the auxiliary
+/// namespace (normally the daemon's effective IDs), while `host_uid`/
+/// `host_gid` are the leased subordinate IDs.
+pub fn create_mount_idmap_user_namespace(
+    mapper: &dyn UidGidMapper,
+    identity: IsolatedIdentity,
+) -> Result<OwnedFd, SandboxError> {
+    let _spawn_guard = SPAWN_LOCK
+        .lock()
+        .map_err(|_| SandboxError::Internal("spawn lock poisoned".to_string()))?;
+    let (ready_read, ready_write) = make_pipe()?;
+    let (installed_read, installed_write) = make_pipe()?;
+    let parent_pid = unsafe { libc::getpid() };
+    let mut args = Clone3Args {
+        flags: CLONE_PIDFD | CLONE_NEWUSER,
+        pidfd: 0,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: libc::SIGCHLD as u64,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
+    };
+
+    match unsafe { clone3(&mut args, CLONE3_ARGS_SIZE_V1) } {
+        Ok(Clone3::Child) => unsafe {
+            mount_idmap_keeper_child(
+                ready_write.as_raw_fd(),
+                installed_read.as_raw_fd(),
+                parent_pid,
+            )
+        },
+        Ok(Clone3::Parent { pid, pidfd }) => {
+            drop(ready_write);
+            drop(installed_read);
+            let result = (|| {
+                install_isolated_maps(pid, &identity, mapper, &ready_read, &installed_write)?;
+                let path = CString::new(format!("/proc/{pid}/ns/user"))
+                    .map_err(|_| SandboxError::Internal("PID contained NUL".to_string()))?;
+                let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    return Err(SandboxError::Setup {
+                        stage: ChildStage::MapBarrier,
+                        detail: 15,
+                        errno: Some(raw_errno()),
+                    });
+                }
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            })();
+            drop(ready_read);
+            drop(installed_write);
+            match result {
+                Ok(namespace) => {
+                    kill_and_reap(&pidfd);
+                    Ok(namespace)
+                }
+                Err(error) => {
+                    kill_and_reap(&pidfd);
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => Err(SandboxError::unsupported(
+            "user-namespace",
+            format!("auxiliary mount ID-map namespace clone3 failed: {error}"),
+        )),
+    }
+}
+
+/// The auxiliary namespace keeper has no Rust-level cleanup path: it is a
+/// post-clone helper that either waits for the parent release byte or exits.
+///
+/// # Safety
+///
+/// Called only in the child returned by `clone3`; all descriptors are valid
+/// child copies and the function never returns to the cloned Rust stack.
+unsafe fn mount_idmap_keeper_child(
+    ready_write: RawFd,
+    installed_read: RawFd,
+    parent_pid: libc::pid_t,
+) -> ! {
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL,
+            0,
+            0,
+            0,
+        )
+    } == -1
+        || unsafe { libc::syscall(libc::SYS_getppid) as libc::pid_t } != parent_pid
+    {
+        unsafe { libc::_exit(127) }
+    }
+
+    let byte = [child::MAP_READY];
+    let mut written = 0_usize;
+    while written < byte.len() {
+        let count = unsafe {
+            libc::write(
+                ready_write,
+                byte.as_ptr().add(written).cast(),
+                byte.len() - written,
+            )
+        };
+        if count > 0 {
+            written += count as usize;
+        } else if count < 0 && raw_errno() == libc::EINTR {
+            continue;
+        } else {
+            unsafe { libc::_exit(127) }
+        }
+    }
+
+    let mut release = [0_u8; 1];
+    loop {
+        let count = unsafe { libc::read(installed_read, release.as_mut_ptr().cast(), 1) };
+        if count == 1 {
+            break;
+        }
+        if count < 0 && raw_errno() == libc::EINTR {
+            continue;
+        }
+        unsafe { libc::_exit(127) }
+    }
+    if release[0] != child::MAP_INSTALLED {
+        unsafe { libc::_exit(127) }
+    }
+
+    loop {
+        unsafe { libc::pause() };
+    }
+}
+
+/// Duplicate a descriptor for a helper process while deliberately clearing
+/// `FD_CLOEXEC`. `Command::output` inherits descriptors; the returned owner
+/// closes the duplicate after the helper has exited.
+fn duplicate_without_cloexec(fd: RawFd) -> Result<OwnedFd, IoError> {
+    // SAFETY: `fd` is an open descriptor owned by the mapper target. F_DUPFD
+    // creates an independent descriptor with the lowest number >= 3.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+    if duplicate < 0 {
+        return Err(IoError::last_os_error());
+    }
+    // SAFETY: the duplicate is valid and owned by this function from here.
+    let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
+    if flags < 0 {
+        unsafe { libc::close(duplicate) };
+        return Err(IoError::last_os_error());
+    }
+    if unsafe { libc::fcntl(duplicate, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        let error = IoError::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    // SAFETY: `duplicate` is a newly-created owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 fn spawn_owner() -> Result<&'static mpsc::Sender<SpawnRequest>, SandboxError> {
@@ -76,9 +413,11 @@ fn spawn_owner() -> Result<&'static mpsc::Sender<SpawnRequest>, SandboxError> {
                 while let Ok(request) = receiver.recv() {
                     let result = spawn_with_cgroup_on_owner(
                         request.landlock_abi,
+                        request.identity_mapper,
                         request.command,
                         request.config,
                         request.sandbox_cgroup,
+                        request.mounts,
                     );
                     let _ = request.reply.send(result);
                 }
@@ -191,6 +530,7 @@ impl ProcessDomainScope {
 /// The immutable Linux backend state.
 pub struct LinuxBackend {
     landlock_abi: Option<u32>,
+    identity_mapper: Option<Arc<dyn UidGidMapper>>,
 }
 
 /// A durable Linux process domain shared by every process in one sandbox.
@@ -248,10 +588,33 @@ impl ProcessDomain {
 }
 
 impl LinuxBackend {
-    pub(crate) fn new(capabilities: &SandboxCapabilities) -> Self {
+    pub(crate) fn new(
+        capabilities: &SandboxCapabilities,
+        identity_mapper: Option<Arc<dyn UidGidMapper>>,
+    ) -> Self {
         LinuxBackend {
             landlock_abi: capabilities.landlock_abi,
+            identity_mapper,
         }
+    }
+
+    pub(crate) fn create_mount_idmap_user_namespace(
+        &self,
+        identity: IsolatedIdentity,
+    ) -> Result<OwnedFd, SandboxError> {
+        let mapper = self.identity_mapper.as_deref().ok_or_else(|| {
+            SandboxError::unsupported(
+                "identity",
+                "isolated identity requires a parent mapping helper for the mount map namespace",
+            )
+        })?;
+        let daemon_identity = IsolatedIdentity {
+            runtime_uid: unsafe { libc::geteuid() },
+            runtime_gid: unsafe { libc::getegid() },
+            host_uid: identity.host_uid,
+            host_gid: identity.host_gid,
+        };
+        create_mount_idmap_user_namespace(mapper, daemon_identity)
     }
 
     pub(crate) fn spawn(
@@ -269,7 +632,7 @@ impl LinuxBackend {
         } else {
             None
         };
-        self.spawn_with_cgroup(command, config, sandbox_cgroup)
+        self.spawn_with_cgroup(command, config, sandbox_cgroup, None)
     }
 
     pub(crate) fn create_process_domain(
@@ -315,7 +678,28 @@ impl LinuxBackend {
                 "spawn resource limits do not match the resource domain",
             ));
         }
-        self.spawn_with_cgroup(command, config, Some(Arc::clone(&domain.cgroup)))
+        self.spawn_with_cgroup(command, config, Some(Arc::clone(&domain.cgroup)), None)
+    }
+
+    pub(crate) fn spawn_in_process_domain_with_mounts(
+        &self,
+        command: CommandSpec,
+        config: SandboxConfig,
+        domain: &ProcessDomain,
+        mounts: PreparedMounts,
+    ) -> Result<SandboxChild, SandboxError> {
+        if config.resources != domain.resources {
+            return Err(SandboxError::invalid(
+                "resources",
+                "spawn resource limits do not match the resource domain",
+            ));
+        }
+        self.spawn_with_cgroup(
+            command,
+            config,
+            Some(Arc::clone(&domain.cgroup)),
+            Some(mounts),
+        )
     }
 
     fn spawn_with_cgroup(
@@ -323,14 +707,17 @@ impl LinuxBackend {
         command: CommandSpec,
         config: SandboxConfig,
         sandbox_cgroup: Option<Arc<Cgroup>>,
+        mounts: Option<PreparedMounts>,
     ) -> Result<SandboxChild, SandboxError> {
         let (reply, response) = mpsc::sync_channel(1);
         spawn_owner()?
             .send(SpawnRequest {
                 landlock_abi: self.landlock_abi,
+                identity_mapper: self.identity_mapper.clone(),
                 command,
                 config,
                 sandbox_cgroup,
+                mounts,
                 reply,
             })
             .map_err(|_| {
@@ -346,9 +733,11 @@ impl LinuxBackend {
 
 fn spawn_with_cgroup_on_owner(
     landlock_abi: Option<u32>,
+    identity_mapper: Option<Arc<dyn UidGidMapper>>,
     command: CommandSpec,
     config: SandboxConfig,
     sandbox_cgroup: Option<Arc<Cgroup>>,
+    mounts: Option<PreparedMounts>,
 ) -> Result<SandboxChild, SandboxError> {
     // Serialize the descriptor-to-clone window against other spawns in
     // this process.
@@ -371,6 +760,36 @@ fn spawn_with_cgroup_on_owner(
 
     // 5. status pipe.
     let (status_read, status_write) = make_pipe()?;
+
+    // 5.5 Isolated identity: the mapping barrier pipe and the mapper seam.
+    //    Both must exist before the child is cloned; an unconfigured mapper
+    //    fails before any child exists.
+    let isolated_launch = match config.identity {
+        IdentityPolicy::Isolated(identity) => {
+            let mapper = identity_mapper.clone().ok_or_else(|| {
+                SandboxError::unsupported(
+                    "identity",
+                    "isolated identity requires a parent mapping helper (UidGidMapper) which was not configured",
+                )
+            })?;
+            // Two one-direction pipes: the child signals readiness on
+            // `ready`, the parent releases it on `installed`. After clone
+            // the parent drops its copy of the readiness write end, so a
+            // child that dies before signaling is observed as EOF instead
+            // of a blocked read.
+            let (ready_read, ready_write) = make_pipe()?;
+            let (installed_read, installed_write) = make_pipe()?;
+            Some((
+                identity,
+                mapper,
+                ready_read,
+                ready_write,
+                installed_read,
+                installed_write,
+            ))
+        }
+        _ => None,
+    };
 
     // A PID namespace needs a dedicated PID1 supervisor. The parent
     // sends logical user-process signals over a fixed-size seqpacket
@@ -408,6 +827,11 @@ fn spawn_with_cgroup_on_owner(
     let mut setup = build_child_setup(
         command,
         &config,
+        isolated_launch
+            .as_ref()
+            .map(|(_, _, _, ready_write, installed_read, _)| {
+                (ready_write.as_raw_fd(), installed_read.as_raw_fd())
+            }),
         stdio.sources(),
         status_write.as_raw_fd(),
         parent_pidfd.as_ref().map(AsRawFd::as_raw_fd),
@@ -418,6 +842,12 @@ fn spawn_with_cgroup_on_owner(
         } else {
             None
         },
+        mounts.as_ref().map(|mounts| child::MountSetup {
+            workspace_mount: mounts.workspace_mount.as_raw_fd(),
+            workspace_target: mounts.workspace_target.as_raw_fd(),
+            runtime_mount: mounts.runtime_mount.as_raw_fd(),
+            runtime_target: mounts.runtime_target.as_raw_fd(),
+        }),
         landlock_prepared,
         seccomp_program,
     )?;
@@ -461,7 +891,40 @@ fn spawn_with_cgroup_on_owner(
             drop(status_write);
             drop(supervisor_control_child);
             drop(supervisor_exit_write);
+            drop(mounts);
             stdio.close_parent_copies();
+
+            // 8.5 Isolated identity: run the parent side of the mapping
+            //     barrier while the child is blocked. Any failure here kills
+            //     the child through the pidfd path before user code can run.
+            if let Some((
+                identity,
+                mapper,
+                ready_read,
+                ready_write,
+                installed_read,
+                installed_write,
+            )) = isolated_launch
+            {
+                // The readiness write end must not outlive the child in the
+                // parent, or a dead child could never be observed as EOF.
+                drop(ready_write);
+                drop(installed_read);
+                let handshake = install_isolated_maps(
+                    pid,
+                    &identity,
+                    mapper.as_ref(),
+                    &ready_read,
+                    &installed_write,
+                );
+                drop(ready_read);
+                drop(installed_write);
+                if let Err(error) = handshake {
+                    kill_and_reap(&pidfd);
+                    drop(sandbox_cgroup);
+                    return Err(error);
+                }
+            }
 
             // 9. Confirm setup: EOF on the status pipe means the exec
             //    happened with every mechanism in place. Anything else
@@ -529,7 +992,13 @@ fn spawn_with_cgroup_on_owner(
 
 fn namespace_flags(config: &SandboxConfig) -> u64 {
     let mut flags = 0_u64;
-    if config.namespaces.user {
+    // A user namespace exists for any non-host identity. Its UID/GID mapping
+    // is identity policy, not topology: `CallerMappedRoot` self-maps in the
+    // child, `Isolated` waits for the parent-side mapper.
+    if matches!(
+        config.identity,
+        IdentityPolicy::CallerMappedRoot | IdentityPolicy::Isolated(_)
+    ) {
         flags |= CLONE_NEWUSER;
     }
     if config.namespaces.pid {
@@ -673,17 +1142,225 @@ fn read_supervisor_exit(fd: &OwnedFd) -> std::io::Result<ExitStatus> {
     })
 }
 
+/// Parent side of the isolated-identity mapping barrier.
+///
+/// Runs after `clone3(CLONE_NEWUSER)` while the child blocks. The child
+/// must announce `MAP_READY` first; the mapper then installs the delegated
+/// maps, and the engine reads them back — an exact one-entry match is
+/// mandatory, and `setgroups` must still read `allow` so the child can
+/// clear its inherited supplementary groups. Only then is `MAP_INSTALLED`
+/// sent.
+fn install_isolated_maps(
+    child_pid: libc::pid_t,
+    identity: &IsolatedIdentity,
+    mapper: &dyn UidGidMapper,
+    ready_read: &OwnedFd,
+    installed_write: &OwnedFd,
+) -> Result<(), SandboxError> {
+    // 1. Wait for the child's barrier announcement. EOF means it died
+    //    before reaching the barrier.
+    let mut ready = [0_u8; 1];
+    let mut offset = 0_usize;
+    while offset < ready.len() {
+        // SAFETY: reads into valid writable stack storage.
+        let read = unsafe {
+            libc::read(
+                ready_read.as_raw_fd(),
+                ready.as_mut_ptr().add(offset).cast(),
+                ready.len() - offset,
+            )
+        };
+        if read > 0 {
+            offset += read as usize;
+        } else if read == 0 {
+            return Err(SandboxError::Setup {
+                stage: ChildStage::MapBarrier,
+                detail: 10,
+                errno: Some(libc::EPIPE),
+            });
+        } else if raw_errno() != libc::EINTR {
+            return Err(SandboxError::Setup {
+                stage: ChildStage::MapBarrier,
+                detail: 11,
+                errno: Some(raw_errno()),
+            });
+        }
+    }
+    if ready[0] != child::MAP_READY {
+        return Err(SandboxError::Setup {
+            stage: ChildStage::MapBarrier,
+            detail: 12,
+            errno: Some(libc::EPROTO),
+        });
+    }
+
+    // 2. Address the child through /proc. The engine holds the child's
+    //    pidfd (CLONE_PIDFD) for the whole handshake, so the PID cannot be
+    //    recycled while this descriptor is open.
+    let proc_path = CString::new(format!("/proc/{child_pid}"))
+        .map_err(|_| SandboxError::Internal("PID contained NUL".to_string()))?;
+    // SAFETY: open of a fixed-form path; a fresh descriptor on success.
+    let proc_fd = unsafe {
+        libc::open(
+            proc_path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if proc_fd < 0 {
+        return Err(SandboxError::Setup {
+            stage: ChildStage::MapBarrier,
+            detail: 13,
+            errno: Some(raw_errno()),
+        });
+    }
+    // SAFETY: proc_fd is a fresh owned descriptor.
+    let target = MapperTarget {
+        proc_dir_fd: unsafe { OwnedFd::from_raw_fd(proc_fd) },
+        pid: child_pid,
+    };
+
+    // 3. Install the delegated maps through the caller's seam.
+    mapper
+        .install(&target, identity)
+        .map_err(SandboxError::Io)?;
+
+    // 4. Read the maps back; an exact single-entry match is mandatory. The
+    //    kernel pads the map columns, so entries compare field-wise.
+    expect_map_entry(&target, c"uid_map", identity.runtime_uid, identity.host_uid)?;
+    expect_map_entry(&target, c"gid_map", identity.runtime_gid, identity.host_gid)?;
+    expect_proc_entry(&target, c"setgroups", b"allow\n")?;
+
+    // 5. Release the child from the barrier.
+    let installed = [child::MAP_INSTALLED];
+    let mut offset = 0_usize;
+    while offset < installed.len() {
+        // SAFETY: writes from valid readable stack storage.
+        let written = unsafe {
+            libc::write(
+                installed_write.as_raw_fd(),
+                installed.as_ptr().add(offset).cast(),
+                installed.len() - offset,
+            )
+        };
+        if written > 0 {
+            offset += written as usize;
+        } else if written < 0 && raw_errno() == libc::EINTR {
+            continue;
+        } else {
+            return Err(SandboxError::Setup {
+                stage: ChildStage::MapBarrier,
+                detail: 14,
+                errno: Some(raw_errno()),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Read a `/proc/<pid>` `uid_map`/`gid_map` entry relative to the barrier
+/// target's directory descriptor and require exactly one mapping row with
+/// the expected inside/outside IDs and length.
+fn expect_map_entry(
+    target: &MapperTarget,
+    name: &CStr,
+    inside: u32,
+    outside: u32,
+) -> Result<(), SandboxError> {
+    let text = String::from_utf8_lossy(&read_proc_entry(target, name)?).into_owned();
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let expected = [inside.to_string(), outside.to_string(), "1".to_string()];
+    let matched = fields.len() == 3
+        && fields
+            .iter()
+            .zip(expected.iter())
+            .all(|(found, wanted)| found == wanted);
+    if !matched {
+        return Err(SandboxError::Setup {
+            stage: ChildStage::MapBarrier,
+            detail: 23,
+            errno: None,
+        });
+    }
+    Ok(())
+}
+
+/// Read a `/proc/<pid>` entry relative to the barrier target's directory
+/// descriptor and require an exact byte match.
+fn expect_proc_entry(
+    target: &MapperTarget,
+    name: &CStr,
+    expected: &[u8],
+) -> Result<(), SandboxError> {
+    let bytes = read_proc_entry(target, name)?;
+    if bytes != expected {
+        return Err(SandboxError::Setup {
+            stage: ChildStage::MapBarrier,
+            detail: 22,
+            errno: None,
+        });
+    }
+    Ok(())
+}
+
+/// Read a small `/proc/<pid>` entry relative to the barrier target's
+/// directory descriptor.
+fn read_proc_entry(target: &MapperTarget, name: &CStr) -> Result<Vec<u8>, SandboxError> {
+    // SAFETY: openat relative to the owned /proc/<pid> descriptor.
+    let fd = unsafe {
+        libc::openat(
+            target.proc_dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(SandboxError::Setup {
+            stage: ChildStage::MapBarrier,
+            detail: 20,
+            errno: Some(raw_errno()),
+        });
+    }
+    let mut buffer = [0_u8; 256];
+    let mut len = 0_usize;
+    loop {
+        // SAFETY: reads into valid writable storage with room left.
+        let read =
+            unsafe { libc::read(fd, buffer.as_mut_ptr().add(len).cast(), buffer.len() - len) };
+        if read > 0 {
+            len += read as usize;
+            if len == buffer.len() {
+                break;
+            }
+        } else if read == 0 {
+            break;
+        } else if raw_errno() != libc::EINTR {
+            // SAFETY: fd is owned by this function.
+            unsafe { libc::close(fd) };
+            return Err(SandboxError::Setup {
+                stage: ChildStage::MapBarrier,
+                detail: 21,
+                errno: Some(raw_errno()),
+            });
+        }
+    }
+    // SAFETY: fd is owned by this function.
+    unsafe { libc::close(fd) };
+    Ok(buffer[..len].to_vec())
+}
+
 /// Build the complete child setup from validated inputs.
 #[allow(clippy::too_many_arguments)]
 fn build_child_setup(
     command: CommandSpec,
     config: &SandboxConfig,
+    barrier_fds: Option<(RawFd, RawFd)>,
     stdio: [RawFd; 3],
     status_write: RawFd,
     parent_pidfd: Option<RawFd>,
     supervisor_control_fd: Option<RawFd>,
     supervisor_exit_fd: Option<RawFd>,
     user_cgroup_fd: Option<RawFd>,
+    mounts: Option<child::MountSetup>,
     landlock_prepared: Option<landlock::PreparedLandlock>,
     seccomp_program: seccomp::CompiledSeccomp,
 ) -> Result<child::ChildSetup, SandboxError> {
@@ -717,13 +1394,98 @@ fn build_child_setup(
     let mut inherited_fds = config.inherited_fds.clone();
     inherited_fds.sort_unstable();
     inherited_fds.dedup();
-    let report_guard = inherited_fds.last().map_or(3, |fd| (fd + 1).max(3));
+    if let Some(mounts) = mounts.as_ref() {
+        let descriptors = mounts.descriptors();
+        for (index, fd) in descriptors.into_iter().enumerate() {
+            if fd < 3
+                || inherited_fds.contains(&fd)
+                || stdio.contains(&fd)
+                || barrier_fds
+                    .iter()
+                    .flat_map(|(read, write)| [*read, *write])
+                    .chain(parent_pidfd)
+                    .chain(supervisor_control_fd)
+                    .chain(supervisor_exit_fd)
+                    .chain(user_cgroup_fd)
+                    .any(|reserved| reserved == fd)
+                || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1
+            {
+                return Err(SandboxError::invalid(
+                    "mounts",
+                    format!("prepared mount descriptor {index} is invalid or conflicts with setup"),
+                ));
+            }
+        }
+        if descriptors[0] == descriptors[1]
+            || descriptors[0] == descriptors[2]
+            || descriptors[0] == descriptors[3]
+            || descriptors[1] == descriptors[2]
+            || descriptors[1] == descriptors[3]
+            || descriptors[2] == descriptors[3]
+        {
+            return Err(SandboxError::invalid(
+                "mounts",
+                "prepared mount descriptors must be distinct",
+            ));
+        }
+    }
+    let mut report_guard = inherited_fds.last().map_or(3, |fd| (fd + 1).max(3));
+    for fd in barrier_fds
+        .iter()
+        .flat_map(|(read, write)| [*read, *write])
+        .chain(parent_pidfd.iter().copied())
+        .chain(supervisor_control_fd.iter().copied())
+        .chain(supervisor_exit_fd.iter().copied())
+        .chain(user_cgroup_fd.iter().copied())
+        .chain(
+            mounts
+                .as_ref()
+                .into_iter()
+                .flat_map(|mounts| mounts.descriptors()),
+        )
+    {
+        report_guard = report_guard.max(fd.saturating_add(1));
+    }
 
-    // User-namespace identity mapping: outer euid/egid become uid/gid 0
-    // inside the new namespace (the `unshare --map-root-user` model).
-    let (uid_map, uid_map_len) = format_identity_map(unsafe { libc::geteuid() } as u64);
-    let (gid_map, gid_map_len) = format_identity_map(unsafe { libc::getegid() } as u64);
-    let with_userns = config.namespaces.user;
+    // User-namespace identity. `CallerMappedRoot` self-maps the launcher's
+    // euid/egid to namespace root (the `unshare --map-root-user` model).
+    // `Isolated` writes nothing from the child: a parent-side mapper
+    // installs the delegated subordinate IDs across the mapping barrier
+    // while the child blocks.
+    let identity = match config.identity {
+        IdentityPolicy::Host => child::ChildIdentity::Host,
+        IdentityPolicy::CallerMappedRoot => {
+            let (uid_map, uid_map_len) = format_identity_map(unsafe { libc::geteuid() } as u64);
+            let (gid_map, gid_map_len) = format_identity_map(unsafe { libc::getegid() } as u64);
+            child::ChildIdentity::CallerMappedRoot {
+                uid_map,
+                uid_map_len,
+                gid_map,
+                gid_map_len,
+            }
+        }
+        IdentityPolicy::Isolated(identity) => {
+            let euid = unsafe { libc::geteuid() };
+            let egid = unsafe { libc::getegid() };
+            if identity.host_uid == euid || identity.host_gid == egid {
+                return Err(SandboxError::invalid(
+                    "identity",
+                    "isolated identity must use leased subordinate IDs, not the launcher's own UID/GID",
+                ));
+            }
+            let (ready_write, installed_read) = barrier_fds.ok_or_else(|| {
+                SandboxError::Internal(
+                    "isolated launch is missing its mapping-barrier descriptors".to_string(),
+                )
+            })?;
+            child::ChildIdentity::Isolated {
+                runtime_uid: identity.runtime_uid,
+                runtime_gid: identity.runtime_gid,
+                ready_write,
+                installed_read,
+            }
+        }
+    };
 
     Ok(child::ChildSetup {
         stdin_fd: stdio[0],
@@ -744,11 +1506,8 @@ fn build_child_setup(
             .as_deref()
             .map(|cwd| to_cstring("cwd", cwd))
             .transpose()?,
-        uid_map: with_userns.then_some(uid_map),
-        uid_map_len: if with_userns { uid_map_len } else { 0 },
-        gid_map,
-        gid_map_len: if with_userns { gid_map_len } else { 0 },
-        deny_setgroups: with_userns,
+        identity,
+        mounts,
         make_mounts_private: config.namespaces.mount,
         retain_mask: child::retained_mask(&config.capabilities),
         drop_capabilities: true,
@@ -1135,7 +1894,7 @@ mod tests {
     fn namespace_flags_follow_policy() {
         let mut config = SandboxConfig::unrestricted();
         assert_eq!(namespace_flags(&config), 0);
-        config.namespaces.user = true;
+        config.identity = IdentityPolicy::CallerMappedRoot;
         assert_eq!(namespace_flags(&config), CLONE_NEWUSER);
         config.namespaces.network = NetworkNamespacePolicy::Isolated;
         config.namespaces.uts = true;
@@ -1143,5 +1902,93 @@ mod tests {
             namespace_flags(&config),
             CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWUTS
         );
+    }
+
+    #[test]
+    fn isolated_identity_requires_mount_namespace_and_zero_free_ids() {
+        let identity = IdentityPolicy::Isolated(crate::policy::IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid: 100_000,
+            host_gid: 200_000,
+        });
+        let mut config = SandboxConfig::unrestricted();
+        config.identity = identity;
+        // Validation: a fresh mount namespace is part of the isolated
+        // contract (ID-mapped writable views replace the inherited ones).
+        let command = || CommandSpec::new("/bin/true");
+        assert!(crate::validate::validate(&config, &command()).is_err());
+        config.namespaces.mount = true;
+        assert!(crate::validate::validate(&config, &command()).is_ok());
+        // Flags: the fresh user namespace comes from the identity policy.
+        assert_eq!(namespace_flags(&config), CLONE_NEWUSER | CLONE_NEWNS);
+        // Construction: the child setup carries the isolated identity with
+        // its barrier descriptors; the launcher's own credentials are
+        // rejected as host IDs.
+        let setup = build_child_setup(
+            command(),
+            &config,
+            Some((10, 11)),
+            [0, 1, 2],
+            3,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            seccomp::compile(&crate::policy::SyscallPolicy::Unrestricted).expect("compile"),
+        )
+        .expect("isolated child setup");
+        assert!(matches!(
+            setup.identity,
+            child::ChildIdentity::Isolated {
+                runtime_uid: 1000,
+                runtime_gid: 1000,
+                ready_write: 10,
+                installed_read: 11,
+            }
+        ));
+        let own = IdentityPolicy::Isolated(crate::policy::IsolatedIdentity {
+            host_uid: unsafe { libc::geteuid() },
+            ..identity_or_default()
+        });
+        config.identity = own;
+        let error = match build_child_setup(
+            command(),
+            &config,
+            Some((10, 11)),
+            [0, 1, 2],
+            3,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            seccomp::compile(&crate::policy::SyscallPolicy::Unrestricted).expect("compile"),
+        ) {
+            Ok(_) => panic!("launcher's own UID must be rejected as a host ID"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                SandboxError::InvalidPolicy {
+                    field: "identity",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    fn identity_or_default() -> crate::policy::IsolatedIdentity {
+        crate::policy::IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid: 100_000,
+            host_gid: 200_000,
+        }
     }
 }

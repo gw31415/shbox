@@ -43,6 +43,24 @@ const STATUS_MAGIC: [u8; 4] = *b"SBX1";
 /// Status record: magic(4) stage(1) detail(1) reserved(2) errno(4).
 const STATUS_RECORD_LEN: usize = 12;
 
+// Linux 5.12+ mount API constants. They are stable across the supported
+// x86_64/aarch64 syscall ABIs; keeping them local avoids depending on a
+// libc release exposing every recent mount flag.
+const SYS_MOVE_MOUNT: libc::c_long = 429;
+const SYS_MOUNT_SETATTR: libc::c_long = 442;
+const AT_RECURSIVE: libc::c_uint = 0x8000;
+const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
 /// One fixed-size control packet sent by the parent to PID 1.
 pub(super) const SUPERVISOR_CONTROL_LEN: usize = 8;
 /// Forward a signal to the user command only.
@@ -52,6 +70,71 @@ pub(super) const SUPERVISOR_SIGNAL_GROUP: u32 = 2;
 
 const SUPERVISOR_EXIT_MAGIC: [u8; 4] = *b"SBXE";
 pub(super) const SUPERVISOR_EXIT_LEN: usize = 12;
+
+/// Barrier protocol bytes for isolated identity: the child announces it is
+/// blocked at the mapping barrier; the parent releases it only after the
+/// delegated maps are installed and read back exactly.
+pub(super) const MAP_READY: u8 = 1;
+pub(super) const MAP_INSTALLED: u8 = 2;
+
+/// User-namespace identity for one launch.
+pub enum ChildIdentity {
+    /// No user namespace: keep the launcher's identity.
+    Host,
+    /// Legacy `unshare --map-root-user` model: the child writes its own
+    /// single-entry maps translating namespace root to the caller's
+    /// effective UID/GID.
+    CallerMappedRoot {
+        /// Pre-formatted `uid_map` content (`<inside> <outside> <count>\n`).
+        uid_map: [u8; 64],
+        /// Valid length of `uid_map`.
+        uid_map_len: usize,
+        /// Pre-formatted `gid_map` content.
+        gid_map: [u8; 64],
+        /// Valid length of `gid_map`.
+        gid_map_len: usize,
+    },
+    /// Isolated identity: a parent-side mapper installs the delegated
+    /// subordinate maps while the child blocks at the barrier; afterwards
+    /// the child clears groups and transitions to the runtime IDs.
+    Isolated {
+        /// Namespace-visible runtime UID.
+        runtime_uid: u32,
+        /// Namespace-visible runtime GID.
+        runtime_gid: u32,
+        /// Write end of the readiness pipe: the child signals `MAP_READY`
+        /// and closes it.
+        ready_write: RawFd,
+        /// Read end of the release pipe: the child blocks until the parent
+        /// sends `MAP_INSTALLED`, then closes it.
+        installed_read: RawFd,
+    },
+}
+
+/// Raw descriptor view of the broker-prepared mount set used by child setup.
+/// Ownership remains with the parent-side `PreparedMounts` until `clone3`;
+/// the child closes all four copies after attaching them.
+pub struct MountSetup {
+    /// Detached ID-mapped workspace mount.
+    pub workspace_mount: RawFd,
+    /// Workspace directory mountpoint in the inherited mount tree.
+    pub workspace_target: RawFd,
+    /// Detached ID-mapped runtime-temp mount.
+    pub runtime_mount: RawFd,
+    /// Runtime-temp directory mountpoint in the inherited mount tree.
+    pub runtime_target: RawFd,
+}
+
+impl MountSetup {
+    pub(super) fn descriptors(&self) -> [RawFd; 4] {
+        [
+            self.workspace_mount,
+            self.workspace_target,
+            self.runtime_mount,
+            self.runtime_target,
+        ]
+    }
+}
 
 /// Everything the child needs, prepared by the parent.
 pub struct ChildSetup {
@@ -88,17 +171,11 @@ pub struct ChildSetup {
     pub user_cgroup_fd: Option<RawFd>,
     /// Working directory to `chdir` into before confinement.
     pub cwd: Option<CString>,
-    /// Pre-formatted `uid_map` / `gid_map` contents (`None` skips the
-    /// write; the contents end in a newline).
-    pub uid_map: Option<[u8; 64]>,
-    /// Valid length of `uid_map`.
-    pub uid_map_len: usize,
-    /// Pre-formatted `gid_map` content.
-    pub gid_map: [u8; 64],
-    /// Valid length of `gid_map`.
-    pub gid_map_len: usize,
-    /// Write `/proc/self/setgroups` = "deny" before `gid_map`.
-    pub deny_setgroups: bool,
+    /// User-namespace identity for this launch.
+    pub identity: ChildIdentity,
+    /// Optional detached writable views to attach in the fresh mount
+    /// namespace before the identity transition.
+    pub mounts: Option<MountSetup>,
     /// Remount `/` recursive-private inside a new mount namespace.
     pub make_mounts_private: bool,
     /// Capability bit mask retained across the drop.
@@ -213,41 +290,70 @@ pub(super) unsafe fn child_entry(setup: &mut ChildSetup) -> ! {
         }
     }
 
-    // 2. User-namespace mappings. The child owns its brand-new user
-    //    namespace and holds CAP_SETUID/CAP_SETGID over it, so it may write
-    //    its own single-entry maps (mapping only the parent's own ids).
-    if setup.deny_setgroups {
-        // SAFETY: runs in the child with parent-prepared buffers.
-        unsafe {
-            write_proc_file(
-                report_fd,
-                ChildStage::UserNamespace,
-                c"/proc/self/setgroups",
-                b"deny\n",
-            )
-        };
-    }
-    if let Some(uid_map) = setup.uid_map {
-        // SAFETY: runs in the child with parent-prepared buffers.
-        unsafe {
-            write_proc_file(
-                report_fd,
-                ChildStage::UserNamespace,
-                c"/proc/self/uid_map",
-                &uid_map[..setup.uid_map_len],
-            )
-        };
-    }
-    if setup.gid_map_len > 0 {
-        // SAFETY: runs in the child with parent-prepared buffers.
-        unsafe {
-            write_proc_file(
-                report_fd,
-                ChildStage::UserNamespace,
-                c"/proc/self/gid_map",
-                &setup.gid_map[..setup.gid_map_len],
-            )
-        };
+    // 2. User-namespace identity.
+    match &setup.identity {
+        ChildIdentity::Host => {}
+        ChildIdentity::CallerMappedRoot {
+            uid_map,
+            uid_map_len,
+            gid_map,
+            gid_map_len,
+        } => {
+            // The child owns its brand-new user namespace and holds
+            // CAP_SETUID/CAP_SETGID over it, so it may write its own
+            // single-entry maps (mapping only the parent's own ids).
+            // SAFETY: runs in the child with parent-prepared buffers.
+            unsafe {
+                write_proc_file(
+                    report_fd,
+                    ChildStage::UserNamespace,
+                    c"/proc/self/setgroups",
+                    b"deny\n",
+                )
+            };
+            // SAFETY: runs in the child with parent-prepared buffers.
+            unsafe {
+                write_proc_file(
+                    report_fd,
+                    ChildStage::UserNamespace,
+                    c"/proc/self/uid_map",
+                    &uid_map[..*uid_map_len],
+                )
+            };
+            // SAFETY: runs in the child with parent-prepared buffers.
+            unsafe {
+                write_proc_file(
+                    report_fd,
+                    ChildStage::UserNamespace,
+                    c"/proc/self/gid_map",
+                    &gid_map[..*gid_map_len],
+                )
+            };
+        }
+        ChildIdentity::Isolated {
+            runtime_uid: _,
+            runtime_gid: _,
+            ready_write,
+            installed_read,
+        } => {
+            let (ready_write, installed_read) = (*ready_write, *installed_read);
+            // Announce the barrier, then block: no mapping is written from
+            // inside — a parent-side mapper installs the delegated entries.
+            // SAFETY: fixed one-byte write on a parent-prepared pipe.
+            unsafe { write_all_or_fail(report_fd, ready_write, &[MAP_READY]) };
+            // SAFETY: this descriptor is this child's copy and is not
+            // needed again.
+            unsafe { libc::close(ready_write) };
+            // SAFETY: blocking one-byte read on a parent-prepared pipe.
+            let installed = unsafe { read_one(report_fd, installed_read) };
+            // SAFETY: this descriptor is this child's copy.
+            unsafe { libc::close(installed_read) };
+            if installed != MAP_INSTALLED {
+                // EOF or a wrong byte: the parent died or failed to install
+                // the maps. No user code may run with an unmapped identity.
+                child_fail(report_fd, ChildStage::MapBarrier, 0, libc::EPIPE);
+            }
+        }
     }
 
     // 3. Mount-namespace hygiene: stop mounts made inside the sandbox from
@@ -276,11 +382,75 @@ pub(super) unsafe fn child_entry(setup: &mut ChildSetup) -> ! {
         }
     }
 
+    // An isolated launch may make only the broker-approved writable views
+    // writable again. The inherited mount tree is recursively read-only at
+    // the VFS layer, which keeps a broadened Landlock rule from creating
+    // persistent raw-subordinate-owned files elsewhere on the host.
+    if let Some(mounts) = setup.mounts.as_ref() {
+        // SAFETY: all pointers address fixed NUL-terminated literals and the
+        // attribute structure is initialized below.
+        let attributes = MountAttr {
+            attr_set: MOUNT_ATTR_RDONLY,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        let result = unsafe {
+            libc::syscall(
+                SYS_MOUNT_SETATTR,
+                libc::AT_FDCWD,
+                c"/".as_ptr(),
+                AT_RECURSIVE,
+                std::ptr::addr_of!(attributes),
+                std::mem::size_of::<MountAttr>(),
+            )
+        };
+        if result == -1 {
+            child_fail(report_fd, ChildStage::MountReadOnly, 0, super::raw_errno());
+        }
+        // Attach by descriptor only. No user-controlled path is resolved in
+        // the bootstrap window; the target descriptors were opened by the
+        // trusted parent before clone.
+        for (source, target) in [
+            (mounts.workspace_mount, mounts.workspace_target),
+            (mounts.runtime_mount, mounts.runtime_target),
+        ] {
+            let result = unsafe {
+                libc::syscall(
+                    SYS_MOVE_MOUNT,
+                    source,
+                    c"".as_ptr(),
+                    target,
+                    c"".as_ptr(),
+                    MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+                )
+            };
+            if result == -1 {
+                child_fail(report_fd, ChildStage::MountAttach, 0, super::raw_errno());
+            }
+        }
+    }
+
     // 4. A process created with CLONE_NEWPID is namespace PID 1. Never exec
     //    arbitrary user code as PID 1: split off a PID 2 user child while PID 1
     //    remains an internal reaper/signal forwarder. This returns only in PID2.
     if setup.pid_namespace_supervisor {
         unsafe { enter_pid_namespace_user_process(setup, report_fd) };
+    }
+
+    // 4.5 Isolated identity transition. The PID-namespace supervisor branch
+    //     above returns only in PID2 (the user process); PID1 transitions
+    //     internally before its supervisor loop. Both branches therefore
+    //     reach user-visible work as the runtime identity with zero
+    //     capabilities.
+    if let ChildIdentity::Isolated {
+        runtime_uid,
+        runtime_gid,
+        ..
+    } = &setup.identity
+    {
+        // SAFETY: scalar credential/prctl transitions with fixed stages.
+        unsafe { transition_to_runtime_identity(report_fd, *runtime_uid, *runtime_gid) };
     }
 
     // 5. Standard streams/session/cwd belong to the user process, not the
@@ -377,6 +547,119 @@ pub(super) unsafe fn child_entry(setup: &mut ChildSetup) -> ! {
         )
     };
     child_fail(report_fd, ChildStage::Exec, 0, super::raw_errno())
+}
+
+/// Transition the calling process to the isolated runtime identity.
+///
+/// Ordering rationale (PLANS.md §9, open question Q1): inside the fresh
+/// user namespace the process still holds every namespace capability, and
+/// the kernel performs no capability fixup for `setresuid`/`setresgid`
+/// moves between non-global-root kernel IDs. The sequence therefore is:
+///
+/// 1. `setresgid` to the runtime GID, clear inherited supplementary groups,
+///    then `setresuid` to the runtime UID, using the namespace
+///    `CAP_SETGID`/`CAP_SETUID`. The group clear must happen before the
+///    capability drop below. Namespace UID/GID 0 are unmapped, so no
+///    bootstrap identity exists to move to.
+/// 2. `PR_SET_SECUREBITS` locking `NOROOT`, `NO_SETUID_FIXUP`, and
+///    `NO_CAP_AMBIENT_RISE` — still permitted because `CAP_SETPCAP` is
+///    held (the capset has not run yet).
+/// 3. `PR_SET_NO_NEW_PRIVS`.
+/// 4. `capset` to empty effective/permitted/inheritable, ambient clear,
+///    and bounding-set narrowing via [`caps::drop_capabilities`].
+///
+/// The final `/proc/self/status` state this produces is asserted by native
+/// tests: `Uid`/`Gid` 1000 across real/effective/saved, empty `Groups`,
+/// `CapEff`/`CapPrm`/`CapInh`/`CapAmb` zero, `NoNewPrivs` 1.
+///
+/// # Safety
+///
+/// Must be called in the child after the mapping barrier, before any
+/// user-controlled operation. Scalar transitions only.
+unsafe fn transition_to_runtime_identity(report_fd: RawFd, runtime_uid: u32, runtime_gid: u32) {
+    // SAFETY: scalar setresgid with three identical GIDs.
+    if unsafe { libc::syscall(libc::SYS_setresgid, runtime_gid, runtime_gid, runtime_gid) } == -1 {
+        child_fail(report_fd, ChildStage::SetGid, 0, super::raw_errno());
+    }
+    // The helper-installed gid_map leaves setgroups enabled so this process
+    // can clear the daemon's inherited supplementary groups. Do that after
+    // entering the mapped runtime GID but before dropping CAP_SETGID.
+    // SAFETY: scalar setgroups with an empty list.
+    if unsafe { libc::syscall(libc::SYS_setgroups, 0_usize, std::ptr::null::<u32>()) } == -1 {
+        child_fail(report_fd, ChildStage::GroupClear, 0, super::raw_errno());
+    }
+    // SAFETY: scalar setresuid with three identical UIDs.
+    if unsafe { libc::syscall(libc::SYS_setresuid, runtime_uid, runtime_uid, runtime_uid) } == -1 {
+        child_fail(report_fd, ChildStage::SetUid, 0, super::raw_errno());
+    }
+    const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+    const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+    const SECBIT_NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
+    const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 1 << 3;
+    const SECBIT_NO_CAP_AMBIENT_RISE: libc::c_ulong = 1 << 4;
+    const SECBIT_NO_CAP_AMBIENT_RISE_LOCKED: libc::c_ulong = 1 << 5;
+    let securebits = SECBIT_NOROOT
+        | SECBIT_NOROOT_LOCKED
+        | SECBIT_NO_SETUID_FIXUP
+        | SECBIT_NO_SETUID_FIXUP_LOCKED
+        | SECBIT_NO_CAP_AMBIENT_RISE
+        | SECBIT_NO_CAP_AMBIENT_RISE_LOCKED;
+    // SAFETY: scalar prctl locking the securebits model.
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, securebits, 0, 0, 0) } == -1 {
+        child_fail(report_fd, ChildStage::Securebits, 0, super::raw_errno());
+    }
+    // SAFETY: scalar prctl; idempotent with the later chain step.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+        child_fail(report_fd, ChildStage::NoNewPrivs, 1, super::raw_errno());
+    }
+    // SAFETY: capset/prctl transitions; requires NNP (set above).
+    if let Err(errno) = caps::drop_capabilities(0) {
+        child_fail(report_fd, ChildStage::Capabilities, 1, errno);
+    }
+}
+
+/// Write exactly `bytes` to `fd` or report and die. Post-fork safe.
+///
+/// # Safety
+///
+/// Must be called in the child with a valid descriptor.
+unsafe fn write_all_or_fail(report_fd: RawFd, fd: RawFd, bytes: &[u8]) {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        // SAFETY: the pointer stays inside the given slice for this call.
+        let written =
+            unsafe { libc::write(fd, bytes.as_ptr().add(offset).cast(), bytes.len() - offset) };
+        if written > 0 {
+            offset += written as usize;
+        } else if written < 0 && super::raw_errno() == libc::EINTR {
+            continue;
+        } else {
+            child_fail(report_fd, ChildStage::MapBarrier, 1, super::raw_errno());
+        }
+    }
+}
+
+/// Read exactly one byte from `fd`, returning it, or 0 on EOF/error.
+///
+/// # Safety
+///
+/// Must be called in the child with a valid descriptor.
+unsafe fn read_one(report_fd: RawFd, fd: RawFd) -> u8 {
+    let mut byte = [0_u8; 1];
+    loop {
+        // SAFETY: the pointer targets writable stack storage for one byte.
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        if read == 1 {
+            return byte[0];
+        }
+        if read < 0 && super::raw_errno() == libc::EINTR {
+            continue;
+        }
+        if read == 0 {
+            return 0;
+        }
+        child_fail(report_fd, ChildStage::MapBarrier, 2, super::raw_errno());
+    }
 }
 
 /// Install stdio/session/cwd for the process that will exec user code.
@@ -512,6 +795,20 @@ unsafe fn enter_pid_namespace_user_process(setup: &mut ChildSetup, report_fd: Ra
     }
 
     let user_pid = result as libc::pid_t;
+
+    // The namespace init transitions to the runtime identity too — after
+    // the nested PID2 clone (cgroup delegation belongs to the daemon
+    // account) and before it enters its supervisor loop. PID1 never runs
+    // user code, but it must not retain the daemon's DAC identity.
+    if let ChildIdentity::Isolated {
+        runtime_uid,
+        runtime_gid,
+        ..
+    } = &setup.identity
+    {
+        // SAFETY: see `transition_to_runtime_identity`.
+        unsafe { transition_to_runtime_identity(report_fd, *runtime_uid, *runtime_gid) };
+    }
 
     // Harden PID1 independently of the user-requested seccomp policy. The
     // arbitrary user filter is intentionally not installed here because it

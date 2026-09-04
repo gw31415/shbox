@@ -20,7 +20,16 @@ use shbox_sandbox::{
 /// Run `/bin/sh -c <script>` under `config`, wait, and collect
 /// (exit status code/signal, stdout, stderr).
 fn run_sh(script: &str, config: SandboxConfig) -> (Option<i32>, Option<i32>, String, String) {
-    let sandbox = Sandbox::detect();
+    run_sh_with(&Sandbox::detect(), script, config)
+}
+
+/// [`run_sh`] with an explicit sandbox backend (isolated identity needs a
+/// mapper-configured one).
+fn run_sh_with(
+    sandbox: &Sandbox,
+    script: &str,
+    config: SandboxConfig,
+) -> (Option<i32>, Option<i32>, String, String) {
     let mut command = CommandSpec::new("/bin/sh");
     command = command
         .arg("-c")
@@ -598,7 +607,7 @@ fn linux_only_policies_fail_closed_on_macos() {
     );
 
     let mut config = unrestricted();
-    config.namespaces.user = true;
+    config.identity = shbox_sandbox::IdentityPolicy::CallerMappedRoot;
     let error = sandbox
         .spawn(CommandSpec::new("/bin/true"), config)
         .expect_err("namespaces on macOS must fail");
@@ -806,7 +815,7 @@ mod linux_only {
     #[test]
     fn pid_namespace_runs_user_command_below_init_supervisor() {
         let mut config = unrestricted();
-        config.namespaces.user = true;
+        config.identity = shbox_sandbox::IdentityPolicy::CallerMappedRoot;
         config.namespaces.pid = true;
         let mut command = CommandSpec::new("/bin/sh");
         command = command.arg("-c").arg("printf '%s %s' \"$$\" \"$PPID\"");
@@ -837,7 +846,7 @@ mod linux_only {
     #[test]
     fn pid_namespace_supervisor_forwards_direct_signals_to_user() {
         let mut config = unrestricted();
-        config.namespaces.user = true;
+        config.identity = shbox_sandbox::IdentityPolicy::CallerMappedRoot;
         config.namespaces.pid = true;
         let mut command = CommandSpec::new("/bin/sh");
         command = command
@@ -892,7 +901,7 @@ mod linux_only {
     #[test]
     fn pid_namespace_init_teardown_kills_descendants() {
         let mut config = unrestricted();
-        config.namespaces.user = true;
+        config.identity = shbox_sandbox::IdentityPolicy::CallerMappedRoot;
         config.namespaces.pid = true;
         let mut command = CommandSpec::new("/bin/sh");
         command = command.arg("-c").arg("sleep 30 & wait");
@@ -979,7 +988,7 @@ mod linux_only {
         }
         let workspace = tempfile::tempdir().expect("workspace");
         let mut config = restricted_to(workspace.path());
-        config.namespaces.user = true;
+        config.identity = shbox_sandbox::IdentityPolicy::CallerMappedRoot;
         config.namespaces.mount = true;
         let sandbox = Sandbox::detect();
         let mut command = CommandSpec::new("/bin/sh");
@@ -1647,5 +1656,335 @@ mod linux_only {
         );
         other.remove_empty().expect("remove drained witness domain");
         let _ = witness.wait();
+    }
+}
+
+/// Isolated-identity launches (PLANS.md Phase I2): fresh user namespace per
+/// launch, parent-installed subordinate maps across a barrier, runtime
+/// UID/GID 1000, zero capabilities, empty groups.
+///
+/// These tests use the real shadow-utils helpers with the account's real
+/// subordinate delegation, exactly as production will. They self-skip on
+/// hosts without `newuidmap`/`newgidmap` or a subid delegation.
+#[cfg(target_os = "linux")]
+mod isolated_identity {
+    use super::*;
+    use shbox_sandbox::{
+        IdentityPolicy, IsolatedIdentity, MapperTarget, SandboxError, ShadowUidGidMapper,
+        UidGidMapper,
+    };
+    use std::io::Read;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    struct FailingMapper;
+
+    impl UidGidMapper for FailingMapper {
+        fn install(
+            &self,
+            _target: &MapperTarget,
+            _identity: &IsolatedIdentity,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("mapper refused (test)"))
+        }
+    }
+
+    /// The account's first subordinate UID/GID pair from /etc/subuid and
+    /// /etc/subgid. Returns `None` when the host lacks the delegation or
+    /// the helpers, so tests can skip rather than fail.
+    fn delegated_pair() -> Option<(u32, u32)> {
+        let user = current_username()?;
+        let uid = first_subid_line("/etc/subuid", &user)?;
+        let gid = first_subid_line("/etc/subgid", &user)?;
+        let helpers = ["newuidmap", "newgidmap"].iter().all(|helper| {
+            Command::new("which")
+                .arg(helper)
+                .output()
+                .is_ok_and(|found| found.status.success())
+        });
+        helpers.then_some((uid, gid))
+    }
+
+    fn current_username() -> Option<String> {
+        let output = Command::new("id")
+            .arg("-un")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    }
+
+    fn first_subid_line(path: &str, user: &str) -> Option<u32> {
+        let content = std::fs::read_to_string(path).ok()?;
+        for line in content.lines() {
+            let mut fields = line.split(':');
+            if let (Some(name), Some(start)) = (fields.next(), fields.next())
+                && name == user
+                && let Ok(start) = start.parse::<u32>()
+            {
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    fn isolated_config() -> Option<SandboxConfig> {
+        let (host_uid, host_gid) = delegated_pair()?;
+        let mut config = unrestricted();
+        // FilesystemPolicy::Unrestricted means no Landlock ruleset: the
+        // DAC proofs below deliberately do not rely on Landlock.
+        config.identity = IdentityPolicy::Isolated(IsolatedIdentity {
+            runtime_uid: 1000,
+            runtime_gid: 1000,
+            host_uid,
+            host_gid,
+        });
+        config.namespaces.mount = true;
+        Some(config)
+    }
+
+    fn isolated_sandbox() -> Sandbox {
+        Sandbox::detect_with_mapper(None, Arc::new(ShadowUidGidMapper::new()))
+    }
+
+    /// Split one padded `uid_map`/`gid_map` row into its fields.
+    fn single_map_fields(line: &str) -> Vec<&str> {
+        line.split_whitespace().collect()
+    }
+
+    #[test]
+    fn runtime_identity_is_1000_with_exact_one_entry_maps() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let sandbox = isolated_sandbox();
+        let (code, _signal, stdout, stderr) = run_sh_with(
+            &sandbox,
+            "id -u; id -g; cat /proc/self/uid_map; cat /proc/self/gid_map; \
+             grep -E '^(Uid|Gid|Groups|CapEff|CapPrm|CapInh|CapAmb|NoNewPrivs):' /proc/self/status",
+            config,
+        );
+        let (host_uid, host_gid) = delegated_pair().expect("delegated pair");
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("1000"), "namespace UID: {stdout}");
+        assert_eq!(lines.next(), Some("1000"), "namespace GID: {stdout}");
+        // Exactly one map entry each (the kernel pads columns), and no
+        // UID/GID 0 mapping exists.
+        assert_eq!(
+            lines.next().map(single_map_fields),
+            Some(vec!["1000", host_uid.to_string().as_str(), "1"]),
+            "uid_map: {stdout}"
+        );
+        assert_eq!(
+            lines.next().map(single_map_fields),
+            Some(vec!["1000", host_gid.to_string().as_str(), "1"]),
+            "gid_map: {stdout}"
+        );
+        let rest: Vec<&str> = lines.collect();
+        assert!(
+            rest.iter().any(|line| line.starts_with("Uid:")
+                && line.split_whitespace().skip(1).all(|id| id == "1000")),
+            "real/effective/saved/fs UID must all be 1000: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|line| line.starts_with("Gid:")
+                && line.split_whitespace().skip(1).all(|id| id == "1000")),
+            "real/effective/saved/fs GID must all be 1000: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|line| line.starts_with("Groups:")),
+            "Groups line must exist: {rest:?}"
+        );
+        let groups_line = rest
+            .iter()
+            .find(|line| line.starts_with("Groups:"))
+            .expect("groups");
+        assert_eq!(
+            groups_line.split_whitespace().count(),
+            1,
+            "supplementary groups must be empty: {groups_line}"
+        );
+        for prefix in ["CapEff:", "CapPrm:", "CapInh:", "CapAmb:"] {
+            assert!(
+                rest.iter().any(|line| line.starts_with(prefix)
+                    && line.split_whitespace().nth(1) == Some("0000000000000000")),
+                "{prefix} must be zero: {rest:?}"
+            );
+        }
+        assert!(
+            rest.iter().any(|line| line.trim() == "NoNewPrivs:\t1"),
+            "NoNewPrivs must be 1: {rest:?}"
+        );
+        assert_eq!(code, Some(0), "exit: {stderr}");
+    }
+
+    #[test]
+    fn host_side_identity_is_the_leased_subordinate_pair() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let (host_uid, host_gid) = delegated_pair().expect("delegated pair");
+        let sandbox = isolated_sandbox();
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg("sleep 2; id -u");
+        command.stdin = Stdio::Null;
+        command.stdout = Stdio::Pipe;
+        let mut child = sandbox.spawn(command, config).expect("isolated spawn");
+        let pid = child.id().expect("child pid");
+        // Read the HOST view of the process credentials while it runs. The
+        // daemon's own UID/GID must not appear.
+        let mut status = String::new();
+        for _ in 0..40 {
+            if let Ok(mut file) = std::fs::File::open(format!("/proc/{pid}/status")) {
+                status.clear();
+                if file.read_to_string(&mut status).is_ok() && status.contains("State:\tS") {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let uid_line = status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .expect("host Uid line");
+        assert!(
+            uid_line
+                .split_whitespace()
+                .skip(1)
+                .all(|id| id == host_uid.to_string()),
+            "host UIDs must all be the leased subordinate {host_uid}: {uid_line}"
+        );
+        let gid_line = status
+            .lines()
+            .find(|line| line.starts_with("Gid:"))
+            .expect("host Gid line");
+        assert!(
+            gid_line
+                .split_whitespace()
+                .skip(1)
+                .all(|id| id == host_gid.to_string()),
+            "host GIDs must all be the leased subordinate {host_gid}: {gid_line}"
+        );
+        let mut stdout = String::new();
+        if let Some(mut pipe) = child.take_stdout() {
+            pipe.read_to_string(&mut stdout).expect("read stdout");
+        }
+        assert_eq!(child.wait().expect("wait").code(), Some(0));
+        assert_eq!(stdout, "1000\n");
+    }
+
+    #[test]
+    fn daemon_private_files_are_denied_by_dac_alone() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let secret = tempfile::tempdir().expect("secret dir");
+        let canary = secret.path().join("canary");
+        std::fs::write(&canary, b"daemon-private").expect("write canary");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod canary");
+        }
+        let read = format!("cat {}", canary.display());
+        let sandbox = isolated_sandbox();
+        let (code, _signal, stdout, stderr) = run_sh_with(&sandbox, &read, config.clone());
+        assert_ne!(code, Some(0), "DAC must deny the daemon-owned 0600 file");
+        assert!(!stdout.contains("daemon-private"), "no content leak");
+        assert!(
+            stderr.contains("Permission denied") || stderr.contains("denied"),
+            "a DAC denial was expected: {stderr}"
+        );
+        // A world-readable file at the same location still works: the
+        // denial is ownership-based, not a blanket block.
+        std::fs::write(secret.path().join("public"), b"public").expect("write public");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                secret.path().join("public"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("chmod public");
+        }
+        let read_public = format!("cat {}", secret.path().join("public").display());
+        let (code, _signal, stdout, stderr) = run_sh_with(&sandbox, &read_public, config);
+        assert_eq!(code, Some(0), "public file: {stderr}");
+        assert_eq!(stdout, "public");
+    }
+
+    #[test]
+    fn becoming_namespace_root_fails() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let setpriv = "/usr/bin/setpriv";
+        if !std::path::Path::new(setpriv).exists() {
+            eprintln!("skipping: {setpriv} not available");
+            return;
+        }
+        let sandbox = isolated_sandbox();
+        let (code, _signal, _stdout, _stderr) = run_sh_with(
+            &sandbox,
+            &format!("{setpriv} --reuid 0 --regid 0 --clear-groups /bin/true"),
+            config,
+        );
+        assert_ne!(
+            code,
+            Some(0),
+            "setresuid(0)/setresgid(0) must fail: UID/GID 0 are unmapped"
+        );
+    }
+
+    #[test]
+    fn mapper_failure_aborts_the_launch_without_exec() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let sandbox = Sandbox::detect_with_mapper(None, Arc::new(FailingMapper));
+        let mut command = CommandSpec::new("/bin/sh");
+        command = command.arg("-c").arg("touch /tmp/shbox-should-not-exist");
+        command.stdout = Stdio::Pipe;
+        let error = sandbox
+            .spawn(command, config.clone())
+            .expect_err("failing mapper must abort the launch");
+        assert!(
+            matches!(error, SandboxError::Io(_) | SandboxError::Setup { .. }),
+            "{error}"
+        );
+        assert!(!std::path::Path::new("/tmp/shbox-should-not-exist").exists());
+    }
+
+    #[test]
+    fn isolated_launch_without_a_mapper_fails_closed() {
+        let Some(config) = isolated_config() else {
+            eprintln!("skipping: no subordinate delegation or mapping helpers");
+            return;
+        };
+        let sandbox = Sandbox::detect();
+        let error = sandbox
+            .spawn(CommandSpec::new("/bin/true"), config)
+            .expect_err("isolated identity without a mapper must fail closed");
+        assert!(
+            matches!(
+                error,
+                SandboxError::Unsupported {
+                    feature: "identity",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("UidGidMapper"),
+            "the diagnostic must name the missing seam: {error}"
+        );
     }
 }

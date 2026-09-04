@@ -48,6 +48,7 @@ pub struct Config {
     sandbox_env: BTreeMap<String, String>,
     resources: SandboxResources,
     cgroup_parent: Option<PathBuf>,
+    identity: SandboxIdentity,
 }
 
 impl Config {
@@ -125,6 +126,13 @@ impl Config {
     pub fn cgroup_parent(&self) -> Option<&Path> {
         self.cgroup_parent.as_deref()
     }
+
+    /// Identity policy for normal Linux sandbox processes. The default is
+    /// the compatibility `host` mode; `isolated` is an explicit opt-in until
+    /// the native deployment gate is satisfied.
+    pub fn identity(&self) -> SandboxIdentity {
+        self.identity
+    }
 }
 
 /// Parse a config file, enforcing the size limit and file safety first.
@@ -183,6 +191,7 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
     let sandbox_env = validate_sandbox_env(sandbox.env.as_ref())?;
     let resources = validate_resources(&sandbox)?;
     let cgroup_parent = validate_cgroup_parent(sandbox.cgroup_parent.as_deref())?;
+    let identity = validate_identity(sandbox.identity.as_deref())?;
     Ok(Config {
         listen,
         log_level,
@@ -192,6 +201,7 @@ pub fn build(raw: RawConfig, paths: &Paths) -> Result<Config, Error> {
         sandbox_env,
         resources,
         cgroup_parent,
+        identity,
     })
 }
 
@@ -293,6 +303,19 @@ fn validate_cgroup_parent(raw: Option<&str>) -> Result<Option<PathBuf>, Error> {
         });
     }
     Ok(Some(path))
+}
+
+fn validate_identity(raw: Option<&str>) -> Result<SandboxIdentity, Error> {
+    let Some(word) = raw else {
+        return Ok(SandboxIdentity::Host);
+    };
+    SandboxIdentity::from_word(word).ok_or_else(|| Error::Invalid {
+        field: "sandbox.identity",
+        message: format!(
+            "sandbox.identity must be one of {}, got {word:?}",
+            SandboxIdentity::WORDS.join(", ")
+        ),
+    })
 }
 
 /// The listener the daemon binds when the config file names none: the
@@ -621,6 +644,33 @@ pub enum NetworkMode {
     Outbound,
 }
 
+/// Identity policy for normal sandbox launches. This is deliberately
+/// separate from the admin `_` host route and from network namespace
+/// topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxIdentity {
+    /// Compatibility mode: the process retains the daemon's host DAC
+    /// identity (and may use a caller-mapped user namespace for networking).
+    Host,
+    /// Use a durable subordinate UID/GID lease and a fresh mapped user
+    /// namespace. Linux-only at runtime; other platforms reject it.
+    Isolated,
+}
+
+impl SandboxIdentity {
+    /// Schema words for the identity policy.
+    pub const WORDS: [&str; 2] = ["host", "isolated"];
+
+    /// Parse one schema word.
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "host" => Some(Self::Host),
+            "isolated" => Some(Self::Isolated),
+            _ => None,
+        }
+    }
+}
+
 impl NetworkMode {
     /// The schema words for the sandbox network modes.
     pub const WORDS: [&str; 2] = ["disabled", "outbound"];
@@ -724,6 +774,7 @@ pub struct RawConfig {
 pub struct RawSandbox {
     shell: Option<String>,
     network: Option<String>,
+    identity: Option<String>,
     #[serde_as(as = "Option<OneOrMany<_>>")]
     read_paths: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
@@ -788,6 +839,22 @@ mod tests {
     use crate::paths::Paths;
     use proptest::prelude::*;
     use tempfile::TempDir;
+
+    /// Create a directory fixture with private permissions, independent of
+    /// the ambient umask (validators correctly reject group-writable dirs).
+    fn create_private_dir(path: &std::path::Path) {
+        std::fs::create_dir(path).expect("create config dir");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod config dir");
+    }
+
+    /// Write a config fixture with private permissions, independent of the
+    /// ambient umask.
+    fn write_config_file(path: &std::path::Path, content: impl AsRef<[u8]>) {
+        std::fs::write(path, content).expect("write config");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
+    }
 
     fn test_paths() -> (TempDir, Paths) {
         let home = TempDir::new().expect("tempdir");
@@ -854,6 +921,7 @@ mod tests {
             );
             assert_eq!(config.log_level(), LogLevel::Info);
             assert_eq!(config.network(), NetworkMode::Disabled);
+            assert_eq!(config.identity(), SandboxIdentity::Host);
             assert!(config.read_paths().is_empty());
             assert!(config.sandbox_env().is_empty());
         }
@@ -871,8 +939,8 @@ mod tests {
     fn present_empty_file_uses_builtin_policy() {
         let (_home, paths) = test_paths();
         // `ensure` no longer creates the read-only config directory.
-        std::fs::create_dir(paths.config_dir()).expect("create config dir");
-        std::fs::write(paths.config_file(), "").expect("write empty config");
+        create_private_dir(paths.config_dir());
+        write_config_file(&paths.config_file(), "");
         let snapshot = Config::load_snapshot(&paths, None);
         #[cfg(feature = "tcp")]
         {
@@ -927,6 +995,7 @@ mod tests {
             [sandbox]
             shell = "/bin/bash"
             network = "outbound"
+            identity = "isolated"
             read_paths = ["/usr/share/terminfo"]
 
             [sandbox.env]
@@ -944,6 +1013,7 @@ mod tests {
         );
         assert_eq!(config.log_level(), LogLevel::Debug);
         assert_eq!(config.network(), NetworkMode::Outbound);
+        assert_eq!(config.identity(), SandboxIdentity::Isolated);
         assert_eq!(config.read_paths().len(), 1);
         assert_eq!(
             config.sandbox_env().get("LANG").map(String::as_str),
@@ -964,6 +1034,22 @@ mod tests {
         ] {
             assert!(build_toml(text).is_ok(), "{text}");
         }
+    }
+
+    #[test]
+    fn identity_accepts_only_host_or_isolated() {
+        assert_eq!(
+            build_ok("[sandbox]\nidentity = \"host\"").identity(),
+            SandboxIdentity::Host
+        );
+        assert_eq!(
+            build_ok("[sandbox]\nidentity = \"isolated\"").identity(),
+            SandboxIdentity::Isolated
+        );
+        let message = build_err("[sandbox]\nidentity = \"root\"");
+        assert!(message.contains("sandbox.identity"), "{message}");
+        assert!(message.contains("host"), "{message}");
+        assert!(message.contains("isolated"), "{message}");
     }
 
     #[test]
@@ -1270,7 +1356,7 @@ read_paths = [""]"#
         );
         paths.ensure().expect("ensure");
         // `ensure` no longer creates the read-only config directory.
-        std::fs::create_dir(paths.config_dir()).expect("create config dir");
+        create_private_dir(paths.config_dir());
         let path = paths.config_file();
         std::fs::write(path, "[sandbox]\nnetwork = \"disabled\"").expect("write config");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
@@ -1298,16 +1384,16 @@ read_paths = [""]"#
         );
         paths.ensure().expect("ensure");
         // `ensure` no longer creates the read-only config directory.
-        std::fs::create_dir(paths.config_dir()).expect("create config dir");
+        create_private_dir(paths.config_dir());
         let path = paths.config_file();
-        std::fs::write(path, b"#").unwrap();
+        write_config_file(&path, b"#");
         // Build a file just over the limit out of harmless comment lines.
         let line = "# ".repeat(511) + "\n";
         let mut body = String::new();
         while (body.len() as u64) <= MAX_CONFIG_BYTES {
             body.push_str(&line);
         }
-        std::fs::write(path, body).expect("write big config");
+        write_config_file(&path, &body);
         assert!(matches!(
             Config::load_snapshot(&paths, None),
             Err(Error::TooLarge { .. })

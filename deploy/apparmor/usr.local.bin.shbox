@@ -1,0 +1,16 @@
+# Allow shbox's own user-namespace bootstrap to retain the capabilities that
+# the kernel grants inside its fresh namespace. Ubuntu 24.04 otherwise
+# transitions unconfined callers into the generic unprivileged_userns profile,
+# which denies CAP_SETGID/CAP_SYS_ADMIN and mount propagation.
+#
+# This is an unconfined-named profile, like the distribution profiles for
+# podman and rootlesskit. The actual daemon and child restrictions remain the
+# systemd, shbox, Landlock, seccomp, and namespace policies.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile shbox /usr/local/bin/shbox flags=(unconfined) {
+    userns,
+
+    include if exists <local/shbox>
+}

@@ -990,6 +990,7 @@ mod tests {
         LaunchRequest {
             sandbox_id: crate::sandbox::SandboxId::parse("dev").expect("sandbox id"),
             workspace: std::path::PathBuf::from("/tmp/shbox-dev"),
+            identity: None,
             operation: LaunchOperation::Exec(b"fake command".to_vec()),
             pty,
             environment: std::collections::BTreeMap::new(),

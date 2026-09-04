@@ -39,6 +39,15 @@ pub(crate) enum FaultPoint {
     RegistryParentSync,
     DeleteEntry,
     DeleteRootSync,
+    // Subordinate-ID lease ledger (sandbox/subid). The points mirror the
+    // metadata writer's crash windows one-for-one.
+    LeaseTempCreate,
+    LeaseWrite,
+    LeaseFileSync,
+    LeaseRename,
+    LeaseParentSync,
+    LeaseUnlink,
+    LeaseUnlinkSync,
 }
 
 #[derive(Debug, Default)]
@@ -51,7 +60,7 @@ impl FaultInjector {
         *self.next.lock().expect("fault injector") = Some(point);
     }
 
-    fn trip(&self, point: FaultPoint) -> Result<(), io::Error> {
+    pub(crate) fn trip(&self, point: FaultPoint) -> Result<(), io::Error> {
         let mut next = self.next.lock().expect("fault injector");
         if *next == Some(point) {
             *next = None;
@@ -489,7 +498,7 @@ fn remove_children(
     Ok(())
 }
 
-struct DirFd {
+pub(crate) struct DirFd {
     fd: RawFd,
 }
 
@@ -508,7 +517,7 @@ impl Drop for DirFd {
     }
 }
 
-fn open_directory_path(path: &Path) -> Result<DirFd, io::Error> {
+pub(crate) fn open_directory_path(path: &Path) -> Result<DirFd, io::Error> {
     let path = path_cstring(path)?;
     // O_NONBLOCK prevents a hostile replacement FIFO from making management
     // startup block while the final type check is performed.
@@ -540,7 +549,7 @@ fn open_directory_path(path: &Path) -> Result<DirFd, io::Error> {
     Ok(DirFd { fd })
 }
 
-fn open_directory_at(parent: RawFd, name: &[u8]) -> Result<DirFd, io::Error> {
+pub(crate) fn open_directory_at(parent: RawFd, name: &[u8]) -> Result<DirFd, io::Error> {
     let name = CString::new(name).map_err(|_| io::Error::other("path component contains NUL"))?;
     let fd = unsafe {
         libc::openat(
@@ -571,7 +580,7 @@ fn open_directory_at(parent: RawFd, name: &[u8]) -> Result<DirFd, io::Error> {
     Ok(DirFd { fd })
 }
 
-fn create_file_at(parent: RawFd, name: &[u8], mode: u32) -> Result<File, io::Error> {
+pub(crate) fn create_file_at(parent: RawFd, name: &[u8], mode: u32) -> Result<File, io::Error> {
     let name = CString::new(name).map_err(|_| io::Error::other("path component contains NUL"))?;
     let fd = unsafe {
         libc::openat(
@@ -588,7 +597,11 @@ fn create_file_at(parent: RawFd, name: &[u8], mode: u32) -> Result<File, io::Err
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn read_file_at(parent: RawFd, name: &[u8], max_bytes: usize) -> Result<Vec<u8>, io::Error> {
+pub(crate) fn read_file_at(
+    parent: RawFd,
+    name: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, io::Error> {
     let name = CString::new(name).map_err(|_| io::Error::other("path component contains NUL"))?;
     let fd = unsafe {
         libc::openat(
@@ -613,7 +626,7 @@ fn read_file_at(parent: RawFd, name: &[u8], max_bytes: usize) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn read_names(directory_fd: RawFd) -> Result<Vec<Vec<u8>>, io::Error> {
+pub(crate) fn read_names(directory_fd: RawFd) -> Result<Vec<Vec<u8>>, io::Error> {
     let duplicate = unsafe { libc::dup(directory_fd) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
@@ -673,7 +686,7 @@ fn fstat(fd: RawFd) -> Result<libc::stat, io::Error> {
     }
 }
 
-fn stat_at(parent: RawFd, name: &[u8]) -> Result<libc::stat, io::Error> {
+pub(crate) fn stat_at(parent: RawFd, name: &[u8]) -> Result<libc::stat, io::Error> {
     let name = CString::new(name).map_err(|_| io::Error::other("path component contains NUL"))?;
     // SAFETY: zeroed is a valid initialization for libc::stat; fstatat fills it.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -699,7 +712,12 @@ fn mkdir_at(parent: RawFd, name: &[u8], mode: u32) -> Result<(), io::Error> {
     }
 }
 
-fn rename_at(from_dir: RawFd, from: &[u8], to_dir: RawFd, to: &[u8]) -> Result<(), io::Error> {
+pub(crate) fn rename_at(
+    from_dir: RawFd,
+    from: &[u8],
+    to_dir: RawFd,
+    to: &[u8],
+) -> Result<(), io::Error> {
     let from = CString::new(from).map_err(|_| io::Error::other("path component contains NUL"))?;
     let to = CString::new(to).map_err(|_| io::Error::other("path component contains NUL"))?;
     // SAFETY: all descriptors and path components are valid.
@@ -711,7 +729,7 @@ fn rename_at(from_dir: RawFd, from: &[u8], to_dir: RawFd, to: &[u8]) -> Result<(
     }
 }
 
-fn unlink_at(parent: RawFd, name: &[u8], flags: i32) -> Result<(), io::Error> {
+pub(crate) fn unlink_at(parent: RawFd, name: &[u8], flags: i32) -> Result<(), io::Error> {
     let name = CString::new(name).map_err(|_| io::Error::other("path component contains NUL"))?;
     // SAFETY: name is a valid NUL-terminated component; unlinkat does not
     // follow symlinks.
@@ -723,7 +741,7 @@ fn unlink_at(parent: RawFd, name: &[u8], flags: i32) -> Result<(), io::Error> {
     }
 }
 
-fn sync_directory(fd: RawFd) -> Result<(), io::Error> {
+pub(crate) fn sync_directory(fd: RawFd) -> Result<(), io::Error> {
     let duplicate = unsafe { libc::dup(fd) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
@@ -733,7 +751,7 @@ fn sync_directory(fd: RawFd) -> Result<(), io::Error> {
     file.sync_all()
 }
 
-fn errno_is(error: &io::Error, errno: i32) -> bool {
+pub(crate) fn errno_is(error: &io::Error, errno: i32) -> bool {
     error.raw_os_error() == Some(errno)
 }
 
@@ -757,15 +775,15 @@ fn clear_errno() {
     }
 }
 
-fn is_directory(mode: libc::mode_t) -> bool {
+pub(crate) fn is_directory(mode: libc::mode_t) -> bool {
     mode & libc::S_IFMT == libc::S_IFDIR
 }
 
-fn is_regular(mode: libc::mode_t) -> bool {
+pub(crate) fn is_regular(mode: libc::mode_t) -> bool {
     mode & libc::S_IFMT == libc::S_IFREG
 }
 
-fn mode_bits(mode: libc::mode_t) -> u32 {
+pub(crate) fn mode_bits(mode: libc::mode_t) -> u32 {
     #[cfg(target_os = "linux")]
     {
         mode & 0o777

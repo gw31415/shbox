@@ -191,6 +191,19 @@ fn emit(action: OutputAction) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--internal-idmap-broker")
+    {
+        return match platform::run_idmap_broker() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("shbox: ID-map broker failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let args = Args::parse();
     match args.output_action() {
         Ok(Some(action)) => return emit(action),
@@ -332,13 +345,19 @@ async fn run(args: &Args) -> Result<(), BootstrapError> {
     let managed_mode = auth_store.admin_count() > 0;
     let sandbox_manager = Arc::new(
         if managed_mode {
-            sandbox::SandboxManager::open_unreconciled_with_launcher(
+            sandbox::SandboxManager::open_unreconciled_with_launcher_and_identity(
                 &paths,
                 config::Caps::default(),
                 launcher,
+                app_config.identity(),
             )
         } else {
-            sandbox::SandboxManager::open_with_launcher(&paths, config::Caps::default(), launcher)
+            sandbox::SandboxManager::open_with_launcher_and_identity(
+                &paths,
+                config::Caps::default(),
+                launcher,
+                app_config.identity(),
+            )
         }
         .map_err(|err| fail("reconciling sandbox registry", err))?,
     );

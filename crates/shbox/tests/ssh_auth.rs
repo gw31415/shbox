@@ -90,10 +90,16 @@ fn daemon_binary() -> PathBuf {
 /// Keep daemon fixtures below the crate workspace instead of the usual
 /// world-writable `/tmp`: shbox validates every authorized_keys ancestor.
 fn ssh_tempdir() -> TempDir {
-    tempfile::Builder::new()
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::Builder::new()
         .prefix(".shbox-ssh-test-")
         .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")))
-        .expect("tempdir")
+        .expect("tempdir");
+    // The fixture root is an ancestor of every key source the daemon
+    // validates; make it private regardless of the ambient umask.
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("fixture root must be private");
+    root
 }
 
 impl TestDaemon {
@@ -117,6 +123,12 @@ impl TestDaemon {
             &data_dir,
             &state_dir,
             &keys_dir,
+            // Intermediate directories created by create_dir_all must be
+            // private too: the daemon walks the whole ancestor chain of
+            // every key source, and default modes are umask-dependent.
+            &root.path().join("config"),
+            &root.path().join("data"),
+            &root.path().join("state"),
         ] {
             std::fs::create_dir_all(dir).expect("create dirs");
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
@@ -161,6 +173,8 @@ impl TestDaemon {
 
         let config_path = config_dir.join("config.toml");
         std::fs::write(&config_path, extra_config).expect("write config");
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
 
         let ssh_config = keys_dir.join("ssh_config");
         std::fs::write(
@@ -242,7 +256,10 @@ impl TestDaemon {
 
     /// Replace the whole config file content with a complete new document.
     fn set_config(&self, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::write(&self.config_path, content).expect("write config");
+        std::fs::set_permissions(&self.config_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod config");
     }
 
     /// Send a signal to the child owned by this harness.
@@ -919,17 +936,20 @@ fn run_ssh_command(
 /// Linux and macOS have a native production sandbox launcher. Unsupported
 /// targets retain the fail-closed path used by generic protocol tests.
 fn native_sandbox_supported() -> bool {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        {
-            return linux_process_domain_supported();
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if cfg!(target_os = "linux") {
+            #[cfg(target_os = "linux")]
+            {
+                return linux_process_domain_supported();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unreachable!("guarded by cfg!(target_os = \"linux\")")
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            unreachable!("guarded by cfg!(target_os = \"linux\")")
-        }
-    }
-    cfg!(target_os = "macos")
+        cfg!(target_os = "macos")
+    })
 }
 
 /// Every sandbox launch joins a mandatory per-sandbox cgroup (plan M4), so
@@ -972,10 +992,18 @@ fn sandbox_request_accepted(result: &SshResult, expected_stdout: &str) -> bool {
     if native_sandbox_supported() {
         result.ok() && result.stdout == expected_stdout
     } else {
-        result.status == 255
-            && result.stdout.is_empty()
-            && result.stderr.contains("request cannot be completed")
+        sandbox_request_failed_closed(result)
     }
+}
+
+/// OpenSSH may render a server-side channel failure instead of forwarding the
+/// daemon's generic unavailable message. Both forms prove that no sandbox
+/// process ran and that the request failed closed.
+fn sandbox_request_failed_closed(result: &SshResult) -> bool {
+    result.status == 255
+        && result.stdout.is_empty()
+        && (result.stderr.contains("request cannot be completed")
+            || result.stderr.contains("exec request failed on channel"))
 }
 
 fn assert_sandbox_request_accepted(result: &SshResult, expected_stdout: &str, context: &str) {
@@ -1159,9 +1187,10 @@ fn sandbox_requests_execute_or_fail_closed() {
         assert_eq!(result.status, 0, "real sandbox launch failed: {result:?}");
         assert_eq!(result.stdout, "nope");
     } else {
-        assert_eq!(result.status, 255, "sandbox must fail closed: {result:?}");
-        assert!(result.stderr.contains("request cannot be completed"));
-        assert!(!result.stdout.contains("nope"));
+        assert!(
+            sandbox_request_failed_closed(&result),
+            "sandbox must fail closed: {result:?}"
+        );
     }
 }
 
@@ -1169,18 +1198,20 @@ fn sandbox_requests_execute_or_fail_closed() {
 /// admin-wide list, then performs an idempotent delete.
 #[test]
 fn sandbox_list_and_delete_are_wired_to_the_manager() {
+    if !native_sandbox_supported() {
+        // The manager stays unavailable when startup cannot reconcile the
+        // mandatory process-domain backend. The fail-closed launch path is
+        // covered by sandbox_requests_execute_or_fail_closed; list/delete
+        // acceptance requires the native backend below.
+        return;
+    }
+
     let daemon = TestDaemon::start(&["admin"]);
 
-    // The request exercises lazy first-owner claim. The real-platform suite
-    // opts in explicitly; the default path proves unavailable is fail-closed.
+    // The request exercises lazy first-owner claim on the real platform.
     let claim = daemon.ssh(&daemon.normal_key, "dev", "printf ignored", &["-T"]);
-    if native_sandbox_supported() {
-        assert!(claim.ok(), "real sandbox launch failed: {claim:?}");
-        assert_eq!(claim.stdout, "ignored");
-    } else {
-        assert_eq!(claim.status, 255, "sandbox must fail closed: {claim:?}");
-        assert!(claim.stderr.contains("request cannot be completed"));
-    }
+    assert!(claim.ok(), "real sandbox launch failed: {claim:?}");
+    assert_eq!(claim.stdout, "ignored");
 
     // The list username is only connection context; owner filtering uses the
     // authenticated fingerprint, so it need not itself be a SandboxId.

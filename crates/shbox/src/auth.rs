@@ -792,10 +792,25 @@ mod tests {
     /// workspace so the tests exercise the file checks rather than the
     /// permissions of the host's shared temp directory.
     fn auth_tempdir() -> TempDir {
-        tempfile::Builder::new()
+        let home = tempfile::Builder::new()
             .prefix(".shbox-auth-test-")
             .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("tempdir")
+            .expect("tempdir");
+        // tempfile 3.x creates directories with default permissions
+        // (umask-dependent); the parent validator correctly rejects
+        // group-writable ancestors, so fixtures must be explicitly private.
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("fixture home must be private");
+        home
+    }
+
+    /// Write a key-source fixture with private permissions. The loader is
+    /// right to reject group-writable sources, so fixtures must not depend
+    /// on the ambient umask to be acceptable.
+    fn write_private(path: &Path, content: impl AsRef<[u8]>) {
+        fs::write(path, content).expect("write fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("fixture must be private");
     }
 
     /// Generate a fresh Ed25519 keypair and return the authorized-keys line
@@ -866,8 +881,8 @@ mod tests {
             (parse(&line_a), parse(&line_b))
         };
         // host has key_a; allowed has key_b AND key_a (overlap)
-        std::fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        std::fs::write(&allowed_path, format!("{line_b}\n{line_a}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n{line_a}\n"));
 
         let snapshot = AuthSnapshot::load(&host_path, &allowed_path).expect("load");
         assert_eq!(snapshot.keys().len(), 2);
@@ -889,8 +904,8 @@ mod tests {
         let (line_b, _) = generated_key();
 
         // Duplicate in host file
-        std::fs::write(&host_path, format!("{line_a}\n{line_a}\n")).expect("write host");
-        std::fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let err = AuthSnapshot::load(&host_path, &allowed_path).expect_err("dup host");
         let message = err.to_string();
         assert!(
@@ -900,8 +915,8 @@ mod tests {
         assert!(message.contains("duplicates an earlier key"), "{message}");
 
         // Duplicate in allowed file
-        std::fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        std::fs::write(&allowed_path, format!("{line_b}\n{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n{line_b}\n"));
         let err = AuthSnapshot::load(&host_path, &allowed_path).expect_err("dup allowed");
         let message = err.to_string();
         assert!(
@@ -925,8 +940,8 @@ mod tests {
             (parse(&line_a), parse(&line_b))
         };
 
-        std::fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        std::fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
 
         // Missing host + valid allowed
         let snapshot = AuthSnapshot::load(&missing_host, &allowed_path).expect("missing host");
@@ -936,7 +951,7 @@ mod tests {
 
         // Empty host + valid allowed
         let empty_host = home.path().join("empty_host");
-        std::fs::write(&empty_host, b"").expect("write empty");
+        write_private(&empty_host, b"");
         let snapshot = AuthSnapshot::load(&empty_host, &allowed_path).expect("empty host");
         assert_eq!(snapshot.admin_count(), 0);
         assert_eq!(snapshot.authenticate(&key_b).unwrap().role, Role::Normal);
@@ -949,7 +964,7 @@ mod tests {
 
         // Valid host + empty allowed
         let empty_allowed = home.path().join("empty_allowed");
-        std::fs::write(&empty_allowed, b"").expect("write empty");
+        write_private(&empty_allowed, b"");
         let snapshot = AuthSnapshot::load(&host_path, &empty_allowed).expect("empty allowed");
         assert_eq!(snapshot.admin_count(), 1);
         assert_eq!(snapshot.authenticate(&key_a).unwrap().role, Role::Admin);
@@ -965,8 +980,8 @@ mod tests {
         // Both comment-only -> empty snapshot error
         let comment_host = home.path().join("comment_host");
         let comment_allowed = home.path().join("comment_allowed");
-        std::fs::write(&comment_host, "# comment only\n\n").expect("write comment");
-        std::fs::write(&comment_allowed, "# another comment\n").expect("write comment");
+        write_private(&comment_host, "# comment only\n\n");
+        write_private(&comment_allowed, "# another comment\n");
         let err = AuthSnapshot::load(&comment_host, &comment_allowed).expect_err("comment only");
         assert!(matches!(err, Error::EmptyAuthSnapshot { .. }), "{err}");
     }
@@ -980,8 +995,8 @@ mod tests {
         let (line_b, _) = generated_key();
 
         // Host valid, allowed malformed -> error specifies allowed path
-        std::fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        std::fs::write(&allowed_path, "not-a-valid-key\n").expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, "not-a-valid-key\n");
         let err = AuthSnapshot::load(&host_path, &allowed_path).expect_err("malformed allowed");
         let message = err.to_string();
         assert!(
@@ -990,8 +1005,8 @@ mod tests {
         );
 
         // Host malformed, allowed valid -> error specifies host path
-        std::fs::write(&host_path, "not-a-valid-key\n").expect("write host");
-        std::fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, "not-a-valid-key\n");
+        write_private(&allowed_path, format!("{line_b}\n"));
         let err = AuthSnapshot::load(&host_path, &allowed_path).expect_err("malformed host");
         let message = err.to_string();
         assert!(
@@ -1006,7 +1021,7 @@ mod tests {
         let host_path = home.path().join("authorized_keys");
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, fp_a) = generated_key();
-        std::fs::write(&host_path, &line_a).expect("write");
+        write_private(&host_path, &line_a);
         let snapshot = AuthSnapshot::load(&host_path, &allowed_path).expect("load");
         let (foreign_line, _) = generated_key();
         let foreign_key = russh::keys::PublicKey::from_openssh(&foreign_line).expect("parse");
@@ -1136,7 +1151,7 @@ mod tests {
         // Missing -> returns Ok(false)
         assert!(!validate_key_source_file(&path, "test_keys").unwrap());
         // Valid.
-        fs::write(&path, b"ssh-ed25519 AAAA test\n").expect("write");
+        write_private(&path, b"ssh-ed25519 AAAA test\n");
         assert!(validate_key_source_file(&path, "test_keys").unwrap());
         // Group writable -> Err(Invalid)
         fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).expect("chmod");
@@ -1151,7 +1166,7 @@ mod tests {
         let home = auth_tempdir();
         let path = home.path().join("keys");
         let line = b"ssh-ed25519 AAAA test\n".repeat(48 * 1024);
-        fs::write(&path, &line).expect("write big");
+        write_private(&path, &line);
         assert!(matches!(
             validate_key_source_file(&path, "test_keys"),
             Err(Error::Invalid { .. })
@@ -1174,7 +1189,7 @@ mod tests {
         let path = home.path().join("authorized_keys");
         assert_eq!(observe_identity(&path), FileIdentity::Absent);
         let (line, _) = generated_key();
-        fs::write(&path, format!("{line}\n")).expect("write");
+        write_private(&path, format!("{line}\n"));
         let present = observe_identity(&path);
         assert!(matches!(present, FileIdentity::Inode { .. }));
         // A permission-only change moves ctime but not mtime; the identity
@@ -1199,11 +1214,11 @@ mod tests {
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
         // Malformed source.
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, b"garbage\n");
         assert!(KeyStore::load(&host_path, &allowed_path).is_err());
         // Unsafe permissions.
-        fs::write(&allowed_path, format!("{line_a}\n")).expect("write allowed");
+        write_private(&allowed_path, format!("{line_a}\n"));
         fs::set_permissions(&allowed_path, fs::Permissions::from_mode(0o664)).expect("chmod");
         assert!(KeyStore::load(&host_path, &allowed_path).is_err());
         // Empty union (both sources absent).
@@ -1225,7 +1240,7 @@ mod tests {
         let (line_b, _) = generated_key();
         let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
         let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         assert_eq!(
             store
@@ -1237,13 +1252,13 @@ mod tests {
         );
 
         // A malformed allowed_keys must not publish anything.
-        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        write_private(&allowed_path, b"garbage\n");
         assert!(store.refresh_if_changed().is_err());
         assert!(store.snapshot().authenticate(&key_a).is_some());
         assert!(store.snapshot().authenticate(&key_b).is_none());
 
         // Fixing the file publishes on the next check.
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        write_private(&allowed_path, format!("{line_b}\n"));
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
         assert!(store.snapshot().authenticate(&key_b).is_some());
     }
@@ -1256,13 +1271,13 @@ mod tests {
         let (line_a, _) = generated_key();
         let (line_b, _) = generated_key();
         let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         // Truncating both sources empties the union; the refresh is rejected
         // and the previous snapshot keeps serving.
-        fs::write(&host_path, "").expect("empty host");
-        fs::write(&allowed_path, "").expect("empty allowed");
+        write_private(&host_path, "");
+        write_private(&allowed_path, "");
         assert!(matches!(
             store.refresh_if_changed(),
             Err(Error::EmptyAuthSnapshot { .. })
@@ -1278,15 +1293,15 @@ mod tests {
         let (line_a, _) = generated_key();
         let (line_b, _) = generated_key();
         let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         // A stable broken file is parsed exactly once, not once per request.
-        fs::write(&allowed_path, b"garbage\n").expect("write allowed");
+        write_private(&allowed_path, b"garbage\n");
         assert!(store.refresh_if_changed().is_err());
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
         assert_eq!(store.load_count(), 2);
         // The next on-disk change retries the parse and applies it.
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        write_private(&allowed_path, format!("{line_b}\n"));
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
         assert!(store.snapshot().authenticate(&key_b).is_some());
         assert_eq!(store.load_count(), 3);
@@ -1301,17 +1316,17 @@ mod tests {
         let (line_b, _) = generated_key();
         let (line_c, _) = generated_key();
         let key_c = russh::keys::PublicKey::from_openssh(&line_c).expect("parse c");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         // A valid host change plus a malformed allowed change rejects whole,
         // matching the old all-or-nothing reload semantics.
-        fs::write(&host_path, format!("{line_c}\n")).expect("change host");
-        fs::write(&allowed_path, b"garbage\n").expect("break allowed");
+        write_private(&host_path, format!("{line_c}\n"));
+        write_private(&allowed_path, b"garbage\n");
         assert!(store.refresh_if_changed().is_err());
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
         // Fixing the malformed source publishes both changes at once.
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("fix allowed");
+        write_private(&allowed_path, format!("{line_b}\n"));
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
         assert!(store.snapshot().authenticate(&key_c).is_some());
     }
@@ -1322,7 +1337,7 @@ mod tests {
         let host_path = home.path().join("authorized_keys");
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Unchanged);
         store.invalidate();
@@ -1340,8 +1355,8 @@ mod tests {
         let (line_b, _) = generated_key();
         let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
         let key_b = russh::keys::PublicKey::from_openssh(&line_b).expect("parse b");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         // Deleting the allowed source leaves a valid host-only snapshot.
         fs::remove_file(&allowed_path).expect("remove allowed");
@@ -1363,14 +1378,14 @@ mod tests {
         let (line_a, _) = generated_key();
         let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
         // Boot with the host source absent: the key starts as Normal.
-        fs::write(&allowed_path, format!("{line_a}\n")).expect("write allowed");
+        write_private(&allowed_path, format!("{line_a}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         assert_eq!(
             store.snapshot().authenticate(&key_a).expect("auth").role,
             Role::Normal
         );
         // The host file appears later; the next check grants Admin.
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         expect_outcome(store.refresh_if_changed(), RefreshOutcome::Reloaded);
         assert_eq!(
             store.snapshot().authenticate(&key_a).expect("auth").role,
@@ -1385,7 +1400,7 @@ mod tests {
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
         let key_a = russh::keys::PublicKey::from_openssh(&line_a).expect("parse a");
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         let store = KeyStore::load(&host_path, &allowed_path).expect("load");
         // An ancestor mode change is invisible to a file-only stat identity:
         // the ordinary check stays Unchanged (the documented limitation), and
@@ -1410,9 +1425,9 @@ mod tests {
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
         let (line_b, _) = generated_key();
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
+        write_private(&host_path, format!("{line_a}\n"));
         let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&allowed_path, format!("{line_b}\n"));
         store.invalidate();
         let waiters = 8;
         let barrier = Arc::new(std::sync::Barrier::new(waiters));
@@ -1450,8 +1465,8 @@ mod tests {
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
         let (line_b, _) = generated_key();
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
         let waiters = 8;
         let barrier = Arc::new(std::sync::Barrier::new(waiters));
@@ -1543,8 +1558,8 @@ mod tests {
         let allowed_path = home.path().join("allowed_keys");
         let (line_a, _) = generated_key();
         let (line_b, _) = generated_key();
-        fs::write(&host_path, format!("{line_a}\n")).expect("write host");
-        fs::write(&allowed_path, format!("{line_b}\n")).expect("write allowed");
+        write_private(&host_path, format!("{line_a}\n"));
+        write_private(&allowed_path, format!("{line_b}\n"));
         let store = Arc::new(KeyStore::load(&host_path, &allowed_path).expect("load"));
         assert_eq!(
             store.refresh_if_changed().expect("first refresh"),
