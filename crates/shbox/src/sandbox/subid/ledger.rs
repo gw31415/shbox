@@ -322,11 +322,13 @@ impl LeaseStore {
             let name = String::from_utf8_lossy(&name).into_owned();
             if name.starts_with(TEMP_PREFIX) {
                 // A crashed writer's temp file. It was never renamed into a
-                // lease, so it holds no live pair; the next successful write
-                // would reuse the prefix. Removing it keeps the ledger
-                // self-validating.
-                unlink_at(directory.as_raw_fd(), name.as_bytes(), 0)
-                    .map_err(|error| self.io("remove a stale temp file", error))?;
+                // lease, so it holds no live pair: skip it without deleting.
+                // Deletion happens only in `remove_stale_temps`, which runs
+                // under the exclusive flock — deleting here would race an
+                // in-flight write from a thread sharing this store's lock
+                // file descriptor (flock does not exclude same-description
+                // holders) or from a lock-holding writer observed by a
+                // flock-less reader.
                 continue;
             }
             if name == LOCK_FILE_BASENAME {
@@ -339,6 +341,23 @@ impl LeaseStore {
         }
         records.sort_by(|a, b| a.lease_id.cmp(&b.lease_id));
         Ok(records)
+    }
+
+    /// Remove crashed writers' temp files. Call ONLY while holding the
+    /// exclusive flock from [`LeaseStore::lock`]: temp files are also
+    /// created by in-flight writes, so sweeping anywhere else (including the
+    /// flock-less [`LeaseStore::load`] scan) can delete a live write's temp
+    /// file and fail its rename.
+    pub(crate) fn remove_stale_temps(&self) -> Result<(), Error> {
+        let directory = self.open_root()?;
+        for name in read_names(directory.as_raw_fd()).map_err(|error| self.io("scan", error))? {
+            let name = String::from_utf8_lossy(&name).into_owned();
+            if name.starts_with(TEMP_PREFIX) {
+                unlink_at(directory.as_raw_fd(), name.as_bytes(), 0)
+                    .map_err(|error| self.io("remove a stale temp file", error))?;
+            }
+        }
+        Ok(())
     }
 
     /// Read one record by lease ID. Absence is `Ok(None)`.

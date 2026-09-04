@@ -6,13 +6,16 @@
 //! configured. `/etc/subuid` and `/etc/subgid` are deliberately not parsed
 //! as the source of truth.
 //!
-//! Delegation is treated as *process-lifetime mutable*: callers re-query
-//! before every new allocation and before installing maps for an existing
-//! lease (PLANS.md §7.6). An active lease that falls outside the current
-//! delegation stays recorded but blocks new isolated launches.
+//! Delegation is treated as *process-lifetime mutable*: the cache checks the
+//! cheap source-generation metadata before returning a warm snapshot, and a
+//! caller that finds a lease outside that snapshot re-queries before using
+//! it. An active lease that falls outside the current delegation stays
+//! recorded but blocks new isolated launches.
 
 use std::fmt;
+use std::fs;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 /// One delegated half-open range `[start, start + count)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +82,137 @@ impl Delegation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileGeneration {
+    present: bool,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileGeneration {
+    fn read(path: &str) -> FileGeneration {
+        match fs::metadata(path) {
+            Ok(metadata) => FileGeneration {
+                present: true,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            },
+            Err(_) => FileGeneration {
+                present: false,
+                len: 0,
+                modified: None,
+            },
+        }
+    }
+}
+
+/// A cheap generation for local inputs that can change the result of
+/// `getsubids`. NSS-backed deployments still benefit from the cache: their
+/// configured source is normally stable for the daemon lifetime, while a
+/// change to the local NSS/subid configuration invalidates the snapshot
+/// synchronously on the next use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegationGeneration {
+    subuid: FileGeneration,
+    subgid: FileGeneration,
+    nsswitch: FileGeneration,
+}
+
+impl DelegationGeneration {
+    fn current() -> DelegationGeneration {
+        DelegationGeneration {
+            subuid: FileGeneration::read("/etc/subuid"),
+            subgid: FileGeneration::read("/etc/subgid"),
+            nsswitch: FileGeneration::read("/etc/nsswitch.conf"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedDelegation {
+    generation: DelegationGeneration,
+    delegation: Delegation,
+}
+
+/// Process-lifetime delegation cache. The account lookup and delegation
+/// snapshot share this object so a warm launch does not repeat either NSS
+/// lookup or the two `getsubids` subprocesses.
+#[derive(Debug, Default)]
+pub(crate) struct DelegationCache {
+    account: OnceLock<Result<String, Error>>,
+    cached: Mutex<Option<CachedDelegation>>,
+}
+
+impl DelegationCache {
+    pub(crate) fn query(&self) -> Result<Delegation, Error> {
+        self.query_with_generation(false)
+    }
+
+    /// Force one fresh query. This is the fail-closed path used when a cached
+    /// delegation no longer contains a lease's IDs.
+    pub(crate) fn refresh(&self) -> Result<Delegation, Error> {
+        self.query_with_generation(true)
+    }
+
+    fn query_with_generation(&self, force: bool) -> Result<Delegation, Error> {
+        let generation = DelegationGeneration::current();
+        if !force
+            && let Some(cached) = self
+                .cached
+                .lock()
+                .map_err(|_| Error::CachePoisoned)?
+                .as_ref()
+            && cached.generation == generation
+        {
+            return Ok(cached.delegation.clone());
+        }
+
+        // Check the source generation again after the potentially slow NSS
+        // query. A configuration edit racing the query must not publish a
+        // snapshot under the wrong generation.
+        let account = self.current_account_name()?;
+        let delegation = query_for_account(&account)?;
+        let after = DelegationGeneration::current();
+        if generation != after {
+            let delegation = query_for_account(&account)?;
+            let final_generation = DelegationGeneration::current();
+            if final_generation != after {
+                return Err(Error::GenerationChanged);
+            }
+            self.publish(final_generation, delegation.clone())?;
+            return Ok(delegation);
+        }
+        self.publish(generation, delegation.clone())?;
+        Ok(delegation)
+    }
+
+    fn publish(
+        &self,
+        generation: DelegationGeneration,
+        delegation: Delegation,
+    ) -> Result<(), Error> {
+        let mut cached = self.cached.lock().map_err(|_| Error::CachePoisoned)?;
+        if cached
+            .as_ref()
+            .is_none_or(|entry| entry.generation != generation)
+        {
+            *cached = Some(CachedDelegation {
+                generation,
+                delegation,
+            });
+        }
+        Ok(())
+    }
+
+    fn current_account_name(&self) -> Result<String, Error> {
+        self.account
+            .get_or_init(resolve_current_account_name)
+            .clone()
+    }
+}
+
+static PROCESS_DELEGATION_CACHE: OnceLock<DelegationCache> = OnceLock::new();
+
 /// Parse `getsubids` output. Each non-empty line is
 /// `<list-index>: <name> <start> <count>`; the index is a list ordinal and
 /// otherwise ignored. Malformed lines, zero-length ranges, and values that
@@ -129,9 +263,14 @@ pub(crate) fn parse_getsubids_output(output: &str) -> Result<Vec<SubidRange>, Er
 /// capability diagnostics can name it; nothing is guessed from
 /// `/etc/subuid` instead.
 pub(crate) fn query_delegation() -> Result<Delegation, Error> {
-    let user = current_account_name()?;
-    let uid_ranges = run_getsubids(&[&user])?;
-    let gid_ranges = run_getsubids(&["-g", &user])?;
+    PROCESS_DELEGATION_CACHE
+        .get_or_init(DelegationCache::default)
+        .query()
+}
+
+fn query_for_account(user: &str) -> Result<Delegation, Error> {
+    let uid_ranges = run_getsubids(&[user])?;
+    let gid_ranges = run_getsubids(&["-g", user])?;
     Ok(Delegation {
         uid_ranges,
         gid_ranges,
@@ -165,7 +304,7 @@ fn run_getsubids(args: &[&str]) -> Result<Vec<SubidRange>, Error> {
 }
 
 /// Resolve the daemon account name for `geteuid()` via the passwd database.
-fn current_account_name() -> Result<String, Error> {
+fn resolve_current_account_name() -> Result<String, Error> {
     // SAFETY: getpwuid_r fills the provided buffer per POSIX; a zero return
     // with a non-null result pointer marks success.
     unsafe {
@@ -192,12 +331,14 @@ fn current_account_name() -> Result<String, Error> {
 
 /// Delegation discovery failures. `HelperMissing` in particular is a
 /// capability-diagnostic input: isolated identity cannot start without it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Error {
     HelperMissing,
     HelperIo(String),
     HelperFailed { code: Option<i32>, stderr: String },
     AccountLookup,
+    CachePoisoned,
+    GenerationChanged,
     MalformedLine(String),
     MalformedRange { line: String, reason: String },
     Range(&'static str),
@@ -218,6 +359,10 @@ impl fmt::Display for Error {
                 }
             ),
             Error::AccountLookup => f.write_str("the daemon account has no passwd-database name"),
+            Error::CachePoisoned => f.write_str("delegation cache is poisoned"),
+            Error::GenerationChanged => {
+                f.write_str("subordinate-ID delegation changed during discovery")
+            }
             Error::MalformedLine(line) => write!(f, "malformed getsubids output line {line:?}"),
             Error::MalformedRange { line, reason } => {
                 write!(

@@ -8,10 +8,10 @@
 //! record removal + directory fsync`), never by inference from age, missing
 //! processes, or namespace disappearance (PLANS.md §7, §11, §12).
 //!
-//! This module owns the ledger and the allocator. It never parses
-//! subordinate delegation on its own for allocation decisions: callers pass
-//! a freshly queried [`Delegation`] so delegation changes are detected at
-//! the moment of use.
+//! This module owns the ledger and the allocator. Delegation discovery is
+//! cached by the daemon and passed in for allocation decisions; callers still
+//! re-check a cached delegation before using an existing lease when it does
+//! not contain that lease's IDs.
 
 pub(crate) mod delegation;
 pub(crate) mod ledger;
@@ -19,7 +19,7 @@ pub(crate) mod ledger;
 pub(crate) use delegation::{Delegation, SubidRange};
 pub(crate) use ledger::{LeaseRecord, LeaseState, LeaseStore};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -146,6 +146,10 @@ impl From<ledger::Error> for Error {
 pub(crate) struct SubidAllocator {
     store: LeaseStore,
     selection: Mutex<()>,
+    /// Sandbox-to-record lookup populated by a validated ledger load. The
+    /// record file is keyed by lease incarnation, so this small index lets a
+    /// warm `lease_for` read exactly one file instead of scanning every lease.
+    lease_ids: Mutex<HashMap<SandboxId, String>>,
 }
 
 impl SubidAllocator {
@@ -153,6 +157,7 @@ impl SubidAllocator {
         SubidAllocator {
             store,
             selection: Mutex::new(()),
+            lease_ids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -162,15 +167,57 @@ impl SubidAllocator {
     pub(crate) fn load(&self) -> Result<Vec<LeaseRecord>, Error> {
         let records = self.store.load()?;
         validate_uniqueness(&records)?;
+        let mut lease_ids = self
+            .lease_ids
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?;
+        lease_ids.clear();
+        lease_ids.extend(
+            records
+                .iter()
+                .map(|record| (record.sandbox_id.clone(), record.lease_id.clone())),
+        );
         Ok(records)
+    }
+
+    /// Load the validated ledger once and index it by durable sandbox ID for
+    /// startup reconciliation. Callers retain the returned snapshot while
+    /// reconciliation transitions individual records on disk.
+    pub(crate) fn load_indexed(&self) -> Result<BTreeMap<SandboxId, LeaseRecord>, Error> {
+        Ok(self
+            .load()?
+            .into_iter()
+            .map(|record| (record.sandbox_id.clone(), record))
+            .collect())
     }
 
     /// The single live lease for a durable sandbox, if any.
     pub(crate) fn lease_for(&self, sandbox_id: &SandboxId) -> Result<Option<LeaseRecord>, Error> {
-        Ok(self
-            .load()?
-            .into_iter()
-            .find(|record| record.sandbox_id == *sandbox_id))
+        let lease_id = self
+            .lease_ids
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .get(sandbox_id)
+            .cloned();
+        let Some(lease_id) = lease_id else {
+            return Ok(self.load_indexed()?.remove(sandbox_id));
+        };
+        match self.store.read(&lease_id)? {
+            Some(record) if record.sandbox_id == *sandbox_id => Ok(Some(record)),
+            Some(record) => Err(Error::Corrupt(format!(
+                "lease {} is indexed for sandbox {} but names sandbox {}",
+                record.lease_id,
+                sandbox_id.as_str(),
+                record.sandbox_id.as_str()
+            ))),
+            None => {
+                // A different daemon may have completed the release or
+                // replaced this incarnation. Refresh the index on this cold
+                // miss so the lookup remains correct without penalizing the
+                // warm launch path.
+                Ok(self.load_indexed()?.remove(sandbox_id))
+            }
+        }
     }
 
     /// Allocate one UID and one GID for a new sandbox incarnation and
@@ -186,7 +233,19 @@ impl SubidAllocator {
         owner: &KeyFingerprint,
         delegation: &Delegation,
     ) -> Result<LeaseRecord, Error> {
-        let _guard = self.mutation_guard()?;
+        // Guard order is flock first, then the process-local mutex, matching
+        // mutation_guard: flock excludes other processes, selection excludes
+        // sibling threads sharing this store's lock-file descriptor (flock
+        // does not exclude same-description holders). The stale-temp sweep
+        // and the scan both run under selection so neither observes nor
+        // deletes an in-flight write's temp file; the flock-less load() scan
+        // never deletes (see LeaseStore::remove_stale_temps).
+        let ledger = self.store.lock()?;
+        let selection = self
+            .selection
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?;
+        self.store.remove_stale_temps()?;
         let records = self.load()?;
         if records
             .iter()
@@ -225,6 +284,12 @@ impl SubidAllocator {
             quarantine_reason: None,
         };
         self.store.write(&record)?;
+        self.lease_ids
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .insert(record.sandbox_id.clone(), record.lease_id.clone());
+        drop(selection);
+        drop(ledger);
         Ok(record)
     }
 
@@ -259,6 +324,10 @@ impl SubidAllocator {
         // of the same incarnation.
         self.expected_record(expected, &["releasing"])?;
         self.store.remove(&expected.lease_id)?;
+        self.lease_ids
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .remove(&expected.sandbox_id);
         Ok(())
     }
 
@@ -284,6 +353,10 @@ impl SubidAllocator {
         let _guard = self.mutation_guard()?;
         self.expected_record(expected, &["reserved"])?;
         self.store.remove(&expected.lease_id)?;
+        self.lease_ids
+            .lock()
+            .map_err(|_| Error::SelectionPoisoned)?
+            .remove(&expected.sandbox_id);
         Ok(())
     }
 
@@ -323,18 +396,19 @@ impl SubidAllocator {
         Ok(next)
     }
 
-    /// Acquire the process-local and cross-process guards for one ledger
-    /// read-modify-write. The field order releases the flock before the
-    /// process-local mutex, reversing the acquisition order cleanly.
+    /// Acquire the cross-process and process-local guards for one ledger
+    /// mutation. Every caller uses this order so a claim can safely keep the
+    /// flock across its scan while narrowing the in-memory lock to selection
+    /// and durable publication.
     fn mutation_guard(&self) -> Result<MutationGuard<'_>, Error> {
+        let ledger = self.store.lock()?;
         let selection = self
             .selection
             .lock()
             .map_err(|_| Error::SelectionPoisoned)?;
-        let ledger = self.store.lock()?;
         Ok(MutationGuard {
-            _ledger: ledger,
             _selection: selection,
+            _ledger: ledger,
         })
     }
 
@@ -370,8 +444,8 @@ impl SubidAllocator {
 /// Guards one allocator mutation. All paths that need both locks acquire the
 /// process-local selection mutex first, then the ledger's `flock`.
 struct MutationGuard<'a> {
-    _ledger: ledger::LedgerLock<'a>,
     _selection: MutexGuard<'a, ()>,
+    _ledger: ledger::LedgerLock<'a>,
 }
 
 /// What the durable-sandbox scan reports for one sandbox.
@@ -421,8 +495,22 @@ pub(crate) fn reconcile(
     lookup: &dyn Fn(&SandboxId) -> Result<Option<SandboxView>, String>,
     runtime_proof: Option<RuntimeReconciliationProof>,
 ) -> Result<Reconciliation, Error> {
+    let records = allocator.load_indexed()?;
+    reconcile_loaded(allocator, &records, lookup, runtime_proof)
+}
+
+/// Reconcile a caller-owned, already validated ledger snapshot. Startup uses
+/// this form so the same sandbox-indexed load can also drive deletion
+/// recovery; the allocator's mutation methods still re-verify every durable
+/// transition under the ledger flock.
+pub(crate) fn reconcile_loaded(
+    allocator: &SubidAllocator,
+    records: &BTreeMap<SandboxId, LeaseRecord>,
+    lookup: &dyn Fn(&SandboxId) -> Result<Option<SandboxView>, String>,
+    runtime_proof: Option<RuntimeReconciliationProof>,
+) -> Result<Reconciliation, Error> {
     let mut report = Reconciliation::default();
-    for record in allocator.load()? {
+    for record in records.values().cloned() {
         let sandbox = lookup(&record.sandbox_id).map_err(Error::Lookup)?;
         match record.state {
             LeaseState::Reserved => match sandbox {
