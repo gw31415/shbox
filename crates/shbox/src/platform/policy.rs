@@ -374,11 +374,21 @@ impl SandboxLaunchPolicy {
     /// UDP). The accompanying user namespace supplies the privilege required
     /// to create the network namespace without granting capabilities to the
     /// daemon in the host namespace.
+    ///
+    /// The `isolated` identity mode always adds a fresh mount namespace:
+    /// [`IdentityPolicy::Isolated`] is only valid with one, because the
+    /// engine replaces the writable views with ID-mapped mounts inside it.
+    /// The mount follows the identity mode — both `engine_identity` arms for
+    /// `SandboxIdentity::Isolated`, leased or not, resolve to
+    /// [`IdentityPolicy::Isolated`] — and never the network mode.
     #[cfg(target_os = "linux")]
     fn engine_namespaces(&self) -> NamespacePolicy {
         let mut namespaces = NamespacePolicy::default();
         if self.network == NetworkMode::Disabled {
             namespaces.network = NetworkNamespacePolicy::Isolated;
+        }
+        if self.identity == SandboxIdentity::Isolated {
+            namespaces.mount = true;
         }
         namespaces
     }
@@ -986,6 +996,70 @@ mod tests {
             "a user namespace is required to create the network namespace without host capabilities"
         );
         assert_eq!(namespaces.network, NetworkNamespacePolicy::Isolated);
+    }
+
+    /// Build a snapshot with an explicit identity mode, the way an operator
+    /// `[sandbox] identity` entry would.
+    #[cfg(target_os = "linux")]
+    fn policy_with_identity(
+        identity: SandboxIdentity,
+        network: NetworkMode,
+    ) -> SandboxLaunchPolicy {
+        let mut policy = SandboxLaunchPolicy::from_parts(
+            PathBuf::from("/bin/sh"),
+            network,
+            Vec::new(),
+            BTreeMap::new(),
+            PathBuf::from("/state/runtime"),
+            crate::config::SandboxResources::default(),
+            None,
+        );
+        policy.identity = identity;
+        policy
+    }
+
+    /// The engine rejects an isolated identity without a fresh mount
+    /// namespace, so `mount` follows the identity mode exactly: set for
+    /// `isolated` and clear for `host`, whatever the network mode is. The
+    /// identity mode changes nothing else about the namespace topology.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespaces_mount_only_when_identity_is_isolated() {
+        let workspace = Path::new("/state/workspace");
+        let launch_temp = Path::new("/state/runtime/launch-abc");
+        let namespaces = |policy: &SandboxLaunchPolicy| {
+            policy
+                .engine_config_with_identity(workspace, launch_temp, None)
+                .namespaces
+        };
+
+        let host = policy_with_identity(SandboxIdentity::Host, NetworkMode::Outbound);
+        let host_disabled = policy_with_identity(SandboxIdentity::Host, NetworkMode::Disabled);
+        let isolated = policy_with_identity(SandboxIdentity::Isolated, NetworkMode::Outbound);
+        let isolated_disabled =
+            policy_with_identity(SandboxIdentity::Isolated, NetworkMode::Disabled);
+
+        assert!(!namespaces(&host).mount, "host identity never mounts");
+        assert!(!namespaces(&host_disabled).mount);
+
+        for policy in [&isolated, &isolated_disabled] {
+            let config = policy.engine_config_with_identity(workspace, launch_temp, None);
+            assert!(
+                matches!(config.identity, IdentityPolicy::Isolated(_)),
+                "the isolated mode resolves to the isolated identity policy"
+            );
+            assert!(
+                config.namespaces.mount,
+                "the engine requires a mount namespace for the ID-mapped writable views"
+            );
+        }
+
+        // Network topology stays a function of the network mode alone.
+        assert_eq!(namespaces(&isolated).network, namespaces(&host).network);
+        assert_eq!(
+            namespaces(&isolated_disabled).network,
+            namespaces(&host_disabled).network
+        );
     }
 
     #[test]
