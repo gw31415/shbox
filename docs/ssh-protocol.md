@@ -255,6 +255,26 @@ channel close
 
 internal wait/channel failureは255のgeneric failureへnormalizeし、raw backend errorをclientへ出さない。
 
+```mermaid
+sequenceDiagram
+    participant D as Daemon
+    participant C as Client
+    D->>D: pump drain to EOF
+    alt normal exit
+        D->>C: SSH EOF
+        D->>C: exit-status
+    else signal exit
+        D->>C: SSH EOF
+        D->>C: exit-signal
+    else launch failure
+        D->>C: CHANNEL_FAILURE
+        D->>C: generic stderr
+        D->>C: SSH EOF
+        D->>C: exit-status 255
+    end
+    D->>C: channel close
+```
+
 ## 16. Launch failure
 
 requestを実行できない場合、channelをsilent hangさせず、まずrequest自体に `CHANNEL_FAILURE` で応答し(RFC 4254 §5.4、clientが `want_reply=false` の場合はrusshが応答を抑制)、generic stderr、EOF、exit status 255、closeの順で完了させる。

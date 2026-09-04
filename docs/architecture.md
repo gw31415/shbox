@@ -34,6 +34,19 @@ russh SSH/session layer
 
 Host selector `_` は例外であり、admin key のみが daemon account の host process route を使う。host mode は sandbox confinement を経由しないため、admin credential は強い権限境界である。
 
+```mermaid
+flowchart TB
+    C[OpenSSH client] --> S[russh SSH/session layer]
+    S --> A[auth / role / selector routing]
+    A -->|sandbox route| M[SandboxManager<br/>durable metadata + workspace]
+    A -->|host route _ admin only| H[host process]
+    M --> L[ProcessLauncher]
+    L --> P[shbox-owned process + PTY lifecycle]
+    L --> O{OS confinement}
+    O -->|Linux| E[shbox-sandbox engine<br/>clone3+pidfd / Landlock / seccomp / cgroup v2]
+    O -->|macOS| B[Seatbelt profile<br/>via /usr/bin/sandbox-exec]
+```
+
 ## 2. Domain model
 
 ### 2.1 Principal
@@ -50,6 +63,17 @@ Host selector `_` は例外であり、admin key のみが daemon account の ho
 
 `_` は host selector なので sandbox ID にならない。path separator、dot、underscore、whitespace、Unicode は拒否する。
 
+```mermaid
+flowchart TB
+    I[username input] --> F{first char alnum?}
+    F -->|no| R[reject]
+    F -->|yes| N{rest alnum or hyphen,<br/>len 1..64?}
+    N -->|no| R
+    N -->|yes| U{_ or separator/dot/unicode?}
+    U -->|yes| R
+    U -->|no| A[accept as SandboxId]
+```
+
 ### 2.3 Persistent sandbox record
 
 各 sandbox は XDG data root 以下に durable metadata と workspace を持つ。metadata は owner fingerprint と lifecycle state を記録し、workspace と同じ sandbox directory に属する。
@@ -58,6 +82,15 @@ Host selector `_` は例外であり、admin key のみが daemon account の ho
 
 ```text
 Absent -> Active -> Deleting -> Absent
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Active: claim<br/>owner確定
+    Active --> Deleting: delete要求
+    Deleting --> Absent: runtime停止 + workspace削除
+    Active --> Active: shell/exec launch<br/>disposable process
 ```
 
 create/claim は owner を durable に確定してから process launch を許可する。delete は `Deleting` を durable に記録してから runtime を停止し、workspace/metadata を削除する。crash 後は startup reconciliation が incomplete delete を再開する。
@@ -80,6 +113,13 @@ $XDG_DATA_HOME/shbox/subid-leases/<lease-id>.toml
 $XDG_STATE_HOME/shbox/host_key
 $XDG_STATE_HOME/shbox/lock
 $XDG_STATE_HOME/shbox/runtime/           sandbox-runtime private temp root
+```
+
+```mermaid
+flowchart TB
+    C[XDG_CONFIG<br/>config.toml / allowed_keys<br/>operator input] --> D[daemon]
+    D --> T[XDG_DATA<br/>sandboxes + subid-leases<br/>durable]
+    D --> S[XDG_STATE<br/>host_key / lock / runtime<br/>ephemeral]
 ```
 
 shbox が作成する directory は owner-only を要求し、symlink や group/world writable path を拒否する。config directory は operator input なので自動作成しない。
@@ -135,6 +175,20 @@ post-fork child が行うのは、事前準備済み data を使った raw/fixed
 
 isolated launch の mapping barrier は次の手順で成立する。child 生成前に 2 本の one-direction pipe を用意し、`clone3(CLONE_NEWUSER)` 直後の child は `MAP_READY` を送って block する。parent は `CLONE_PIDFD` の pidfd で PID を pin したまま、`/proc/<pid>` の directory fd を継承させた `newuidmap` / `newgidmap`（`fd:N` 形式・env clear・固定 PATH）で「runtime ID ↔ leased host ID・長さ 1」の map を install する。engine は map を読み戻し、単一 entry の完全一致と `setgroups` が `allow` であることを確認してから `MAP_INSTALLED` で child を解放する。helper 失敗・map 不一致・child の早期死亡はいずれも pidfd 経由の kill & reap で fail closed する。lease の host UID/GID に daemon 自身の ID を指定することは engine 側で拒否される。
 
+```mermaid
+sequenceDiagram
+    participant P as Parent
+    participant Ch as Child
+    participant H as newuidmap/newgidmap
+    P->>Ch: clone3 NEWUSER+NEWNS
+    Ch->>P: MAP_READY then block
+    P->>H: install 1000 to leased ID x1
+    H-->>P: ok
+    P->>P: verify exact map + setgroups allow
+    P->>Ch: MAP_INSTALLED
+    Ch->>Ch: clear groups + mounts + setresuid/gid 1000
+```
+
 ID-mapped mount の作成には initial user namespace の root 権が必要なため、daemon は socket activation される `shbox-idmap-broker` に固定長 request と共に SCM_RIGHTS で mount-ID-map user namespace FD と workspace/runtime の source directory FD を渡し、detached mount FD を受け取る。broker（root・initial user namespace で動作）は peer credential と source FD（daemon 所有・group/world writable でない・削除済みでない・設定された data/runtime root 配下）だけを検証し、任意の pathname や command は受け取らない。daemon は `CAP_SYS_ADMIN` を持たない。mount-ID-map 用の auxiliary user namespace は runtime-domain generation ごとに 1 つ作成され（同じ parent 側 mapper barrier で map を install）、その descriptor は generation と同じ lifetime で保持・解放される。同一 sandbox の既存 generation の identity が durable lease と一致しない launch は拒否される。
 
 child setup failure は CLOEXEC status pipe で stage/errno を parent に返し、client には generic launch failure を返す。
@@ -168,6 +222,15 @@ startup の主要順序は次である。
 9. listener bind
 10. managed mode なら startup reconciliation。順序は runtime 資源（stale `shbox-domain-*` cgroup と runtime temp generation）→ subordinate lease ledger → durable `Deleting` workspace の削除再開、である。いずれかが失敗すれば manager を ready にしない。lease ledger の reconciliation は、`Reserved` + published sandbox を `Active` へ昇格し、orphan・owner 不一致・corrupt sandbox の lease を `Quarantined` へ移し、runtime 資源の回収を既に証明した上で sandbox が不在の `Releasing` lease のみを削除して pair を再利用可能にする。`Quarantined` は自動再割当てしない。
 
+```mermaid
+flowchart TB
+    A[XDG/config/keys/policy] --> B[preflight + listener bind]
+    B --> C{startup reconciliation}
+    C -->|runtime cgroup/temp| D[lease ledger]
+    D -->|Deleting resume| E[ready]
+    C -->|any step fails| F[not ready]
+```
+
 config と launch policy は process-lifetime snapshot であり SIGHUP では再読込しない。SIGHUP は key source の再検証だけを強制する。
 
 sandbox backend preflight が利用不能な場合、sandbox shell/exec は fail closed にする。host mode や metadata operationへ unconfined sandbox fallback はしない。
@@ -179,6 +242,24 @@ sandbox backend preflight が利用不能な場合、sandbox shell/exec は fail
 owner だけが通常の shell/exec と delete を行える。admin は管理 route を持つが、identity/ownership の記録を曖昧にしない。
 
 ## 7. Process launch
+
+```mermaid
+sequenceDiagram
+    participant C as OpenSSH client
+    participant S as SSH handler
+    participant M as SandboxManager
+    participant L as ProcessLauncher
+    participant E as OS confinement<br/>engine/Seatbelt
+    C->>S: shell/exec channel open
+    S->>M: owner claim / launch admission
+    M-->>S: validated workspace + policy
+    S->>L: launch(shell, PTY spec)
+    L->>E: clone3 / exec with confinement
+    E-->>L: exec-status / direct child
+    L-->>S: owned stdio + wait handle
+    S-->>C: CHANNEL_SUCCESS
+    Note over C,E: channel closeはtransport detachのみ<br/>processはcgroup残留
+```
 
 一つの SSH shell/exec channel は一つの launch に対応する。同一 sandbox で複数 channel/process を並行実行でき、共有するのは durable workspace だけである。
 
@@ -246,6 +327,15 @@ delete は runtime と persistent state の競合を避ける。
 7. global reservation を解放
 8. identity lease record を削除して ledger directory を fsync し、subordinate pair を再利用可能にする（quarantined にした lease は record を残す）
 
+```mermaid
+flowchart TB
+    A[Active to Deleting durable] --> B[deny new launch]
+    B --> C[lease to Releasing]
+    C --> D[cgroup kill + temp/mount release]
+    D --> E[workspace + metadata delete]
+    E --> F[lease record delete + fsync]
+```
+
 resource limit を使う Linux sandbox では、child exit だけでは `SandboxId` の durable resource domain を削除しない。runtime cancellation と child cleanup の完了後、この delete path が domain を release/remove する。
 
 途中 crash では `Deleting` record が restart 後の再開点になる。target workspace が既に無い場合も idempotent に完了する。lease 側では、`Releasing` record が残る crash window を startup reconciliation が閉じる: runtime 資源の reconciliation が process/namespace の不在を証明した後のみ record を削除して pair を free にする。record の不在のみが free を意味し、`Releasing` / `Quarantined` の pair は決して自動再割当てしない。lease の incarnation（128-bit `lease_id`）は同一 numeric pair の再利用後も stale cleanup が新しい lease を削除できないよう ABA 保護に使う。
@@ -257,6 +347,19 @@ resource limit を使う Linux sandbox では、child exit だけでは `Sandbox
 ## 12. Shutdown
 
 最初の SIGINT/SIGTERM は listener を止め、host/sandbox runtime を drain する。二回目の shutdown signal は force-stop pathへ移る。
+
+```mermaid
+sequenceDiagram
+    participant K as Kernel
+    participant D as Daemon
+    participant G as Sandbox domains
+    K->>D: 1st SIGINT/SIGTERM
+    D->>D: stop listener + freeze admission
+    D->>G: kill + wait populated 0 + remove
+    G-->>D: drained
+    K->>D: 2nd signal
+    D->>G: force-stop
+```
 
 host process は direct child ownership と process-group cleanup を持つ。Linux sandbox
 process は process domain を ownership boundary とし、shutdown は各 domain の

@@ -234,6 +234,14 @@ TERM=<pty-req term>
 
 これらは `[sandbox.env]` より authoritative であり shadow できない。
 
+```mermaid
+flowchart TB
+    Q[SSH env request] -->|always| X[reject]
+    O[sandbox.env operator] --> M[merge]
+    A[shbox authoritative<br/>HOME PWD SHELL TMPDIR TERM] -->|overrides| M
+    M --> L[launch env]
+```
+
 Linux の private `TMPDIR` は sandbox runtime-domain generation ごとに一つ、macOS では launch ごとに一つ作る。いずれも owner-only directory とし、Linux では cgroup が空になり in-flight launch がなくなった後、macOS では launch cleanup で recursive に削除する。host-wide `/tmp` を writable sandbox path として自動 grant しない。
 
 ## 6. Built-in concurrency caps

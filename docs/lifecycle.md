@@ -24,6 +24,14 @@ archival commit を参照すること。
 - sandbox delete は sandbox に属するすべての process を終了させる。
   `setsid()` による session 離脱、double-fork、daemonize 済みの descendant を含む。
 - daemon の graceful shutdown はすべての sandbox process を終了させる。
+
+```mermaid
+flowchart TB
+    E{event} -->|channel close/disconnect| T[detach transport only<br/>process survives in cgroup]
+    E -->|pre-publication failure| K1[terminate + reap launch]
+    E -->|sandbox delete| K2[cgroup kill + temp/mount + workspace + lease release]
+    E -->|daemon shutdown| K3[drain + kill all domains]
+```
 - subordinate identity lease は durable sandbox と同じ lifetime を持つ。pair の
   再利用は verified release transaction（`Active -> Releasing -> cleanup 証明 ->
   record 削除 + directory fsync`）でのみ許され、process・namespace の消失や
@@ -88,6 +96,17 @@ client が一度も acknowledgment を受け取っていない launch の失敗
 10. workspace と durable metadata を削除する。
 11. identity lease record を削除して ledger directory を fsync し、subordinate
     pair を再利用可能にする（quarantined lease は残す）。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reserved: claim
+    Reserved --> Active: publication
+    Reserved --> Releasing: delete before activation
+    Active --> Releasing: delete durable
+    Releasing --> [*]: cleanup proven + record delete
+    Releasing --> Quarantined: ambiguous cleanup
+    Quarantined --> [*]: operator repair only
+```
 
 runtime lease（manager の runtime entry）は launch race の管理には有用だが、
 完全な process inventory ではない。descendant は manager に登録されないまま

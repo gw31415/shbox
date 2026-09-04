@@ -24,6 +24,13 @@ shbox は SSH authentication/authorization、durable sandbox ownership、workspa
 
 ### 1.3 保護対象
 
+```mermaid
+flowchart TB
+    U[untrusted: client input / sandbox code / workspace] --> B{trust boundary<br/>auth + ownership + confinement}
+    B --> P[protected: other sandboxes / config+keys / daemon+host mode / lease ledger]
+    T[trusted: kernel / daemon binary / service account / admin keys] --> B
+```
+
 - 他sandbox workspace/metadata
 - shbox config/state/host key
 - daemon processとhost mode

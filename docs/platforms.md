@@ -13,8 +13,17 @@ SSH/session layer
                    + durable cgroup v2 process domain (CLONE_INTO_CGROUP)
                    + namespaces + subordinate identity + ID-mapped mounts
                    + no_new_privs + capability drop
-            macOS: generated Seatbelt profile
-                   via /usr/bin/sandbox-exec
+             macOS: generated Seatbelt profile
+                    via /usr/bin/sandbox-exec
+```
+
+```mermaid
+flowchart TB
+    S[SSH/session layer] --> L[ProcessLauncher]
+    L --> P[shbox-owned PTY/process lifecycle]
+    L --> E[shbox-sandbox engine]
+    E -->|Linux| X[clone3+pidfd / Landlock / seccomp<br/>+ cgroup v2 domain<br/>+ namespaces / isolated identity / ID-mapped mounts]
+    E -->|macOS| M[Seatbelt profile via sandbox-exec]
 ```
 
 `ProcessLauncher` は private test seam であり public backend selector ではない。shbox の policy 層は backend-neutral で、shell、network mode、read-only paths、environment、private runtime temp root、resource limits を表現し、launch ごとに explicit な engine `SandboxConfig` へ解決する。engine crate 自体は preset/profile を持たない（[crates/shbox-sandbox](../crates/shbox-sandbox/README.md)）。

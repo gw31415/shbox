@@ -10,6 +10,7 @@
 4. [ssh-protocol.md](ssh-protocol.md) — SSH request/stream/signal semantics
 5. [security.md](security.md) — trust boundary、OS confinement、既知の限界
 6. [platforms.md](platforms.md) — Linux/macOS backend と正式 support 条件
+6a. [requirements.md](requirements.md) — OS/account/kernel/cgroup/user ID の動作要件（特に Linux）
 7. [testing.md](testing.md) — unit/OpenSSH/native platform acceptance
 8. [release.md](release.md) — blocking CI、release evidence、deployment gate
 9. [maintenance.md](maintenance.md) — upstream 依存関係の更新・追従体制
@@ -41,7 +42,16 @@ SSH/session layer
                    (+ durable cgroup v2 process domain via CLONE_INTO_CGROUP)
                    (+ subordinate identity / ID-mapped mounts when
                     sandbox identity = "isolated")
-            macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
+             macOS: generated Seatbelt profile via /usr/bin/sandbox-exec
+```
+
+```mermaid
+flowchart TB
+    S[SSH/session layer] --> L[ProcessLauncher]
+    L --> P[shbox-owned PTY/process lifecycle]
+    L --> E[shbox-sandbox engine]
+    E -->|Linux| X[clone3+pidfd / Landlock / seccomp<br/>+ cgroup v2 domain<br/>+ isolated identity/ID-mapped mounts]
+    E -->|macOS| M[Seatbelt profile via sandbox-exec]
 ```
 
 Linux では workspace 内の shbox-sandbox crate が confinement engine と sandbox process domain cgroup を担い、project-owned な外部 sandbox CLI や sibling helper を必要としない（Linux launch には writable な cgroup delegation が必要。`identity = "isolated"` では加えて daemon account への subordinate UID/GID delegation と root で socket activation される `shbox-idmap-broker` が必要で、`newuidmap`/`newgidmap`/`getsubids` は administrator 所有の shadow-utils helper である）。restart 時は delegated parent の shbox 所有 process domain と runtime temp を自動 reconciliation する。macOS では parent process が Seatbelt profile を構築し、固定 OS component である `/usr/bin/sandbox-exec` に適用を委ねる。project-owned external helper は禁止し、この OS component だけを例外として許可する。両 OS とも PTY/session/process-group lifecycle は shbox 自身が所有する。
