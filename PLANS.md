@@ -1485,3 +1485,248 @@ These observations are not release evidence; they exist so a future implementer 
 - An attempt on the Docker overlay-backed `/tmp` returned `EINVAL`, reinforcing the requirement for an actual backing-filesystem capability probe rather than a kernel-version-only check.
 
 These probes must be replaced by repository-native tests and supported-host acceptance during implementation.
+
+## 24. Review-remediation plan (2026-09-04 review, agent execution contract)
+
+Scope: fix every finding of the 2026-09-04 safety/performance/standards review of
+`origin/main...78247d0` (2 blocking, ~20 should-fix, notes). Most code will be
+written by subagents (glm-flash or luna-xhigh class). §24.0 records the
+calibration experiment that fixes how detailed each item must be; §24.1 is the
+mandatory execution contract; §24.2 lists the items at the calibrated
+granularity. Tiers: **S** mechanical (<=3 files, no design choice), **M** logic
+fix with test, **L** security/perf/cross-cutting.
+
+### 24.0 Calibration experiment (2026-09-04): required item granularity
+
+Method. 2 representative tasks x 3 detail levels x 2 models = 8 runs, each in an
+isolated git worktree at 78247d0, agents forbidden from running builds, central
+evaluation (`cargo check`, `cargo fmt --check`, targeted `cargo test`, new-failure
+diff vs clean-tree baseline). Rework = follow-up prompts needed for acceptance.
+- T-A (mechanical): single named const for runtime UID/GID 1000 at
+  `platform/policy.rs:~398` + `sandbox/manager.rs:~1291`; remove stale
+  `#[allow(dead_code)]` on `Paths::subid_leases_root` (`paths.rs`).
+- T-B (logic): `engine_namespaces` sets `namespaces.mount = true` iff identity is
+  `Isolated` + policy-level test per identity mode.
+- L1 = goal + file:line pointers. L2 = L1 + change sketch + test spec + non-goals.
+  L3 = L2 + why-context, exact spots, edge cases, acceptance criteria, verify
+  commands. Models: claude `glm-5.3-flash[1m]` vs codex `gpt-5.6-luna` @ xhigh.
+
+Results (all 8 compiled first try; functional rework was zero at every level):
+
+| run | wall | check | fmt | tests | rework |
+|---|---|---|---|---|---|
+| TA-L1 glm | 266s | clean | 1 import-order nit | 0 new fails | trivial (`cargo fmt`) |
+| TA-L1 luna | 107s | clean | 1 import-order nit | 0 new fails | trivial (`cargo fmt`) |
+| TB-L1 glm | 439s | clean | clean | new 4-combo test passes | none |
+| TB-L1 luna | 93s | clean | 1 import-order nit | new 2-mode test passes | trivial (`cargo fmt`) |
+| TB-L2 glm | 299s | clean | clean | new 4-combo+identity test passes | none |
+| TB-L2 luna | 89s | clean | clean | extended existing test passes | none |
+| TB-L3 glm | 200s | clean | clean | new 3-mode test passes | none |
+| TB-L3 luna | 117s | clean | clean | new 3-mode test passes | none |
+
+Capability assessment (critical, for routing in §24.1).
+- glm-flash: slow (200-440s), thorough, faster with MORE detail (439s at L1 ->
+  200s at L3: detail replaces exploration). Surfaces uncertainties honestly,
+  self-runs `rustfmt --check` unprompted, notices adjacent issues (docs already
+  claiming the behavior, `(Isolated,None)` interplay, second stale allow).
+  Scope discipline held (1 file for T-B). Verbose output. 3 parallel sessions
+  hit API 429 rate limits with retries.
+- luna-xhigh: fast (~90-120s regardless of detail), literal, minimal-precise.
+  Test breadth is thin by default (2 modes where 4 fit; extends rather than adds).
+  Always reports "unsure: nothing" (confidence, not evidence of scrutiny).
+  Skips self-checks it could have run (no `rustfmt --check`, hence 2 fmt nits).
+  No scope violations in 4 runs.
+- Caveats: agents were forbidden builds, so compiler-iteration loops are
+  unmeasured; n=8 on small (1-5 file) tasks. Large cross-cutting tasks were NOT
+  calibrated and default to tier L.
+- Decision: L1 is functionally sufficient for S/M class tasks; L2's test spec
+  buys breadth (worth it for M); L items need full L3. Unlike the experiment,
+  real runs MUST include `cargo fmt --check` + relevant tests in every item
+  (eliminates the only rework class observed).
+
+### 24.1 Execution contract (mandatory for every item)
+
+1. One item = one work unit. Touch ONLY the files whitelisted in the item.
+2. Output contract: (1) files changed, (2) summary, (3) uncertainties.
+3. Gate per item: `cargo fmt --check` clean, `cargo check -p <crate> --tests`
+   clean, listed tests pass on a namespace-capable Linux host (container EACCES
+   failures in `engine_capability_probe`, `isolated_identity`, `linux_only` are
+   environmental, not regressions: compare against the clean-tree baseline).
+4. Routing: S/M items -> luna (fast); L or discovery-heavy items -> glm (max 2
+   parallel sessions: 429 risk); M either. Commit per completed item.
+5. Order follows §24.2 dependencies. R-0 first: nothing isolated-path is testable
+   without it. R-3 before any concurrency test.
+
+### 24.2 Items
+
+#### R-0. `Isolated` sets `namespaces.mount = true` [M, either | blocking B1]
+- Goal: isolated launches pass engine `validate_identity` (mount-ns requirement).
+- Files: `crates/shbox/src/platform/policy.rs` (`engine_namespaces` ~:378,
+  test ~:982). Ref: `crates/shbox-sandbox/src/validate.rs` (`validate_identity`),
+  `NamespacePolicy::default` (`crates/shbox-sandbox/src/policy.rs`).
+- Change: match on identity; `Isolated` -> `mount = true`; `Host`/
+  `CallerMappedRoot` unchanged. Leave non-Linux arm (~:418) as is.
+- Test: assert the whole `NamespacePolicy` per identity mode (Host,
+  CallerMappedRoot, Isolated); engine `spawn.rs` hand-sets `mount = true` so only
+  a policy-level test catches this coupling.
+- Acceptance: Isolated -> mount true, others false; check clean; new test passes;
+  no other files. Non-goals: engine changes, macOS behavior, `(Isolated,None)` arm.
+- (Calibrated at L1-L3 with zero rework; any tier works.)
+
+#### R-1. `(Isolated, None)` arm returns `Err` [M, either]
+- Files: `crates/shbox/src/platform/policy.rs:397`.
+- Change: stop fabricating `host_uid: 0, host_gid: 0` (engine rejects it anyway);
+  return `Err` so the launcher's precise "no active lease" diagnostic survives.
+- Test: no-lease isolated policy construction errors (extend R-0 test module).
+- Acceptance: check clean; tests pass. Non-goals: lease lifecycle changes.
+
+#### R-2. Reject `identity = "isolated"` on non-Linux at config validation [M, either]
+- Files: `crates/shbox/src/config.rs` (`validate_identity` ~:308, test ~:1046),
+  `platform/policy.rs:412`, `platform/macos.rs:77`.
+- Change: `not(target_os = "linux")` + `isolated` -> validation error (PLANS.md
+  §14.1 mandates this; current silent Host-downgrade is forbidden behavior).
+- Test: `build_ok(identity=isolated)` becomes Linux-only; non-Linux reject assert.
+- Acceptance: macOS path rejects; Linux unchanged. Non-goals: engine changes.
+
+#### R-3. Exclusive ledger locking across processes [L, glm | blocking B2]
+- Context: `selection` is a per-process `Mutex` (`subid/mod.rs:139-143,183`); two
+  daemon instances can claim the same lowest-available pair -> two live sandboxes
+  share one subordinate UID.
+- Files: `crates/shbox/src/sandbox/subid/mod.rs`, `ledger.rs` (lockfile helper).
+- Change: `flock` a ledger-dir lockfile around claim AND all transitions
+  (activate/begin_release/finish_release/quarantine); read-modify-write under one
+  guard with state re-verified at write (also fixes the unlocked-transition
+  overwrite at `mod.rs:298-309,259-274`); replace `lock().expect()` with
+  `PoisonError::into_inner` continuation.
+- Edge: lock ordering vs future `flock` users (document); crash while holding
+  flock = released by kernel, safe.
+- Test: two allocators on one dir, concurrent claims -> zero pair overlap;
+  poison-then-claim continues; quarantine-vs-activate race test.
+- Acceptance: race tests pass; existing 26 subid tests green. Non-goals: lockfile
+  location outside ledger dir.
+
+#### R-4. Broker confinement on fd identity, not paths [L, glm]
+- Context: root broker (`platform/idmap_broker.rs:641`) `canonicalize`s a path
+  string; a daemon-owned dir renamed out of the root + replaced passes validation
+  while the fd mounts the moved-out tree.
+- Files: `crates/shbox/src/platform/idmap_broker.rs`.
+- Change: compare `st_dev`/`st_ino` of the supplied fd against a fresh
+  `openat2(RESOLVE_BENEATH)` open from a pinned root fd. Same treatment for
+  deleted-detection (`:634-635`, drop the `" (deleted)"` suffix compare) and
+  userns-fd check (`:651-656`, inode-compare vs `/proc/self/ns/user`, reject
+  initial-ns inode). Validate configured roots once at startup (`:179-190`).
+- Test: rename-out + replace negative test; bad-roots startup-failure test.
+- Acceptance: negatives rejected; existing broker tests green. Non-goals: protocol
+  changes.
+
+#### R-5. Broker fd-leak, thread bound, accept discipline [L, glm]
+- Files: `crates/shbox/src/platform/idmap_broker.rs:551-577,220,546,210-215`.
+- Change: collect the whole control buffer into `OwnedFd`s before any error return
+  (drop-guard all paths); semaphore-bounded handlers (e.g. 16) + `SO_RCVTIMEO` on
+  `recvmsg`; sleep-and-continue on transient accept errno (EMFILE/ENFILE/
+  ECONNABORTED) instead of exiting `serve()`.
+- Test: `/proc/self/fd` count before/after malformed-message burst; thread-count
+  bound under N idle connections.
+- Acceptance: no leak; bound holds. Non-goals: connection reuse (deferred §24.3).
+
+#### R-6. Ledger transition atomicity + durability gaps [M, either]
+- Files: `subid/mod.rs:298-309,259-274`, `ledger.rs:216-229,360-362`.
+- Change: (a) transitions under the R-3 guard with re-verify (if R-3 landed
+  first, only re-verify remains); (b) parent-dir fsync after ledger-dir
+  create/chmod; (c) `open_root` re-validates owner/mode on every open, not once
+  at `:232`.
+- Test: create/chmod durability (fault-injection if available); chmod-after-open
+  detected.
+- Acceptance: tests pass. Non-goals: schema changes.
+
+#### R-7. Lease selection exclusions + typed reconcile proof [M, either]
+- Files: `subid/mod.rs:503-510,371,441-450,376-382`.
+- Change: subtract daemon euid/egid (plus reserved set) at selection alongside
+  the ID-0 exclusion; replace `runtime_reconciled: bool` with a typed
+  proof/token produced by the runtime sweep; assert (not just document) the
+  activate-before-launch invariant behind `Reserved`+absent freeing.
+- Test: delegation containing daemon IDs never handed out; premature-`true`
+  becomes a type error (compile-level acceptance).
+- Acceptance: tests pass. Non-goals: allocator algorithm changes.
+
+#### R-8. Delegation cache + single-read `lease_for` [L, glm | perf blocking]
+- Context: every launch spawns `getsubids` + `getsubids -g` (`manager.rs:631,652,
+  1274,1285`; 4 execs on claim) and `lease_for` full-scans O(n) (`manager.rs:1278`
+  -> `store.load()`).
+- Files: `manager.rs`, `subid/delegation.rs:131,141`, `subid/mod.rs:163`,
+  `ledger.rs:245,267`.
+- Change: daemon-lifetime delegation cache with generation check (keep
+  re-query-before-use on shrink: fail-closed behavior preserved); `lease_for`
+  via the single-file `read()` fast path (`ledger.rs:267`); hoist one `load()`
+  snapshot indexed by `SandboxId` for `reconcile_deleting` (`manager.rs:1057`)
+  shared with `reconcile_subid_leases:296`.
+- Edge: NSS backends (sssd/LDAP) have real latency; cache invalidation must not
+  widen the shrink window (re-check on use, not only on timer).
+- Test: spawn-count per launch = 0 after warm; shrink-delegation fail-closed
+  maintained; 1000-lease launch latency flat (bench, not a unit assert).
+- Acceptance: bench numbers recorded in the commit message. Non-goals: broker
+  connection reuse.
+
+#### R-9. Mutex-hold narrowing on launch paths [L, glm | perf blocking]
+- Files: `manager.rs:738,752` (ledger mutex across `storage.inspect()`),
+  `platform/linux.rs:144` (`slots` mutex across `cgroup.events` read),
+  `subid/mod.rs:183` (claim mutex across load+write+fsync).
+- Change: lock -> inspect/I/O -> re-lock -> re-validate pattern in all three
+  (coordinate R-9c with R-3's flock design).
+- Test: concurrent-launch throughput bench; existing race tests green.
+- Acceptance: no throughput regression vs pre-change; invariants documented where
+  a TOCTOU window is explicitly accepted (double-`inspect` at
+  `manager.rs:342,618` resolved the same way: pass validated metadata through
+  `begin_launch` or comment the window).
+
+#### R-10. Claim-path write/scan efficiency [M, either]
+- Files: `subid/mod.rs:503,512`, `ledger.rs:304,342`.
+- Change: replace 65k linear `lowest_available` scan + per-claim `HashSet` rebuild
+  with a sorted free-list/interval set; coalesce Reserved->Active double write
+  where publication is atomic (update crash-window fault tests accordingly).
+- Test: existing fault-injection + ABA tests green; claim bench noted.
+- Acceptance: tests pass. Non-goals: ledger schema change.
+
+#### R-11. Error-type, const, lint hygiene [S, luna]
+- Files: `manager.rs:1462` (`Error::Subid(String)` -> `Error::Subid(subid::Error)`,
+  13 call sites; keeps `HelperMissing` diagnostic), `policy.rs:398` +
+  `manager.rs:1291` (single const for runtime 1000; experiment validated the shape,
+  either crate home acceptable, document the choice), `paths.rs:119` (remove stale
+  allow), `config.rs:943,1389,1396` (3 clippy test warnings).
+- Test: `HelperMissing` message preserved assert; full bin tests green.
+- Acceptance: `cargo clippy --all-targets` zero warnings; PLANS.md clippy
+  accounting updated.
+
+#### R-12. Broker/systemd/profile hardening + SAFETY sweep [M, luna]
+- Files: `idmap_broker.rs` (SAFETY comments: prioritize cmsg walks `561-588,696`
+  and syscall casts `336,357`; `get_u32/get_u64` `:720,728` -> `Result`; protocol
+  constants `:431-458` alignment), `deploy/systemd/shbox-idmap-broker.service`
+  (`SystemCallFilter` allowlist + `MemoryMax`/task limits), AppArmor (separate
+  broker invocation path from the daemon binary profile).
+- Test: no behavior change (existing tests green); `systemd-analyze security`
+  delta recorded.
+- Acceptance: zero-behavior diff + recorded hardening delta. Non-goals: protocol
+  redesign.
+
+#### R-13. Quarantine reason persistence [S, luna]
+- Files: `subid/mod.rs:260` (persist reason in record or sidecar; operators need
+  durable evidence for repair).
+- Test: quarantine round-trip preserves reason.
+- Acceptance: test passes. Non-goals: tombstones (deferred: any out-of-band unlink
+  still silently frees; operator-only repair verb is future work).
+
+### 24.3 Explicitly deferred (measure first, per §24.2 R-8/R-9 benches)
+
+Broker connection reuse / mount batching; lingering idle generations
+(`linux.rs:667,247`); `duplicate_fd` skip (`linux.rs:498,622`); `PathRule`
+interning (`policy.rs:329,340`); cgroup poll tuning (`cgroup.rs:95,143`).
+Adopt only if post-R-8/R-9 latency breakdown justifies each.
+
+### 24.4 Final gate (after all items)
+
+1. `cargo fmt --check` clean. 2. `cargo clippy --all-targets` zero warnings.
+3. Full `cargo test` green on a namespace-capable Linux host (the 9 container
+   environmental failures must turn green there). 4. New tests enumerated in
+   §24.2 present and passing. 5. PLANS.md §0 caveat corrected (I3 integration was
+   statically unreachable pre-R-0, not merely pending a host) and evidence
+   retention (§12) extended with delegation/broker availability.
