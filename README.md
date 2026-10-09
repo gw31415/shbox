@@ -1,5 +1,7 @@
 # shbox
 
+> **Archive notice:** The author no longer uses shbox and has migrated to [dev-session-mcp](https://github.com/gw31415/dev-session-mcp). This repository is archived and will no longer be maintained.
+
 Foreground SSH daemon that maps OpenSSH clients onto persistent sandbox workspaces.
 
 - Rust 1.95 / edition 2024
